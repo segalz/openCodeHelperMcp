@@ -30,7 +30,24 @@ function isWithinAllowedRoot(directory) {
 }
 
 function runOpenCode({ directory, prompt, model }) {
-  const executable = process.env.OPENCODE_BIN ?? "opencode";
+  const windowsNpmBin = process.env.APPDATA
+    ? path.join(process.env.APPDATA, "npm")
+    : process.env.USERPROFILE
+      ? path.join(process.env.USERPROFILE, "AppData", "Roaming", "npm")
+      : null;
+  const openCodePowerShellScript = process.platform === "win32" && windowsNpmBin
+    ? path.join(windowsNpmBin, "opencode.ps1")
+    : null;
+  const executable = process.env.OPENCODE_BIN
+    ?? (openCodePowerShellScript
+      ? path.join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      )
+      : "opencode");
   const timeoutMs = Number(process.env.OPENCODE_HELPER_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
   const args = [
     "run",
@@ -42,6 +59,8 @@ function runOpenCode({ directory, prompt, model }) {
     DEFAULT_VARIANT,
     "--agent",
     "plan",
+    "--format",
+    "json",
     [
       "You are a read-only code analysis assistant.",
       "Do not create, edit, delete, rename, format, or apply files.",
@@ -56,11 +75,22 @@ function runOpenCode({ directory, prompt, model }) {
   ];
 
   return new Promise((resolve) => {
-    const child = spawn(executable, args, {
-      cwd: directory,
-      shell: false,
-      windowsHide: true,
-      env: { ...process.env },
+  const childArgs = openCodePowerShellScript && !process.env.OPENCODE_BIN
+    ? ["-NoProfile", "-NonInteractive", "-File", openCodePowerShellScript, ...args]
+    : args;
+  const child = spawn(executable, childArgs, {
+    cwd: directory,
+    shell: false,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+    ...process.env,
+    PATH: [
+      path.join(process.env.APPDATA ?? "", "npm"),
+      path.dirname(process.execPath),
+      process.env.PATH ?? "",
+    ].filter(Boolean).join(path.delimiter),
+  },
     });
     let stdout = "";
     let stderr = "";
