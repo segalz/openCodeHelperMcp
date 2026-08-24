@@ -2,8 +2,9 @@
 
 Local, read-only MCP server for code analysis through the installed OpenCode CLI.
 
-It exposes three fixed, read-only analysis tools:
+It exposes one fixed, read-only analysis tool for normal use plus three provider-specific diagnostic tools:
 
+- `analyze_code`: deterministic fallback — Cloudflare, then MiMo, then NVIDIA
 - `analyze_code_cloudflare`: Cloudflare Workers AI `@cf/zai-org/glm-4.7-flash`
 - `analyze_code_mimo`: OpenCode `mimo-v2.5-free`
 - `analyze_code_nemotron`: NVIDIA `nemotron-3-nano-omni-30b-a3b-reasoning`
@@ -11,7 +12,7 @@ It exposes three fixed, read-only analysis tools:
 - OpenCode's `plan` agent
 - a 120-second timeout
 
-All tools start `opencode run` with fixed arguments and do not expose model, effort, command, or write controls to MCP clients. Call Cloudflare GLM first, then MiMo when Cloudflare fails or is insufficient, then Nemotron only when MiMo also fails or is insufficient.
+All tools start `opencode run` with fixed arguments and expose only `directory` and `prompt` to MCP clients—never a model, executable, command, test mode, or write control. `analyze_code` performs the deterministic Cloudflare → MiMo → NVIDIA fallback and returns a sanitized all-providers-failed status only after all three providers fail or time out. At that point, a direct Grok fallback is permitted.
 
 ## Scope
 
