@@ -2,14 +2,15 @@
 
 Local, read-only MCP server for code analysis through the installed OpenCode CLI.
 
-It always uses:
+It exposes two fixed, read-only analysis tools:
 
-- NVIDIA `nemotron-3-nano-omni-30b-a3b-reasoning`
+- `analyze_code_mimo`: OpenCode `mimo-v2.5-free`
+- `analyze_code_nemotron`: NVIDIA `nemotron-3-nano-omni-30b-a3b-reasoning`
 - `low` reasoning effort
 - OpenCode's `plan` agent
 - a 120-second timeout
 
-The server offers one tool: `analyze_code`. It starts `opencode run` with fixed arguments and does not expose model, effort, command, or write controls to MCP clients.
+Both tools start `opencode run` with fixed arguments and do not expose model, effort, command, or write controls to MCP clients. Call MiMo first, then Nemotron only when MiMo fails or is insufficient.
 
 ## Scope
 

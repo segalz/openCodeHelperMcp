@@ -5,7 +5,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const DEFAULT_MODEL = "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning";
+const MIMO_MODEL = "opencode/mimo-v2.5-free";
+const NEMOTRON_MODEL = "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning";
 const DEFAULT_VARIANT = "low";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_ALLOWED_ROOT = "C:\\Develop";
@@ -27,7 +28,7 @@ function isWithinAllowedRoot(directory) {
   });
 }
 
-function runOpenCode({ directory, prompt }) {
+function runOpenCode({ directory, prompt, model }) {
   const executable = process.env.OPENCODE_BIN ?? "opencode";
   const timeoutMs = Number(process.env.OPENCODE_HELPER_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
   const args = [
@@ -35,7 +36,7 @@ function runOpenCode({ directory, prompt }) {
     "--dir",
     directory,
     "--model",
-    DEFAULT_MODEL,
+    model,
     "--variant",
     DEFAULT_VARIANT,
     "--agent",
@@ -96,29 +97,41 @@ const server = new McpServer({
   version: "0.1.0",
 });
 
-server.registerTool(
-  "analyze_code",
-  {
-    title: "Analyze code read-only",
-    description: "Search and analyze a C:\\Develop workspace using fixed NVIDIA Nemotron Nano and low reasoning effort. It cannot edit files.",
+function registerAnalysisTool({ name, title, description, model }) {
+  server.registerTool(name, {
+    title,
+    description,
     inputSchema: {
       directory: z.string().min(1).describe("Absolute workspace path under an allowed root."),
       prompt: z.string().min(1).max(12_000).describe("The focused code-analysis question."),
     },
-  },
-  async ({ directory, prompt }) => {
+  }, async ({ directory, prompt }) => {
     if (!path.isAbsolute(directory)) {
       return { content: [{ type: "text", text: "The directory must be an absolute path." }], isError: true };
     }
     if (!isWithinAllowedRoot(directory)) {
       return { content: [{ type: "text", text: "The directory is outside the helper's allowed roots." }], isError: true };
     }
-    const result = await runOpenCode({ directory: path.resolve(directory), prompt });
+    const result = await runOpenCode({ directory: path.resolve(directory), prompt, model });
     return result.error
       ? { content: [{ type: "text", text: result.error }], isError: true }
       : { content: [{ type: "text", text: result.text }] };
-  },
-);
+  });
+}
+
+registerAnalysisTool({
+  name: "analyze_code_mimo",
+  title: "Analyze code with MiMo Free",
+  description: "Read-only code analysis using the fixed OpenCode MiMo V2.5 Free model at low reasoning effort. Use this first.",
+  model: MIMO_MODEL,
+});
+
+registerAnalysisTool({
+  name: "analyze_code_nemotron",
+  title: "Analyze code with NVIDIA Nemotron",
+  description: "Read-only code analysis using the fixed NVIDIA Nemotron 3 Nano Omni model at low reasoning effort. Use this after MiMo fails or is insufficient.",
+  model: NEMOTRON_MODEL,
+});
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
