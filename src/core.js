@@ -7,7 +7,7 @@ export const DEFAULT_VARIANT = "low";
 export const PROVIDERS = Object.freeze([
   Object.freeze({ key: "cloudflare", model: "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash", title: "Analyze code with Cloudflare GLM", description: "Read-only code analysis using the fixed Cloudflare Workers AI GLM 4.7 Flash model at low reasoning effort. Use this first." }),
   Object.freeze({ key: "mimo", model: "opencode/mimo-v2.5-free", title: "Analyze code with MiMo Free", description: "Read-only code analysis using the fixed OpenCode MiMo V2.5 Free model at low reasoning effort. Use this after Cloudflare GLM fails or is insufficient." }),
-  Object.freeze({ key: "nemotron", model: "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", title: "Analyze code with NVIDIA Nemotron", description: "Read-only code analysis using the fixed NVIDIA Nemotron 3 Nano Omni model at low reasoning effort. Use this after MiMo fails or is insufficient." }),
+  Object.freeze({ key: "nvidia", model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this after MiMo fails or is insufficient." }),
 ]);
 
 export const analysisInputSchema = Object.freeze({

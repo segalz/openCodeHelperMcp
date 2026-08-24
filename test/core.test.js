@@ -4,13 +4,21 @@ import test from "node:test";
 import { DEFAULT_VARIANT, PROVIDERS, analysisInputSchema, createOpenCodeRunner, registerAnalysisTools, runWithFallback } from "../src/core.js";
 
 const directory = "C:\\Develop\\sample";
+test("NVIDIA fallback is fixed to GPT-OSS 20B", () => {
+  assert.deepEqual(PROVIDERS[2], {
+    key: "nvidia",
+    model: "nvidia/openai/gpt-oss-20b",
+    title: "Analyze code with NVIDIA GPT-OSS",
+    description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this after MiMo fails or is insufficient.",
+  });
+});
 test("fallback stops after Cloudflare succeeds", async () => {
   const calls = [];
   const result = await runWithFallback({ directory, prompt: "inspect", runner: async (call) => { calls.push(call); return { text: "cloudflare answer" }; } });
   assert.equal(result.provider, "cloudflare"); assert.deepEqual(calls.map((call) => call.model), [PROVIDERS[0].model]);
 });
-test("fallback advances Cloudflare to MiMo and then NVIDIA", async () => {
-  for (const [outcomes, expected] of [[[{ error: "quota" }, { text: "mimo" }], "mimo"], [[{ error: "quota" }, { error: "unavailable" }, { text: "nvidia" }], "nemotron"]]) {
+test("fallback advances Cloudflare to MiMo and then NVIDIA GPT-OSS", async () => {
+  for (const [outcomes, expected] of [[[{ error: "quota" }, { text: "mimo" }], "mimo"], [[{ error: "quota" }, { error: "unavailable" }, { text: "nvidia" }], "nvidia"]]) {
     let index = 0; const calls = [];
     const result = await runWithFallback({ directory, prompt: "inspect", runner: async (call) => { calls.push(call); return outcomes[index++]; } });
     assert.equal(result.provider, expected); assert.deepEqual(calls.map((call) => call.model), PROVIDERS.slice(0, calls.length).map((provider) => provider.model));

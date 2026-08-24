@@ -4,10 +4,10 @@ Local, read-only MCP server for code analysis through the installed OpenCode CLI
 
 It exposes one fixed, read-only analysis tool for normal use plus three provider-specific diagnostic tools:
 
-- `analyze_code`: deterministic fallback — Cloudflare, then MiMo, then NVIDIA
+- `analyze_code`: deterministic fallback — Cloudflare, then MiMo, then NVIDIA GPT-OSS
 - `analyze_code_cloudflare`: Cloudflare Workers AI `@cf/zai-org/glm-4.7-flash`
 - `analyze_code_mimo`: OpenCode `mimo-v2.5-free`
-- `analyze_code_nemotron`: NVIDIA `nemotron-3-nano-omni-30b-a3b-reasoning`
+- `analyze_code_nvidia`: NVIDIA `openai/gpt-oss-20b`
 - `low` reasoning effort
 - OpenCode's `plan` agent
 - a 120-second timeout
