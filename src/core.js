@@ -2,7 +2,9 @@ import { spawn as defaultSpawn } from "node:child_process";
 import path from "node:path";
 import { z } from "zod";
 
-export const DEFAULT_TIMEOUT_MS = 120_000;
+export const DEFAULT_TIMEOUT_MS = 40_000;
+export const DEFAULT_FALLBACK_TIMEOUT_MS = 120_000;
+export const EXIT_GRACE_MS = 1_000;
 export const DEFAULT_VARIANT = "low";
 export const PROVIDERS = Object.freeze([
   Object.freeze({ key: "cloudflare", model: "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash", title: "Analyze code with Cloudflare GLM", description: "Read-only code analysis using the fixed Cloudflare Workers AI GLM 4.7 Flash model at low reasoning effort. Use this first." }),
@@ -15,37 +17,89 @@ export const analysisInputSchema = Object.freeze({
   prompt: z.string().min(1).max(12_000).describe("The focused code-analysis question."),
 });
 
+function validTimeout(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+export function parseOpenCodeNdjson(stdout) {
+  const events = stdout.trim().split(/\r?\n/).filter(Boolean).map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter(Boolean);
+  if (events.length === 0) return { error: "OpenCode returned no valid analysis." };
+  const texts = [];
+  for (const event of events) {
+    if (event.error || /error|failed/i.test(event.type ?? "") || /error|failed/i.test(event.part?.type ?? "")) return { error: "OpenCode reported an analysis error." };
+    const text = event.part?.type === "text" ? event.part.text : event.type === "text" ? event.text : event.result?.text;
+    if (typeof text === "string" && text.trim()) texts.push(text.trim());
+  }
+  return texts.length > 0 ? { text: texts.at(-1) } : { error: "OpenCode returned no valid analysis." };
+}
+
+export function defaultKillProcessTree(child, { platform = process.platform, spawnImpl = defaultSpawn } = {}) {
+  if (platform === "win32" && Number.isInteger(child.pid)) {
+    const terminator = spawnImpl("taskkill", ["/pid", String(child.pid), "/t", "/f"], { shell: false, windowsHide: true, stdio: "ignore" });
+    terminator.on("error", () => child.kill());
+    return;
+  }
+  child.kill();
+}
+
 export function createOpenCodeRunner({
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout,
-  env = process.env, platform = process.platform, execPath = process.execPath,
-  timeoutMs = Number(env.OPENCODE_HELPER_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS),
+  killProcessTreeImpl, env = process.env, platform = process.platform, execPath = process.execPath,
+  timeoutMs = Number(env.OPENCODE_HELPER_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS), graceMs = EXIT_GRACE_MS,
 } = {}) {
-  return ({ directory, prompt, model }) => {
-    const windowsNpmBin = env.APPDATA ? path.join(env.APPDATA, "npm") : env.USERPROFILE ? path.join(env.USERPROFILE, "AppData", "Roaming", "npm") : null;
-    const openCodePowerShellScript = platform === "win32" && windowsNpmBin ? path.join(windowsNpmBin, "opencode.ps1") : null;
-    const executable = env.OPENCODE_BIN ?? (openCodePowerShellScript ? path.join(env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe") : "opencode");
+  const terminate = killProcessTreeImpl ?? ((child) => defaultKillProcessTree(child, { platform, spawnImpl }));
+  return ({ directory, prompt, model, timeoutMs: requestTimeoutMs }) => {
+    const executable = env.OPENCODE_BIN ?? "opencode";
     const args = ["run", "--dir", directory, "--model", model, "--variant", DEFAULT_VARIANT, "--agent", "plan", "--format", "json", [
       "You are a read-only code analysis assistant.", "Do not create, edit, delete, rename, format, or apply files.", "Do not run commands that change the workspace or system state.", "Use search and read operations only.", "Never inspect node_modules, .git, dist, build, coverage, .next, or out unless the user explicitly asks about that exact directory.", "Prefer the smallest relevant files and directories; do not glob an entire workspace when a focused search will answer the question.", "Return a concise answer with relevant files, symbols, and evidence.", "\nUser request:", prompt,
     ].join("\n")];
-    const childArgs = openCodePowerShellScript && !env.OPENCODE_BIN ? ["-NoProfile", "-NonInteractive", "-File", openCodePowerShellScript, ...args] : args;
+    const effectiveTimeoutMs = Math.min(validTimeout(timeoutMs, DEFAULT_TIMEOUT_MS), validTimeout(requestTimeoutMs, Infinity));
     return new Promise((resolve) => {
-      const child = spawnImpl(executable, childArgs, { cwd: directory, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], env: { ...env, PATH: [path.join(env.APPDATA ?? "", "npm"), path.dirname(execPath), env.PATH ?? ""].filter(Boolean).join(path.delimiter) } });
-      let stdout = ""; let stderr = ""; let timedOut = false;
-      const timer = setTimeoutImpl(() => { timedOut = true; child.kill(); }, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS);
+      let child;
+      try {
+        child = spawnImpl(executable, args, { cwd: directory, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], env: { ...env, PATH: [path.join(env.APPDATA ?? "", "npm"), path.dirname(execPath), env.PATH ?? ""].filter(Boolean).join(path.delimiter) } });
+      } catch (error) {
+        resolve({ error: `Could not start OpenCode: ${error.message}` });
+        return;
+      }
+      let stdout = ""; let stderr = ""; let settled = false; let timedOut = false; let exitCode = null;
+      let timeoutTimer; let graceTimer;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeoutImpl(timeoutTimer);
+        clearTimeoutImpl(graceTimer);
+        resolve(result);
+      };
+      const finishFromExit = () => {
+        if (timedOut) return finish({ error: "OpenCode analysis timed out." });
+        if (exitCode !== 0) return finish({ error: `OpenCode exited with code ${exitCode}. ${stderr.trim()}`.trim() });
+        return finish(parseOpenCodeNdjson(stdout));
+      };
+      timeoutTimer = setTimeoutImpl(() => {
+        timedOut = true;
+        terminate(child);
+        graceTimer = setTimeoutImpl(() => finish({ error: "OpenCode analysis timed out." }), graceMs);
+      }, effectiveTimeoutMs);
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk) => { stdout += chunk; }); child.stderr.on("data", (chunk) => { stderr += chunk; });
-      child.on("error", (error) => { clearTimeoutImpl(timer); resolve({ error: `Could not start OpenCode: ${error.message}` }); });
-      child.on("close", (code) => { clearTimeoutImpl(timer); if (timedOut) return resolve({ error: "OpenCode analysis timed out." }); if (code !== 0) return resolve({ error: `OpenCode exited with code ${code}. ${stderr.trim()}`.trim() }); return resolve({ text: stdout.trim() || "OpenCode returned no analysis." }); });
+      child.on("error", (error) => finish({ error: `Could not start OpenCode: ${error.message}` }));
+      child.on("exit", (code) => { exitCode = code; graceTimer ??= setTimeoutImpl(finishFromExit, graceMs); });
+      child.on("close", (code) => { exitCode = code; finishFromExit(); });
     });
   };
 }
 
-export async function runWithFallback({ directory, prompt, runner }) {
-  const attempts = [];
+export async function runWithFallback({ directory, prompt, runner, timeoutMs = DEFAULT_FALLBACK_TIMEOUT_MS, nowImpl = Date.now }) {
+  const attempts = []; const deadline = nowImpl() + validTimeout(timeoutMs, DEFAULT_FALLBACK_TIMEOUT_MS);
   for (const provider of PROVIDERS) {
+    const remainingMs = deadline - nowImpl();
+    if (remainingMs <= 0) return { error: "all-providers-failed", attempts: [...attempts, { provider: provider.key, status: "deadline" }] };
     try {
-      const result = await runner({ directory, prompt, model: provider.model });
-      if (result?.text && result.text !== "OpenCode returned no analysis.") return { text: result.text, provider: provider.key, attempts };
+      const result = await runner({ directory, prompt, model: provider.model, timeoutMs: remainingMs });
+      if (result?.text) return { text: result.text, provider: provider.key, attempts };
       attempts.push({ provider: provider.key, status: result?.error === "OpenCode analysis timed out." ? "timeout" : "failed" });
     } catch { attempts.push({ provider: provider.key, status: "failed" }); }
   }

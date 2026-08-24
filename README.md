@@ -10,9 +10,9 @@ It exposes one fixed, read-only analysis tool for normal use plus three provider
 - `analyze_code_nvidia`: NVIDIA `openai/gpt-oss-20b`
 - `low` reasoning effort
 - OpenCode's `plan` agent
-- a 120-second timeout
+- a 40-second per-provider timeout and 120-second fallback deadline
 
-All tools start `opencode run` with fixed arguments and expose only `directory` and `prompt` to MCP clients—never a model, executable, command, test mode, or write control. `analyze_code` performs the deterministic Cloudflare → MiMo → NVIDIA fallback and returns a sanitized all-providers-failed status only after all three providers fail or time out. At that point, a direct Grok fallback is permitted.
+All tools start `opencode run` with fixed arguments and expose only `directory` and `prompt` to MCP clients—never a model, executable, command, test mode, or write control. `analyze_code` performs the deterministic Cloudflare → MiMo → NVIDIA fallback, with a 120-second total deadline, and returns a sanitized all-providers-failed status only after all three providers fail, time out, or the deadline expires. At that point, a direct Grok fallback is permitted. OpenCode's NDJSON output is accepted only when it contains a valid final text event; error events and malformed output are failures.
 
 ## Scope
 
