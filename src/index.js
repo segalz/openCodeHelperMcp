@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+const CLOUDFLARE_MODEL = "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash";
 const MIMO_MODEL = "opencode/mimo-v2.5-free";
 const NEMOTRON_MODEL = "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning";
 const DEFAULT_VARIANT = "low";
@@ -120,9 +121,16 @@ function registerAnalysisTool({ name, title, description, model }) {
 }
 
 registerAnalysisTool({
+  name: "analyze_code_cloudflare",
+  title: "Analyze code with Cloudflare GLM",
+  description: "Read-only code analysis using the fixed Cloudflare Workers AI GLM 4.7 Flash model at low reasoning effort. Use this first.",
+  model: CLOUDFLARE_MODEL,
+});
+
+registerAnalysisTool({
   name: "analyze_code_mimo",
   title: "Analyze code with MiMo Free",
-  description: "Read-only code analysis using the fixed OpenCode MiMo V2.5 Free model at low reasoning effort. Use this first.",
+  description: "Read-only code analysis using the fixed OpenCode MiMo V2.5 Free model at low reasoning effort. Use this after Cloudflare GLM fails or is insufficient.",
   model: MIMO_MODEL,
 });
 

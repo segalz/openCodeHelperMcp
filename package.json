@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Read-only OpenCode analysis MCP helper with fixed NVIDIA defaults.",
+  "description": "Read-only OpenCode analysis MCP helper with fixed Cloudflare, MiMo, and NVIDIA models.",
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test"
