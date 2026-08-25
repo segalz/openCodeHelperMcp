@@ -4,7 +4,7 @@ Local, read-only MCP server for code analysis through the installed OpenCode CLI
 
 It exposes one fixed, read-only analysis tool for normal use plus three provider-specific diagnostic tools:
 
-- `analyze_code`: deterministic fallback — Cloudflare, then MiMo, then NVIDIA GPT-OSS
+- `analyze_code`: deterministic fallback — NVIDIA GPT-OSS, then MiMo, then Cloudflare
 - `analyze_code_cloudflare`: Cloudflare Workers AI `@cf/zai-org/glm-4.7-flash`
 - `analyze_code_mimo`: OpenCode `mimo-v2.5-free`
 - `analyze_code_nvidia`: NVIDIA `openai/gpt-oss-20b`
@@ -12,7 +12,7 @@ It exposes one fixed, read-only analysis tool for normal use plus three provider
 - OpenCode's `plan` agent
 - a 40-second per-provider timeout and 120-second fallback deadline
 
-All tools start `opencode run` with fixed arguments and expose only `directory` and `prompt` to MCP clients—never a model, executable, command, test mode, or write control. `analyze_code` performs the deterministic Cloudflare → MiMo → NVIDIA fallback, with a 120-second total deadline, and returns a sanitized all-providers-failed status only after all three providers fail, time out, or the deadline expires. At that point, a direct Grok fallback is permitted. OpenCode's NDJSON output is accepted only when it contains a valid final text event; error events and malformed output are failures.
+All tools start `opencode run` with fixed arguments and expose only `directory` and `prompt` to MCP clients—never a model, executable, command, test mode, or write control. `analyze_code` performs the deterministic NVIDIA GPT-OSS → MiMo → Cloudflare fallback, with a 120-second total deadline, and returns a sanitized all-providers-failed status only after all three providers fail, time out, or the deadline expires. At that point, a direct Grok fallback is permitted. Model output is constrained to concise English Markdown (120 words maximum); the caller translates the result for the user when needed. OpenCode's NDJSON output is accepted only when it contains a valid final text event; error events and malformed output are failures.
 
 ## Scope
 

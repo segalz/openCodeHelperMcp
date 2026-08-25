@@ -7,9 +7,9 @@ export const DEFAULT_FALLBACK_TIMEOUT_MS = 120_000;
 export const EXIT_GRACE_MS = 1_000;
 export const DEFAULT_VARIANT = "low";
 export const PROVIDERS = Object.freeze([
-  Object.freeze({ key: "cloudflare", model: "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash", title: "Analyze code with Cloudflare GLM", description: "Read-only code analysis using the fixed Cloudflare Workers AI GLM 4.7 Flash model at low reasoning effort. Use this first." }),
-  Object.freeze({ key: "mimo", model: "opencode/mimo-v2.5-free", title: "Analyze code with MiMo Free", description: "Read-only code analysis using the fixed OpenCode MiMo V2.5 Free model at low reasoning effort. Use this after Cloudflare GLM fails or is insufficient." }),
-  Object.freeze({ key: "nvidia", model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this after MiMo fails or is insufficient." }),
+  Object.freeze({ key: "nvidia", model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this first." }),
+  Object.freeze({ key: "mimo", model: "opencode/mimo-v2.5-free", title: "Analyze code with MiMo Free", description: "Read-only code analysis using the fixed OpenCode MiMo V2.5 Free model at low reasoning effort. Use this after NVIDIA GPT-OSS fails or is insufficient." }),
+  Object.freeze({ key: "cloudflare", model: "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash", title: "Analyze code with Cloudflare GLM", description: "Read-only code analysis using the fixed Cloudflare Workers AI GLM 4.7 Flash model at low reasoning effort. Use this only after NVIDIA GPT-OSS and MiMo fail or are insufficient." }),
 ]);
 
 export const analysisInputSchema = Object.freeze({
@@ -53,7 +53,7 @@ export function createOpenCodeRunner({
   return ({ directory, prompt, model, timeoutMs: requestTimeoutMs }) => {
     const executable = env.OPENCODE_BIN ?? "opencode";
     const args = ["run", "--dir", directory, "--model", model, "--variant", DEFAULT_VARIANT, "--agent", "plan", "--format", "json", [
-      "You are a read-only code analysis assistant.", "Do not create, edit, delete, rename, format, or apply files.", "Do not run commands that change the workspace or system state.", "Use search and read operations only.", "Never inspect node_modules, .git, dist, build, coverage, .next, or out unless the user explicitly asks about that exact directory.", "Prefer the smallest relevant files and directories; do not glob an entire workspace when a focused search will answer the question.", "Return a concise answer with relevant files, symbols, and evidence.", "\nUser request:", prompt,
+      "You are a read-only code analysis assistant.", "Do not create, edit, delete, rename, format, or apply files.", "Do not run commands that change the workspace or system state.", "Use search and read operations only.", "Never inspect node_modules, .git, dist, build, coverage, .next, or out unless the user explicitly asks about that exact directory.", "Prefer the smallest relevant files and directories; do not glob an entire workspace when a focused search will answer the question.", "Respond only in concise English Markdown. Use clear headings and short bullets. Do not use Hebrew, include a preamble, a reasoning trace, or code excerpts unless explicitly requested. Keep the answer within 120 words.", "\nUser request:", prompt,
     ].join("\n")];
     const effectiveTimeoutMs = Math.min(validTimeout(timeoutMs, DEFAULT_TIMEOUT_MS), validTimeout(requestTimeoutMs, Infinity));
     return new Promise((resolve) => {
@@ -115,7 +115,7 @@ export function registerAnalysisTools(server, { runner, isWithinAllowedRoot, res
     return result.error ? { content: [{ type: "text", text: result.error }], isError: true } : { content: [{ type: "text", text: result.text }] };
   };
   for (const provider of PROVIDERS) server.registerTool(`analyze_code_${provider.key}`, { title: provider.title, description: provider.description, inputSchema: analysisInputSchema }, makeHandler(provider));
-  server.registerTool("analyze_code", { title: "Analyze code with deterministic OpenCode fallback", description: "Read-only code analysis with fixed Cloudflare, MiMo, then NVIDIA fallback. Use this first.", inputSchema: analysisInputSchema }, async ({ directory, prompt }) => {
+  server.registerTool("analyze_code", { title: "Analyze code with deterministic OpenCode fallback", description: "Read-only code analysis with fixed NVIDIA GPT-OSS, MiMo, then Cloudflare fallback. Use this first.", inputSchema: analysisInputSchema }, async ({ directory, prompt }) => {
     const validationError = validate(directory);
     if (validationError) return { content: [{ type: "text", text: validationError }], isError: true };
     const result = await runWithFallback({ directory: resolvePath(directory), prompt, runner });

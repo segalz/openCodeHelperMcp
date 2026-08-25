@@ -12,8 +12,8 @@ function fakeChild({ pid = 1234 } = {}) {
   return child;
 }
 
-test("NVIDIA fallback is fixed to GPT-OSS 20B", () => {
-  assert.deepEqual(PROVIDERS[2], { key: "nvidia", model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this after MiMo fails or is insufficient." });
+test("NVIDIA fallback is first and fixed to GPT-OSS 20B", () => {
+  assert.deepEqual(PROVIDERS[0], { key: "nvidia", model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this first." });
 });
 
 test("NDJSON parser returns only the final text and rejects errors or invalid output", () => {
@@ -23,14 +23,14 @@ test("NDJSON parser returns only the final text and rejects errors or invalid ou
   assert.deepEqual(parseOpenCodeNdjson("plain text"), { error: "OpenCode returned no valid analysis." });
 });
 
-test("fallback stops after Cloudflare succeeds", async () => {
+test("fallback stops after NVIDIA succeeds", async () => {
   const calls = [];
-  const result = await runWithFallback({ directory, prompt: "inspect", runner: async (call) => { calls.push(call); return { text: "cloudflare answer" }; } });
-  assert.equal(result.provider, "cloudflare"); assert.deepEqual(calls.map((call) => call.model), [PROVIDERS[0].model]);
+  const result = await runWithFallback({ directory, prompt: "inspect", runner: async (call) => { calls.push(call); return { text: "nvidia answer" }; } });
+  assert.equal(result.provider, "nvidia"); assert.deepEqual(calls.map((call) => call.model), [PROVIDERS[0].model]);
 });
 
-test("fallback advances Cloudflare to MiMo and then NVIDIA GPT-OSS", async () => {
-  for (const [outcomes, expected] of [[[{ error: "quota" }, { text: "mimo" }], "mimo"], [[{ error: "quota" }, { error: "unavailable" }, { text: "nvidia" }], "nvidia"]]) {
+test("fallback advances NVIDIA to MiMo and then Cloudflare", async () => {
+  for (const [outcomes, expected] of [[[{ error: "quota" }, { text: "mimo" }], "mimo"], [[{ error: "quota" }, { error: "unavailable" }, { text: "cloudflare" }], "cloudflare"]]) {
     let index = 0; const calls = [];
     const result = await runWithFallback({ directory, prompt: "inspect", runner: async (call) => { calls.push(call); return outcomes[index++]; } });
     assert.equal(result.provider, expected); assert.deepEqual(calls.map((call) => call.model), PROVIDERS.slice(0, calls.length).map((provider) => provider.model));
@@ -56,6 +56,7 @@ test("runner directly launches the fixed executable with low and plan arguments"
   assert.deepEqual(await pending, { text: "final analysis" });
   const [executable, args, options] = invocations[0];
   assert.equal(executable, "C:\\tools\\opencode.exe"); assert.deepEqual(args.slice(0, 10), ["run", "--dir", directory, "--model", PROVIDERS[0].model, "--variant", DEFAULT_VARIANT, "--agent", "plan", "--format"]); assert.equal(options.shell, false);
+  assert.match(args.at(-1), /Respond only in concise English Markdown/); assert.match(args.at(-1), /within 120 words/);
 });
 
 test("runner terminates only its Windows child tree and resolves after timeout grace without close", async () => {
