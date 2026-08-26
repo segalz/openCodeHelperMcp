@@ -17,6 +17,7 @@ import {
   sanitizeOllamaOutput,
   createOpenCodeRunner,
   defaultKillProcessTree,
+  formatOrchestratedResult,
   isBlockedOllamaName,
   isBlockedOllamaPath,
   isConnectionOrAddressFamilyError,
@@ -166,10 +167,10 @@ test("Ollama success posts a fixed native chat payload", async () => {
   const runner = createOllamaRunner({
     fetchImpl: async (url, init) => {
       posts.push({ url, init });
-      return jsonResponse({ message: { role: "assistant", content: "final ollama" } });
+      return jsonResponse({ message: { role: "assistant", content: "## Analysis\nfinal ollama" } });
     },
   });
-  assert.deepEqual(await runner({ directory, prompt: "map architecture", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "final ollama" });
+  assert.deepEqual(await runner({ directory, prompt: "map architecture", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "## Analysis\nfinal ollama" });
   const body = JSON.parse(posts[0].init.body);
   assert.equal(posts[0].url, OLLAMA_PRIMARY_URL);
   assert.equal(posts[0].init.method, "POST");
@@ -182,12 +183,14 @@ test("Ollama success posts a fixed native chat payload", async () => {
 });
 
 test("Ollama strips leaked reasoning and enforces the requested word cap", async () => {
-  const leaked = "private reasoning\n</think>\n## Result\n" + Array.from({ length: 50 }, (_, index) => `word${index + 1}`).join(" ");
+  const leaked = "<think>private reasoning with a fake ## Analysis marker</think>\n## Analysis\nThe literal `## Analysis` inside this sentence is not a heading. " + Array.from({ length: 50 }, (_, index) => `word${index + 1}`).join(" ");
   const cleaned = sanitizeOllamaOutput(leaked, 40);
   assert.doesNotMatch(cleaned, /reasoning|think/i);
-  assert.match(cleaned, /^## Result/);
+  assert.match(cleaned, /^## Analysis\n/);
+  assert.match(cleaned, /The literal `## Analysis` inside this sentence/);
   assert.equal(cleaned.split(/\s+/).length, 40);
   assert.match(cleaned, /…$/);
+  assert.equal(sanitizeOllamaOutput("unfinished fragment only", 40), "");
 
   const runner = createOllamaRunner({
     fetchImpl: async () => jsonResponse({ message: { role: "assistant", content: leaked } }),
@@ -196,16 +199,33 @@ test("Ollama strips leaked reasoning and enforces the requested word cap", async
   assert.equal(result.text, cleaned);
 });
 
+test("orchestrated MCP results expose only safe provider and attempt metadata", () => {
+  const success = formatOrchestratedResult({
+    provider: "nvidia",
+    attempts: [{ provider: "ollama", status: "timeout", privateError: "secret" }],
+    text: "## Analysis\nComplete result.",
+  });
+  assert.match(success, /Provider: nvidia/);
+  assert.match(success, /Previous attempts: ollama:timeout/);
+  assert.match(success, /## Analysis\nComplete result\./);
+  assert.doesNotMatch(success, /secret/);
+
+  const failed = formatOrchestratedResult({ error: "all-providers-failed", attempts: [{ provider: "ollama", status: "failed" }] });
+  assert.match(failed, /Provider: none/);
+  assert.match(failed, /ollama:failed/);
+  assert.match(failed, /direct Grok fallback is permitted/);
+});
+
 test("Ollama falls back to IPv4 only on a connection failure", async () => {
   const posts = [];
   const runner = createOllamaRunner({
     fetchImpl: async (url) => {
       posts.push(url);
       if (url === OLLAMA_PRIMARY_URL) throw Object.assign(new Error("fetch failed"), { code: "ENOTFOUND" });
-      return jsonResponse({ message: { role: "assistant", content: "via ipv4" } });
+      return jsonResponse({ message: { role: "assistant", content: "## Analysis\nvia ipv4" } });
     },
   });
-  assert.deepEqual(await runner({ directory, prompt: "inspect", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "via ipv4" });
+  assert.deepEqual(await runner({ directory, prompt: "inspect", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "## Analysis\nvia ipv4" });
   assert.deepEqual(posts, [OLLAMA_PRIMARY_URL, OLLAMA_FALLBACK_URL]);
 
   const httpPosts = [];
@@ -226,13 +246,13 @@ test("Ollama executes a bounded read-only tool loop", async () => {
         return jsonResponse({ message: { role: "assistant", content: "", tool_calls: [{ function: { name: "read_file", arguments: { path: "src/a.js" } } }] } });
       }
       assert.match(body.messages.find((message) => message.role === "tool").content, /const x = 1/);
-      return jsonResponse({ message: { role: "assistant", content: "saw const" } });
+      return jsonResponse({ message: { role: "assistant", content: "## Analysis\nsaw const" } });
     },
     readFileImpl: async () => "const x = 1;\n",
     realpathImpl: async (value) => value,
     statImpl: async () => ({ isFile: () => true }),
   });
-  assert.deepEqual(await runner({ directory, prompt: "read a", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "saw const" });
+  assert.deepEqual(await runner({ directory, prompt: "read a", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "## Analysis\nsaw const" });
 });
 
 test("Ollama rejects traversal and symlink escapes", async () => {
@@ -277,7 +297,7 @@ test("Ollama never calls destructive endpoints", async () => {
       assert.equal(init.method, "POST");
       assert.match(url, /\/api\/chat$/);
       assert.doesNotMatch(url, /\/api\/(generate|pull|push|delete|create)/);
-      return jsonResponse({ message: { role: "assistant", content: "ok" } });
+      return jsonResponse({ message: { role: "assistant", content: "## Analysis\nok" } });
     },
   });
   await runner({ directory, prompt: "x", model: PROVIDERS[0].model, timeoutMs: 1_000 });

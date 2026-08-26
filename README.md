@@ -17,7 +17,7 @@ MCP input is only `directory`, `prompt`, and optional `maxWords` / `budgetMs`. C
 - `POST http://Zvis-MacBook-Pro.local:11434/api/chat`
 - IPv4 fallback `http://10.100.102.8:11434/api/chat` only on connection or address-family errors
 - Fixed payload fields: `think: false`, `keep_alive: "30m"`, `stream: false`
-- Leaked reasoning tags are removed and the requested output word cap is enforced locally before returning MCP text.
+- Native Ollama final answers must contain the `## Analysis` marker. Leaked reasoning tags are removed, incomplete fragments are rejected, and the requested output word cap is enforced locally before returning MCP text.
 - Bounded read-only tool loop (no shell): `list_files`, `search_text`, `read_file`
 - Canonical path checks under the allowed workspace; rejects traversal and symlink/reparse escapes
 - Skips `node_modules`, `.git`, `build`, `vendor`, binaries, hidden paths, and common credential files such as `.env`, `*.pem`, and `id_rsa`
@@ -33,6 +33,7 @@ By default, target folders must resolve canonically under `C:\Develop`, includin
 
 Callers choose `budgetMs` from request complexity (roughly 90 seconds focused, 180 seconds multi-file, or 270 seconds deep). The helper dynamically redistributes unused time across the fixed provider chain without duplicate provider calls.
 Ollama receives half of focused and multi-file budgets, and two-thirds of a deep budget (180 seconds out of 270); unused time remains available to the fallback providers.
+The orchestrated MCP result reports the successful provider and sanitized statuses for any previous attempts before the analysis text. It never includes raw provider errors or credentials.
 
 ## Run locally
 

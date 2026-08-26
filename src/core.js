@@ -501,7 +501,7 @@ export function createOllamaRunner({
           ...ANALYSIS_AUTHORITY_RULES,
           "Use only the provided tools list_files, search_text, and read_file. Never request shell, write, delete, or network tools.",
           "Stay inside the workspace. Prefer the smallest relevant files.",
-          `Respond only in concise English Markdown. No Hebrew, preamble, or reasoning traces. Keep the answer within ${wordCap} words.`,
+          `Begin the final answer exactly with "## Analysis". Respond only in concise English Markdown. No Hebrew, preamble, or reasoning traces. Keep the answer within ${wordCap} words.`,
         ].join("\n"),
       },
       { role: "user", content: prompt },
@@ -586,13 +586,31 @@ export function createOllamaRunner({
 
 export function sanitizeOllamaOutput(rawText, maxWords = DEFAULT_MAX_WORDS) {
   if (typeof rawText !== "string") return "";
-  let text = rawText.trim();
-  const lastThinkEnd = text.toLowerCase().lastIndexOf("</think>");
-  if (lastThinkEnd >= 0) text = text.slice(lastThinkEnd + "</think>".length).trim();
-  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<\/?think>/gi, "").trim();
+  const withoutReasoning = rawText.replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "").replace(/<\/?think\b[^>]*>/gi, "").trim();
+  const headingPattern = /^## Analysis[ \t]*\r?$/gm;
+  const headings = [...withoutReasoning.matchAll(headingPattern)];
+  if (headings.length === 0) return "";
+  const text = withoutReasoning.slice(headings.at(-1).index).trim();
   const cap = clampNumber(maxWords, MIN_MAX_WORDS, MAX_MAX_WORDS, DEFAULT_MAX_WORDS);
-  const words = text.split(/\s+/).filter(Boolean);
-  return words.length <= cap ? text : `${words.slice(0, cap).join(" ")}…`;
+  const words = [...text.matchAll(/\S+/g)];
+  if (words.length <= cap) return text;
+  const lastWord = words[cap - 1];
+  return `${text.slice(0, lastWord.index + lastWord[0].length).trimEnd()}…`;
+}
+
+export function formatOrchestratedResult(result) {
+  const attempts = Array.isArray(result?.attempts)
+    ? result.attempts.map(({ provider, status }) => `${provider}:${status}`).join(", ")
+    : "";
+  const metadata = [
+    "## CodeHelper",
+    `- Provider: ${result?.provider ?? "none"}`,
+    `- Previous attempts: ${attempts || "none"}`,
+  ].join("\n");
+  if (result?.error) {
+    return `${metadata}\n\nAll analysis providers failed; direct Grok fallback is permitted.`;
+  }
+  return `${metadata}\n\n${String(result?.text ?? "").trim()}`;
 }
 
 export function allocateProviderTimeoutMs(providers, index, remainingMs, totalBudgetMs = remainingMs) {
@@ -647,6 +665,8 @@ export function registerAnalysisTools(server, { runner, ollamaRunner = createOll
     const validated = await validate(directory);
     if (validated.error) return { content: [{ type: "text", text: validated.error }], isError: true };
     const result = await runWithFallback({ directory: validated.directory, prompt, runner, ollamaRunner, maxWords, budgetMs });
-    return result.error ? { content: [{ type: "text", text: "All analysis providers failed; direct Grok fallback is permitted." }], isError: true } : { content: [{ type: "text", text: result.text }] };
+    return result.error
+      ? { content: [{ type: "text", text: formatOrchestratedResult(result) }], isError: true }
+      : { content: [{ type: "text", text: formatOrchestratedResult(result) }] };
   });
 }
