@@ -8,13 +8,20 @@ import {
   OLLAMA_PRIMARY_URL,
   OLLAMA_THINK,
   OLLAMA_TOOL_DEFS,
+  OPENCODE_MAX_STDOUT_BYTES,
   PROVIDERS,
+  allocateProviderTimeoutMs,
   analysisInputSchema,
+  createOllamaToolExecutor,
   createOllamaRunner,
   createOpenCodeRunner,
+  defaultKillProcessTree,
+  isBlockedOllamaName,
+  isBlockedOllamaPath,
   isConnectionOrAddressFamilyError,
   parseOpenCodeNdjson,
   registerAnalysisTools,
+  resolvePathWithinAllowedRoots,
   resolveSafeWorkspacePath,
   runWithFallback,
 } from "../src/core.js";
@@ -109,6 +116,23 @@ test("OpenCode runner directly launches the fixed executable in plan/low mode", 
   assert.equal(options.shell, false);
 });
 
+test("Grok-selected provider timeout overrides the OpenCode default timeout", async () => {
+  const child = fakeChild();
+  const timers = [];
+  const runner = createOpenCodeRunner({
+    spawnImpl: () => child,
+    setTimeoutImpl: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeoutImpl: () => {},
+    env: { OPENCODE_BIN: "C:\\tools\\opencode.exe", OPENCODE_HELPER_TIMEOUT_MS: "40000" },
+    platform: "win32",
+  });
+  const pending = runner({ directory, prompt: "deep review", model: PROVIDERS[1].model, timeoutMs: 60_000 });
+  child.stdout.emit("data", '{"type":"text","text":"complete"}\n');
+  child.emit("close", 0);
+  assert.deepEqual(await pending, { text: "complete" });
+  assert.equal(timers[0].delay, 60_000);
+});
+
 test("all MCP tools keep provider settings internal", async () => {
   const tools = new Map();
   registerAnalysisTools(
@@ -116,7 +140,7 @@ test("all MCP tools keep provider settings internal", async () => {
     {
       runner: async ({ model }) => ({ text: model }),
       ollamaRunner: async ({ model }) => ({ text: model }),
-      isWithinAllowedRoot: () => true,
+      resolveAllowedPath: async (value) => value,
     },
   );
   assert.deepEqual(Object.keys(analysisInputSchema), ["directory", "prompt", "maxWords", "budgetMs"]);
@@ -242,4 +266,168 @@ test("Ollama never calls destructive endpoints", async () => {
   });
   await runner({ directory, prompt: "x", model: PROVIDERS[0].model, timeoutMs: 1_000 });
   assert.equal(seen.length, 1);
+});
+
+test("canonical allowed-root resolution rejects junction escapes and returns the real path", async () => {
+  const escaped = await resolvePathWithinAllowedRoots("C:\\Develop\\link", ["C:\\Develop"], {
+    realpathImpl: async (value) => String(value).endsWith("link") ? "C:\\Outside\\target" : value,
+  });
+  assert.equal(escaped, null);
+
+  const canonical = await resolvePathWithinAllowedRoots("C:\\Develop\\project", ["C:\\Develop"], {
+    realpathImpl: async (value) => String(value).endsWith("project") ? "C:\\Develop\\real-project" : value,
+  });
+  assert.equal(canonical, "C:\\Develop\\real-project");
+});
+
+test("MCP handlers pass only the canonical allowed path to providers", async () => {
+  const tools = new Map();
+  const directories = [];
+  registerAnalysisTools(
+    { registerTool: (name, config, handler) => tools.set(name, { config, handler }) },
+    {
+      runner: async ({ directory: value }) => { directories.push(value); return { text: "remote" }; },
+      ollamaRunner: async ({ directory: value }) => { directories.push(value); return { text: "local" }; },
+      resolveAllowedPath: async () => "C:\\Develop\\canonical",
+    },
+  );
+  const response = await tools.get("analyze_code").handler({ directory, prompt: "inspect" });
+  assert.equal(response.isError, undefined);
+  assert.deepEqual(directories, ["C:\\Develop\\canonical"]);
+});
+
+test("OpenCode errors never expose raw stderr", async () => {
+  const child = fakeChild();
+  const runner = createOpenCodeRunner({
+    spawnImpl: () => child,
+    setTimeoutImpl: () => 1,
+    clearTimeoutImpl: () => {},
+    env: { OPENCODE_BIN: "C:\\tools\\opencode.exe" },
+    timeoutMs: 10_000,
+  });
+  const pending = runner({ directory, prompt: "inspect", model: PROVIDERS[1].model });
+  child.stderr.emit("data", "private diagnostic details\n");
+  child.emit("close", 1);
+  const result = await pending;
+  assert.match(result.error, /exited with code 1/);
+  assert.doesNotMatch(result.error, /private diagnostic details/);
+});
+
+test("OpenCode runner bounds stdout and terminates only its child", async () => {
+  const child = fakeChild({ pid: 4321 });
+  const killed = [];
+  const runner = createOpenCodeRunner({
+    spawnImpl: () => child,
+    setTimeoutImpl: () => 1,
+    clearTimeoutImpl: () => {},
+    killProcessTreeImpl: (target) => { killed.push(target.pid); target.emit("close", null); },
+    env: { OPENCODE_BIN: "C:\\tools\\opencode.exe" },
+    timeoutMs: 10_000,
+  });
+  const pending = runner({ directory, prompt: "inspect", model: PROVIDERS[1].model });
+  child.stdout.emit("data", "x".repeat(OPENCODE_MAX_STDOUT_BYTES + 1));
+  assert.deepEqual(await pending, { error: "OpenCode output exceeded the size limit." });
+  assert.deepEqual(killed, [4321]);
+});
+
+test("Windows tree termination targets only the known child pid", () => {
+  const invocations = [];
+  const terminator = new EventEmitter();
+  defaultKillProcessTree({ pid: 4242, kill: () => assert.fail("fallback kill should not run") }, {
+    platform: "win32",
+    spawnImpl: (...args) => { invocations.push(args); return terminator; },
+  });
+  assert.equal(invocations[0][0], "taskkill");
+  assert.deepEqual(invocations[0][1], ["/pid", "4242", "/t", "/f"]);
+  assert.equal(invocations[0][2].shell, false);
+});
+
+test("Ollama rejects oversized files before reading them", async () => {
+  let reads = 0;
+  const execute = createOllamaToolExecutor({
+    workspaceRoot: directory,
+    realpathImpl: async (value) => value,
+    statImpl: async () => ({ isFile: () => true, size: 70_000 }),
+    readFileImpl: async () => { reads += 1; return "too large"; },
+  });
+  assert.match((await execute("read_file", { path: "big.js" })).error, /size limit/);
+  assert.equal(reads, 0);
+});
+
+test("Ollama search skips oversized files before reading them", async () => {
+  let reads = 0;
+  const execute = createOllamaToolExecutor({
+    workspaceRoot: directory,
+    realpathImpl: async (value) => value,
+    readdirImpl: async () => [{ name: "big.js", isDirectory: () => false }],
+    statImpl: async () => ({ isFile: () => true, size: 70_000 }),
+    readFileImpl: async () => { reads += 1; return "needle"; },
+  });
+  assert.equal((await execute("search_text", { query: "needle" })).text, "(no matches)");
+  assert.equal(reads, 0);
+});
+
+test("Ollama blocks hidden and credential paths in list search and direct read", async () => {
+  assert.equal(isBlockedOllamaName(".env"), true);
+  assert.equal(isBlockedOllamaName("id_rsa"), true);
+  assert.equal(isBlockedOllamaName("cert.pem"), true);
+  assert.equal(isBlockedOllamaName("src.js"), false);
+  assert.equal(isBlockedOllamaPath("config/.private/token.txt"), true);
+
+  let reads = 0;
+  const execute = createOllamaToolExecutor({
+    workspaceRoot: directory,
+    realpathImpl: async (value) => value,
+    readdirImpl: async () => [
+      { name: ".env", isDirectory: () => false },
+      { name: "NODE_MODULES", isDirectory: () => true },
+      { name: "ok.js", isDirectory: () => false },
+    ],
+    statImpl: async () => ({ isFile: () => true, size: 6 }),
+    readFileImpl: async () => { reads += 1; return "KEY=1\n"; },
+  });
+  assert.equal((await execute("list_files", { path: "." })).text, "file\tok.js");
+  assert.match((await execute("read_file", { path: ".env" })).error, /blocked/);
+  assert.match((await execute("search_text", { query: "KEY" })).text, /ok\.js:1:KEY=1/);
+  assert.equal(reads, 1);
+});
+
+test("Ollama search does not recurse through a junction cycle", async () => {
+  let listings = 0;
+  const execute = createOllamaToolExecutor({
+    workspaceRoot: directory,
+    realpathImpl: async (value) => String(value).endsWith("loop") ? directory : value,
+    readdirImpl: async () => {
+      listings += 1;
+      return [{ name: "loop", isDirectory: () => true }];
+    },
+  });
+  assert.equal((await execute("search_text", { query: "needle" })).text, "(no matches)");
+  assert.equal(listings, 1);
+});
+
+test("Grok-selected total budget is dynamically allocated without duplicate provider calls", async () => {
+  const quick = allocateProviderTimeoutMs(PROVIDERS, 0, 90_000);
+  const deep = allocateProviderTimeoutMs(PROVIDERS, 0, 270_000);
+  assert.ok(deep > quick);
+
+  let now = 0;
+  const calls = [];
+  const fail = async (call) => {
+    calls.push({ model: call.model, timeoutMs: call.timeoutMs });
+    now += call.timeoutMs;
+    return { error: "timed out" };
+  };
+  const result = await runWithFallback({
+    directory,
+    prompt: "deep review",
+    budgetMs: 270_000,
+    nowImpl: () => now,
+    ollamaRunner: fail,
+    runner: fail,
+  });
+  assert.equal(result.error, "all-providers-failed");
+  assert.deepEqual(calls.map((call) => call.model), PROVIDERS.map((provider) => provider.model));
+  assert.equal(new Set(calls.map((call) => call.model)).size, PROVIDERS.length);
+  assert.ok(calls.reduce((sum, call) => sum + call.timeoutMs, 0) <= 270_000);
 });

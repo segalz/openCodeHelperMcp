@@ -31,6 +31,17 @@ export const OLLAMA_BINARY_EXTS = Object.freeze([
   ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip",
   ".7z", ".gz", ".tar", ".rar", ".mp3", ".mp4", ".mov", ".class", ".jar",
 ]);
+export const OLLAMA_BLOCKED_BASENAMES = Object.freeze([
+  ".env", ".env.local", ".env.development", ".env.production", ".env.test",
+  ".npmrc", ".netrc", ".pgpass", ".htpasswd",
+  "credentials", "credentials.json", "secrets.json", "service-account.json",
+  "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "authorized_keys", "known_hosts",
+]);
+export const OLLAMA_BLOCKED_EXTS = Object.freeze([
+  ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore",
+]);
+export const OPENCODE_MAX_STDOUT_BYTES = 1_048_576;
+export const OPENCODE_MAX_STDERR_BYTES = 65_536;
 export const PROVIDERS = Object.freeze([
   Object.freeze({ key: "ollama", kind: "ollama", timeoutMs: 90_000, model: "qwen3.8:27b-mlx", title: "Analyze code with native Mac Ollama", description: "Read-only code analysis using the fixed native Mac Ollama qwen3.8:27b-mlx model with a bounded read-only tool loop. Use this first." }),
   Object.freeze({ key: "nvidia", kind: "opencode", timeoutMs: 20_000, model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this after native Ollama fails or is insufficient." }),
@@ -60,7 +71,7 @@ export const analysisInputSchema = Object.freeze({
   maxWords: z.number().int().min(MIN_MAX_WORDS).max(MAX_MAX_WORDS).optional()
     .describe(`Answer length budget in words (${MIN_MAX_WORDS}-${MAX_MAX_WORDS}, default ${DEFAULT_MAX_WORDS}). Raise it for architecture maps or multi-file traces; lower it for a single focused question.`),
   budgetMs: z.number().int().min(MIN_BUDGET_MS).max(MAX_BUDGET_MS).optional()
-    .describe(`Total wall-clock budget in milliseconds for the whole provider chain (${MIN_BUDGET_MS}-${MAX_BUDGET_MS}, default ${MAX_BUDGET_MS}). The helper divides it across providers; it never exceeds this value.`),
+    .describe(`Choose the total wall-clock budget from request complexity (${MIN_BUDGET_MS}-${MAX_BUDGET_MS}, default ${MAX_BUDGET_MS}): about 90000 for focused, 180000 for multi-file, or 270000 for deep analysis. The helper dynamically divides unused time across providers and never exceeds this value.`),
 });
 
 function validTimeout(value, fallback) {
@@ -100,18 +111,19 @@ export function createOpenCodeRunner({
     const executable = env.OPENCODE_BIN ?? "opencode";
     const wordCap = clampNumber(maxWords, MIN_MAX_WORDS, MAX_MAX_WORDS, DEFAULT_MAX_WORDS);
     const args = ["run", "--dir", directory, "--model", model, "--variant", DEFAULT_VARIANT, "--agent", "plan", "--format", "json", [
-      "You are a read-only code analysis assistant.", ...ANALYSIS_AUTHORITY_RULES, "Do not create, edit, delete, rename, format, or apply files.", "Do not run commands that change the workspace or system state.", "Use search and read operations only.", "Never inspect node_modules, .git, dist, build, coverage, .next, or out unless the user explicitly asks about that exact directory.", "Prefer the smallest relevant files and directories; do not glob an entire workspace when a focused search will answer the question.", `Respond only in concise English Markdown. Use clear headings and short bullets. Do not use Hebrew, include a preamble, a reasoning trace, or code excerpts unless explicitly requested. Keep the answer within ${wordCap} words.`, "\nUser request:", prompt,
+      "You are a read-only code analysis assistant.", ...ANALYSIS_AUTHORITY_RULES, "Do not create, edit, delete, rename, format, or apply files.", "Do not run commands that change the workspace or system state.", "Use search and read operations only.", "Never read hidden paths or common credential files such as .env, .npmrc, id_rsa, credentials.json, secrets.json, *.pem, or *.key.", "Never inspect node_modules, .git, dist, build, coverage, .next, or out unless the user explicitly asks about that exact directory.", "Prefer the smallest relevant files and directories; do not glob an entire workspace when a focused search will answer the question.", `Respond only in concise English Markdown. Use clear headings and short bullets. Do not use Hebrew, include a preamble, a reasoning trace, or code excerpts unless explicitly requested. Keep the answer within ${wordCap} words.`, "\nUser request:", prompt,
     ].join("\n")];
-    const effectiveTimeoutMs = Math.min(validTimeout(timeoutMs, DEFAULT_TIMEOUT_MS), validTimeout(requestTimeoutMs, Infinity));
+    const effectiveTimeoutMs = Math.min(MAX_BUDGET_MS, validTimeout(requestTimeoutMs, validTimeout(timeoutMs, DEFAULT_TIMEOUT_MS)));
     return new Promise((resolve) => {
       let child;
       try {
         child = spawnImpl(executable, args, { cwd: directory, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], env: { ...env, PATH: [path.join(env.APPDATA ?? "", "npm"), path.dirname(execPath), env.PATH ?? ""].filter(Boolean).join(path.delimiter) } });
       } catch (error) {
-        resolve({ error: `Could not start OpenCode: ${error.message}` });
+        resolve({ error: "Could not start OpenCode." });
         return;
       }
-      let stdout = ""; let stderr = ""; let settled = false; let timedOut = false; let exitCode = null;
+      let stdout = ""; let settled = false; let timedOut = false; let exitCode = null;
+      let stdoutBytes = 0; let stderrBytes = 0; let overflowed = false;
       let timeoutTimer; let graceTimer;
       const finish = (result) => {
         if (settled) return;
@@ -122,8 +134,15 @@ export function createOpenCodeRunner({
       };
       const finishFromExit = () => {
         if (timedOut) return finish({ error: "OpenCode analysis timed out." });
-        if (exitCode !== 0) return finish({ error: `OpenCode exited with code ${exitCode}. ${stderr.trim()}`.trim() });
+        if (overflowed) return finish({ error: "OpenCode output exceeded the size limit." });
+        if (exitCode !== 0) return finish({ error: `OpenCode exited with code ${exitCode}.` });
         return finish(parseOpenCodeNdjson(stdout));
+      };
+      const failForOverflow = () => {
+        if (settled || overflowed) return;
+        overflowed = true;
+        terminate(child);
+        graceTimer ??= setTimeoutImpl(() => finish({ error: "OpenCode output exceeded the size limit." }), graceMs);
       };
       timeoutTimer = setTimeoutImpl(() => {
         timedOut = true;
@@ -131,8 +150,24 @@ export function createOpenCodeRunner({
         graceTimer = setTimeoutImpl(() => finish({ error: "OpenCode analysis timed out." }), graceMs);
       }, effectiveTimeoutMs);
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk) => { stdout += chunk; }); child.stderr.on("data", (chunk) => { stderr += chunk; });
-      child.on("error", (error) => finish({ error: `Could not start OpenCode: ${error.message}` }));
+      child.stdout.on("data", (chunk) => {
+        if (settled || overflowed) return;
+        stdoutBytes += Buffer.byteLength(chunk, "utf8");
+        if (stdoutBytes > OPENCODE_MAX_STDOUT_BYTES) {
+          failForOverflow();
+          return;
+        }
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk) => {
+        if (settled || overflowed) return;
+        stderrBytes += Buffer.byteLength(chunk, "utf8");
+        if (stderrBytes > OPENCODE_MAX_STDERR_BYTES) {
+          failForOverflow();
+          return;
+        }
+      });
+      child.on("error", () => finish({ error: overflowed ? "OpenCode output exceeded the size limit." : "Could not start OpenCode." }));
       child.on("exit", (code) => { exitCode = code; graceTimer ??= setTimeoutImpl(finishFromExit, graceMs); });
       child.on("close", (code) => { exitCode = code; finishFromExit(); });
     });
@@ -154,6 +189,26 @@ export function isConnectionOrAddressFamilyError(error) {
     return visit(err.cause, seen);
   };
   return visit(error);
+}
+
+export async function resolvePathWithinAllowedRoots(directory, roots, { realpathImpl = defaultRealpath } = {}) {
+  let targetReal;
+  try {
+    targetReal = await realpathImpl(path.resolve(directory));
+  } catch {
+    return null;
+  }
+  for (const root of roots) {
+    let rootReal;
+    try {
+      rootReal = await realpathImpl(path.resolve(root));
+    } catch {
+      continue;
+    }
+    const relative = path.relative(rootReal, targetReal);
+    if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) return targetReal;
+  }
+  return null;
 }
 
 function messagesContextChars(messages) {
@@ -189,9 +244,24 @@ export async function resolveSafeWorkspacePath(workspaceRoot, requestedPath, {
   return { path: real, relative: realRelative === "" ? "." : realRelative, root: rootReal };
 }
 
-function shouldSkipDirent(name, isDirectory) {
+export function isBlockedOllamaName(name) {
   if (!name || name === "." || name === "..") return true;
-  return isDirectory && (OLLAMA_SKIP_DIRS.includes(name) || name.startsWith("."));
+  if (name.startsWith(".")) return true;
+  const lower = path.basename(name).toLowerCase();
+  if (OLLAMA_BLOCKED_BASENAMES.some((blocked) => blocked.toLowerCase() === lower)) return true;
+  return OLLAMA_BLOCKED_EXTS.includes(path.extname(lower));
+}
+
+export function isBlockedOllamaPath(relativePath) {
+  return String(relativePath ?? "")
+    .split(/[\\/]+/)
+    .filter((part) => part && part !== ".")
+    .some((part) => isBlockedOllamaName(part));
+}
+
+function shouldSkipDirent(name, isDirectory) {
+  if (isBlockedOllamaName(name)) return true;
+  return isDirectory && OLLAMA_SKIP_DIRS.includes(name.toLowerCase());
 }
 
 function isBinaryFilename(name) {
@@ -266,6 +336,7 @@ export function createOllamaToolExecutor({
   };
 
   const listFiles = async ({ path: rel = "." } = {}) => {
+    if (isBlockedOllamaPath(rel)) return { error: "Ollama refused blocked path." };
     const safe = await resolveSafeWorkspacePath(workspaceRoot, rel, { realpathImpl });
     if (safe.error) return safe;
     let entries;
@@ -285,13 +356,17 @@ export function createOllamaToolExecutor({
 
   const readFileTool = async ({ path: rel, offset, limit } = {}) => {
     if (typeof rel !== "string" || !rel.trim()) return { error: "Ollama read_file path is required." };
+    if (isBlockedOllamaPath(rel)) return { error: "Ollama refused blocked file." };
     const safe = await resolveSafeWorkspacePath(workspaceRoot, rel, { realpathImpl });
     if (safe.error) return safe;
-    if (isBinaryFilename(path.basename(safe.path))) return { error: "Ollama refused binary file." };
+    const base = path.basename(safe.path);
+    if (isBlockedOllamaName(base)) return { error: "Ollama refused blocked file." };
+    if (isBinaryFilename(base)) return { error: "Ollama refused binary file." };
     let content;
     try {
       const info = await statImpl(safe.path);
       if (!info.isFile()) return { error: "Ollama read_file target is not a file." };
+      if (info.size > maxFileBytes) return { error: "Ollama file exceeds size limit." };
       content = await readFileImpl(safe.path, "utf8");
     } catch {
       return { error: "Ollama read_file failed." };
@@ -308,13 +383,18 @@ export function createOllamaToolExecutor({
 
   const searchText = async ({ query, path: rel = ".", maxMatches = 20 } = {}) => {
     if (typeof query !== "string" || !query) return { error: "Ollama search_text query is required." };
+    if (isBlockedOllamaPath(rel)) return { error: "Ollama refused blocked path." };
     const safe = await resolveSafeWorkspacePath(workspaceRoot, rel, { realpathImpl });
     if (safe.error) return safe;
     const matches = [];
     const max = Math.min(50, Math.max(1, Number(maxMatches) || 20));
+    const visitedDirectories = new Set();
 
     const walk = async (dir) => {
       if (matches.length >= max) return;
+      const directoryKey = process.platform === "win32" ? String(dir).toLowerCase() : String(dir);
+      if (visitedDirectories.has(directoryKey)) return;
+      visitedDirectories.add(directoryKey);
       let entries;
       try {
         entries = await readdirImpl(dir, { withFileTypes: true });
@@ -332,7 +412,14 @@ export function createOllamaToolExecutor({
           await walk(checked.path);
           continue;
         }
-        if (isBinaryFilename(entry.name)) continue;
+        if (isBlockedOllamaName(entry.name) || isBinaryFilename(entry.name)) continue;
+        let info;
+        try {
+          info = await statImpl(checked.path);
+        } catch {
+          continue;
+        }
+        if (!info.isFile() || info.size > maxFileBytes) continue;
         let content;
         try {
           content = await readFileImpl(checked.path, "utf8");
@@ -492,15 +579,25 @@ export function createOllamaRunner({
   };
 }
 
+export function allocateProviderTimeoutMs(providers, index, remainingMs) {
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return 0;
+  const remainingProviders = providers.slice(index);
+  if (remainingProviders.length <= 1) return Math.max(1, Math.floor(remainingMs));
+  const totalWeight = remainingProviders.reduce((sum, provider) => sum + validTimeout(provider.timeoutMs, 1), 0);
+  const providerWeight = validTimeout(providers[index]?.timeoutMs, 1);
+  return Math.max(1, Math.floor(remainingMs * providerWeight / totalWeight));
+}
+
 export async function runWithFallback({ directory, prompt, runner, ollamaRunner = createOllamaRunner(), maxWords, budgetMs, timeoutMs, nowImpl = Date.now }) {
   const attempts = []; const budget = clampNumber(budgetMs ?? timeoutMs, MIN_BUDGET_MS, MAX_BUDGET_MS, MAX_BUDGET_MS);
   const deadline = nowImpl() + budget;
-  for (const provider of PROVIDERS) {
+  for (let index = 0; index < PROVIDERS.length; index++) {
+    const provider = PROVIDERS[index];
     const remainingMs = deadline - nowImpl();
     if (remainingMs <= 0) return { error: "all-providers-failed", attempts: [...attempts, { provider: provider.key, status: "deadline" }] };
     try {
       const providerRunner = provider.kind === "ollama" ? ollamaRunner : runner;
-      const attemptTimeoutMs = Math.min(remainingMs, validTimeout(provider.timeoutMs, remainingMs));
+      const attemptTimeoutMs = allocateProviderTimeoutMs(PROVIDERS, index, remainingMs);
       const result = await providerRunner({ directory, prompt, model: provider.model, timeoutMs: attemptTimeoutMs, maxWords });
       if (result?.text) return { text: result.text, provider: provider.key, attempts };
       attempts.push({ provider: provider.key, status: /timed out/i.test(result?.error ?? "") ? "timeout" : "failed" });
@@ -509,21 +606,27 @@ export async function runWithFallback({ directory, prompt, runner, ollamaRunner 
   return { error: "all-providers-failed", attempts };
 }
 
-export function registerAnalysisTools(server, { runner, ollamaRunner = createOllamaRunner(), isWithinAllowedRoot, resolvePath = path.resolve, isAbsolute = path.isAbsolute } = {}) {
-  const validate = (directory) => !isAbsolute(directory) ? "The directory must be an absolute path." : !isWithinAllowedRoot(directory) ? "The directory is outside the helper's allowed roots." : null;
+export function registerAnalysisTools(server, { runner, ollamaRunner = createOllamaRunner(), resolveAllowedPath, isAbsolute = path.isAbsolute } = {}) {
+  const validate = async (directory) => {
+    if (!isAbsolute(directory)) return { error: "The directory must be an absolute path." };
+    if (typeof resolveAllowedPath !== "function") return { error: "The helper's allowed-root resolver is unavailable." };
+    const canonicalDirectory = await resolveAllowedPath(directory);
+    if (!canonicalDirectory) return { error: "The directory is outside the helper's allowed roots." };
+    return { directory: canonicalDirectory };
+  };
   const makeHandler = (provider) => async ({ directory, prompt, maxWords, budgetMs }) => {
-    const validationError = validate(directory);
-    if (validationError) return { content: [{ type: "text", text: validationError }], isError: true };
+    const validated = await validate(directory);
+    if (validated.error) return { content: [{ type: "text", text: validated.error }], isError: true };
     const providerRunner = provider.kind === "ollama" ? ollamaRunner : runner;
     const attemptTimeoutMs = Math.min(provider.timeoutMs, clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, MAX_BUDGET_MS));
-    const result = await providerRunner({ directory: resolvePath(directory), prompt, model: provider.model, timeoutMs: attemptTimeoutMs, maxWords });
+    const result = await providerRunner({ directory: validated.directory, prompt, model: provider.model, timeoutMs: attemptTimeoutMs, maxWords });
     return result.error ? { content: [{ type: "text", text: result.error }], isError: true } : { content: [{ type: "text", text: result.text }] };
   };
   for (const provider of PROVIDERS) server.registerTool(`analyze_code_${provider.key}`, { title: provider.title, description: provider.description, inputSchema: analysisInputSchema }, makeHandler(provider));
-  server.registerTool("analyze_code", { title: "Analyze code with deterministic provider fallback", description: "Read-only code analysis with fixed native Mac Ollama qwen3.8:27b-mlx, then NVIDIA GPT-OSS, MiMo, then Cloudflare. Use this first. Set maxWords higher for architecture maps or multi-file traces and lower for a single focused question; set budgetMs lower when a fast answer matters more than depth.", inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs }) => {
-    const validationError = validate(directory);
-    if (validationError) return { content: [{ type: "text", text: validationError }], isError: true };
-    const result = await runWithFallback({ directory: resolvePath(directory), prompt, runner, ollamaRunner, maxWords, budgetMs });
-    return result.error ? { content: [{ type: "text", text: "All OpenCode providers failed; direct Grok fallback is permitted." }], isError: true } : { content: [{ type: "text", text: result.text }] };
+  server.registerTool("analyze_code", { title: "Analyze code with deterministic provider fallback", description: "Read-only code analysis with fixed native Mac Ollama qwen3.8:27b-mlx, then NVIDIA GPT-OSS, MiMo, then Cloudflare. Use this first. Choose maxWords and the total budgetMs from request complexity; the helper dynamically allocates that budget without duplicate provider calls.", inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs }) => {
+    const validated = await validate(directory);
+    if (validated.error) return { content: [{ type: "text", text: validated.error }], isError: true };
+    const result = await runWithFallback({ directory: validated.directory, prompt, runner, ollamaRunner, maxWords, budgetMs });
+    return result.error ? { content: [{ type: "text", text: "All analysis providers failed; direct Grok fallback is permitted." }], isError: true } : { content: [{ type: "text", text: result.text }] };
   });
 }

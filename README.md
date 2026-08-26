@@ -19,14 +19,18 @@ MCP input is only `directory`, `prompt`, and optional `maxWords` / `budgetMs`. C
 - Fixed payload fields: `think: false`, `keep_alive: "30m"`, `stream: false`
 - Bounded read-only tool loop (no shell): `list_files`, `search_text`, `read_file`
 - Canonical path checks under the allowed workspace; rejects traversal and symlink/reparse escapes
-- Skips `node_modules`, `.git`, `build`, `vendor`, binaries, and similar junk trees
+- Skips `node_modules`, `.git`, `build`, `vendor`, binaries, hidden paths, and common credential files such as `.env`, `*.pem`, and `id_rsa`
+- Rejects oversized files before a full read in `read_file` and `search_text`
 - Caps rounds, files, bytes, context, output, and wall time; malformed, empty, unsafe, tool, and timeout errors fail the provider
 
 OpenCode providers still launch `opencode run` with fixed arguments. NDJSON is accepted only with a valid final text event.
+OpenCode child stdout and stderr are memory-bounded; MCP clients receive sanitized errors only. Timeouts and output limits terminate only the known child process tree.
 
 ## Scope
 
-By default, target folders must be under `C:\Develop`. Set `OPENCODE_HELPER_ALLOWED_ROOTS` to a semicolon-separated list of additional allowed absolute paths if needed.
+By default, target folders must resolve canonically under `C:\Develop`, including Windows junction and symlink resolution. Set `OPENCODE_HELPER_ALLOWED_ROOTS` to a semicolon-separated list of additional allowed absolute paths if needed.
+
+Callers choose `budgetMs` from request complexity (roughly 90 seconds focused, 180 seconds multi-file, or 270 seconds deep). The helper dynamically redistributes unused time across the fixed provider chain without duplicate provider calls.
 
 ## Run locally
 
