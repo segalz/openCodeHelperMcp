@@ -1,83 +1,245 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
-import { DEFAULT_FALLBACK_TIMEOUT_MS, DEFAULT_VARIANT, PROVIDERS, analysisInputSchema, createOpenCodeRunner, parseOpenCodeNdjson, registerAnalysisTools, runWithFallback } from "../src/core.js";
+import {
+  DEFAULT_VARIANT,
+  OLLAMA_FALLBACK_URL,
+  OLLAMA_KEEP_ALIVE,
+  OLLAMA_PRIMARY_URL,
+  OLLAMA_THINK,
+  OLLAMA_TOOL_DEFS,
+  PROVIDERS,
+  analysisInputSchema,
+  createOllamaRunner,
+  createOpenCodeRunner,
+  isConnectionOrAddressFamilyError,
+  parseOpenCodeNdjson,
+  registerAnalysisTools,
+  resolveSafeWorkspacePath,
+  runWithFallback,
+} from "../src/core.js";
 
 const directory = "C:\\Develop\\sample";
 
 function fakeChild({ pid = 1234 } = {}) {
-  const stdout = new EventEmitter(); stdout.setEncoding = () => {};
-  const stderr = new EventEmitter(); stderr.setEncoding = () => {};
-  const child = new EventEmitter(); child.pid = pid; child.stdout = stdout; child.stderr = stderr; child.kill = () => child.emit("exit", null);
+  const stdout = new EventEmitter();
+  stdout.setEncoding = () => {};
+  const stderr = new EventEmitter();
+  stderr.setEncoding = () => {};
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.stdout = stdout;
+  child.stderr = stderr;
+  child.kill = () => child.emit("exit", null);
   return child;
 }
 
-test("NVIDIA fallback is first and fixed to GPT-OSS 20B", () => {
-  assert.deepEqual(PROVIDERS[0], { key: "nvidia", model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this first." });
+function jsonResponse(data, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async json() { return data; },
+  };
+}
+
+test("native Mac Ollama is the fixed first provider", () => {
+  assert.deepEqual(PROVIDERS.map((provider) => provider.key), ["ollama", "nvidia", "mimo", "cloudflare"]);
+  assert.equal(PROVIDERS[0].kind, "ollama");
+  assert.equal(PROVIDERS[0].model, "qwen3.8:27b-mlx");
+  assert.equal(OLLAMA_PRIMARY_URL, "http://Zvis-MacBook-Pro.local:11434/api/chat");
+  assert.equal(OLLAMA_FALLBACK_URL, "http://10.100.102.8:11434/api/chat");
+  assert.equal(OLLAMA_THINK, false);
+  assert.equal(OLLAMA_KEEP_ALIVE, "30m");
 });
 
-test("NDJSON parser returns only the final text and rejects errors or invalid output", () => {
+test("NDJSON parser accepts only final text and rejects error output", () => {
   assert.deepEqual(parseOpenCodeNdjson('{"type":"text","text":"draft"}\n{"type":"text","text":"final"}'), { text: "final" });
-  assert.deepEqual(parseOpenCodeNdjson('{"type":"error","error":"private detail"}'), { error: "OpenCode reported an analysis error." });
-  assert.deepEqual(parseOpenCodeNdjson('{"type":"message","part":{"type":"error","text":"private detail"}}'), { error: "OpenCode reported an analysis error." });
+  assert.deepEqual(parseOpenCodeNdjson('{"type":"error","error":"private"}'), { error: "OpenCode reported an analysis error." });
   assert.deepEqual(parseOpenCodeNdjson("plain text"), { error: "OpenCode returned no valid analysis." });
 });
 
-test("fallback stops after NVIDIA succeeds", async () => {
-  const calls = [];
-  const result = await runWithFallback({ directory, prompt: "inspect", runner: async (call) => { calls.push(call); return { text: "nvidia answer" }; } });
-  assert.equal(result.provider, "nvidia"); assert.deepEqual(calls.map((call) => call.model), [PROVIDERS[0].model]);
+test("fallback stops after Ollama succeeds", async () => {
+  let remoteCalls = 0;
+  const result = await runWithFallback({
+    directory,
+    prompt: "inspect",
+    ollamaRunner: async () => ({ text: "ollama answer" }),
+    runner: async () => { remoteCalls += 1; return { text: "remote" }; },
+  });
+  assert.equal(result.provider, "ollama");
+  assert.equal(remoteCalls, 0);
 });
 
-test("fallback advances NVIDIA to MiMo and then Cloudflare", async () => {
-  for (const [outcomes, expected] of [[[{ error: "quota" }, { text: "mimo" }], "mimo"], [[{ error: "quota" }, { error: "unavailable" }, { text: "cloudflare" }], "cloudflare"]]) {
-    let index = 0; const calls = [];
-    const result = await runWithFallback({ directory, prompt: "inspect", runner: async (call) => { calls.push(call); return outcomes[index++]; } });
-    assert.equal(result.provider, expected); assert.deepEqual(calls.map((call) => call.model), PROVIDERS.slice(0, calls.length).map((provider) => provider.model));
+test("fallback advances from Ollama to NVIDIA, MiMo, and Cloudflare", async () => {
+  for (const successIndex of [0, 1, 2]) {
+    const calls = [];
+    const result = await runWithFallback({
+      directory,
+      prompt: "inspect",
+      ollamaRunner: async () => ({ error: "unavailable" }),
+      runner: async (call) => {
+        calls.push(call.model);
+        return calls.length - 1 === successIndex ? { text: "answer" } : { error: "unavailable" };
+      },
+    });
+    assert.equal(result.provider, PROVIDERS[successIndex + 1].key);
+    assert.deepEqual(calls, PROVIDERS.slice(1, successIndex + 2).map((provider) => provider.model));
   }
 });
 
-test("fallback records timeouts and enforces its total deadline", async () => {
-  for (const failingIndex of [0, 1, 2]) {
-    const result = await runWithFallback({ directory, prompt: "inspect", runner: async ({ model }) => ({ error: model === PROVIDERS[failingIndex].model ? "OpenCode analysis timed out." : "unavailable" }) });
-    assert.equal(result.error, "all-providers-failed"); assert.equal(result.attempts[failingIndex].status, "timeout");
-  }
-  let now = 0; const calls = [];
-  const deadlineResult = await runWithFallback({ directory, prompt: "inspect", timeoutMs: 10, nowImpl: () => now, runner: async (call) => { calls.push(call); now = 10; return { error: "unavailable" }; } });
-  assert.equal(deadlineResult.error, "all-providers-failed"); assert.deepEqual(deadlineResult.attempts.at(-1), { provider: "mimo", status: "deadline" }); assert.equal(calls[0].timeoutMs, 10);
-  assert.equal(DEFAULT_FALLBACK_TIMEOUT_MS, 120_000);
-});
-
-test("runner directly launches the fixed executable with low and plan arguments", async () => {
-  const child = fakeChild(); const invocations = []; const timers = [];
-  const runner = createOpenCodeRunner({ spawnImpl: (...args) => { invocations.push(args); return child; }, setTimeoutImpl: (callback) => { timers.push(callback); return timers.length; }, clearTimeoutImpl: () => {}, env: { OPENCODE_BIN: "C:\\tools\\opencode.exe" }, platform: "win32", timeoutMs: 10, graceMs: 1 });
-  const pending = runner({ directory, prompt: "inspect", model: PROVIDERS[0].model });
-  child.stdout.emit("data", '{"type":"text","text":"final analysis"}\n'); child.emit("close", 0);
+test("OpenCode runner directly launches the fixed executable in plan/low mode", async () => {
+  const child = fakeChild();
+  const invocations = [];
+  const runner = createOpenCodeRunner({
+    spawnImpl: (...args) => { invocations.push(args); return child; },
+    setTimeoutImpl: () => 1,
+    clearTimeoutImpl: () => {},
+    env: { OPENCODE_BIN: "C:\\tools\\opencode.exe" },
+    platform: "win32",
+    timeoutMs: 10,
+    graceMs: 1,
+  });
+  const pending = runner({ directory, prompt: "inspect", model: PROVIDERS[1].model });
+  child.stdout.emit("data", '{"type":"text","text":"final analysis"}\n');
+  child.emit("close", 0);
   assert.deepEqual(await pending, { text: "final analysis" });
   const [executable, args, options] = invocations[0];
-  assert.equal(executable, "C:\\tools\\opencode.exe"); assert.deepEqual(args.slice(0, 10), ["run", "--dir", directory, "--model", PROVIDERS[0].model, "--variant", DEFAULT_VARIANT, "--agent", "plan", "--format"]); assert.equal(options.shell, false);
-  assert.match(args.at(-1), /Respond only in concise English Markdown/); assert.match(args.at(-1), /within 120 words/);
+  assert.equal(executable, "C:\\tools\\opencode.exe");
+  assert.deepEqual(args.slice(0, 10), ["run", "--dir", directory, "--model", PROVIDERS[1].model, "--variant", DEFAULT_VARIANT, "--agent", "plan", "--format"]);
+  assert.equal(options.shell, false);
 });
 
-test("runner terminates only its Windows child tree and resolves after timeout grace without close", async () => {
-  const child = fakeChild({ pid: 5678 }); const timers = []; const terminated = [];
-  const runner = createOpenCodeRunner({ spawnImpl: () => child, setTimeoutImpl: (callback) => { timers.push(callback); return timers.length; }, clearTimeoutImpl: () => {}, killProcessTreeImpl: (target) => terminated.push(target.pid), env: { OPENCODE_BIN: "C:\\tools\\opencode.exe" }, platform: "win32", timeoutMs: 10, graceMs: 1 });
-  const pending = runner({ directory, prompt: "inspect", model: PROVIDERS[0].model });
-  timers[0](); assert.deepEqual(terminated, [5678]);
-  timers[1](); assert.deepEqual(await pending, { error: "OpenCode analysis timed out." });
-});
-
-test("runner resolves from exit after grace when inherited streams prevent close", async () => {
-  const child = fakeChild(); const timers = [];
-  const runner = createOpenCodeRunner({ spawnImpl: () => child, setTimeoutImpl: (callback) => { timers.push(callback); return timers.length; }, clearTimeoutImpl: () => {}, env: { OPENCODE_BIN: "C:\\tools\\opencode.exe" }, timeoutMs: 10, graceMs: 1 });
-  const pending = runner({ directory, prompt: "inspect", model: PROVIDERS[0].model });
-  child.stdout.emit("data", '{"part":{"type":"text","text":"exit result"}}\n'); child.emit("exit", 0);
-  timers[1](); assert.deepEqual(await pending, { text: "exit result" });
-});
-
-test("all MCP tools expose only directory and prompt and keep provider selection fixed", async () => {
+test("all MCP tools keep provider settings internal", async () => {
   const tools = new Map();
-  registerAnalysisTools({ registerTool: (name, config, handler) => tools.set(name, { config, handler }) }, { runner: async ({ model }) => ({ text: model }), isWithinAllowedRoot: () => true });
-  assert.deepEqual(Object.keys(analysisInputSchema), ["directory", "prompt"]); assert.equal(tools.size, 4);
-  for (const provider of PROVIDERS) { const tool = tools.get(`analyze_code_${provider.key}`); assert.deepEqual(Object.keys(tool.config.inputSchema), ["directory", "prompt"]); const response = await tool.handler({ directory, prompt: "inspect" }); assert.equal(response.content[0].text, provider.model); }
+  registerAnalysisTools(
+    { registerTool: (name, config, handler) => tools.set(name, { config, handler }) },
+    {
+      runner: async ({ model }) => ({ text: model }),
+      ollamaRunner: async ({ model }) => ({ text: model }),
+      isWithinAllowedRoot: () => true,
+    },
+  );
+  assert.deepEqual(Object.keys(analysisInputSchema), ["directory", "prompt", "maxWords", "budgetMs"]);
+  assert.equal(tools.size, 5);
+  assert.match(tools.get("analyze_code").config.description, /native Mac Ollama/);
+  for (const provider of PROVIDERS) {
+    const tool = tools.get(`analyze_code_${provider.key}`);
+    assert.deepEqual(Object.keys(tool.config.inputSchema), ["directory", "prompt", "maxWords", "budgetMs"]);
+    const response = await tool.handler({ directory, prompt: "inspect" });
+    assert.equal(response.content[0].text, provider.model);
+  }
+});
+
+test("only connection and address-family failures qualify for IPv4 fallback", () => {
+  assert.equal(isConnectionOrAddressFamilyError({ code: "ENOTFOUND" }), true);
+  assert.equal(isConnectionOrAddressFamilyError({ message: "fetch failed", cause: { code: "EAI_AGAIN" } }), true);
+  assert.equal(isConnectionOrAddressFamilyError({ message: "HTTP 500" }), false);
+});
+
+test("Ollama success posts a fixed native chat payload", async () => {
+  const posts = [];
+  const runner = createOllamaRunner({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, init });
+      return jsonResponse({ message: { role: "assistant", content: "final ollama" } });
+    },
+  });
+  assert.deepEqual(await runner({ directory, prompt: "map architecture", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "final ollama" });
+  const body = JSON.parse(posts[0].init.body);
+  assert.equal(posts[0].url, OLLAMA_PRIMARY_URL);
+  assert.equal(posts[0].init.method, "POST");
+  assert.equal(body.model, "qwen3.8:27b-mlx");
+  assert.equal(body.stream, false);
+  assert.equal(body.think, false);
+  assert.equal(body.keep_alive, "30m");
+  assert.deepEqual(body.tools, OLLAMA_TOOL_DEFS);
+  assert.equal(Object.hasOwn(body, "prompt"), false);
+});
+
+test("Ollama falls back to IPv4 only on a connection failure", async () => {
+  const posts = [];
+  const runner = createOllamaRunner({
+    fetchImpl: async (url) => {
+      posts.push(url);
+      if (url === OLLAMA_PRIMARY_URL) throw Object.assign(new Error("fetch failed"), { code: "ENOTFOUND" });
+      return jsonResponse({ message: { role: "assistant", content: "via ipv4" } });
+    },
+  });
+  assert.deepEqual(await runner({ directory, prompt: "inspect", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "via ipv4" });
+  assert.deepEqual(posts, [OLLAMA_PRIMARY_URL, OLLAMA_FALLBACK_URL]);
+
+  const httpPosts = [];
+  const httpRunner = createOllamaRunner({
+    fetchImpl: async (url) => { httpPosts.push(url); return jsonResponse({ error: "busy" }, 503); },
+  });
+  assert.match((await httpRunner({ directory, prompt: "inspect", model: PROVIDERS[0].model, timeoutMs: 5_000 })).error, /HTTP 503/);
+  assert.deepEqual(httpPosts, [OLLAMA_PRIMARY_URL]);
+});
+
+test("Ollama executes a bounded read-only tool loop", async () => {
+  let round = 0;
+  const runner = createOllamaRunner({
+    fetchImpl: async (_url, init) => {
+      round += 1;
+      const body = JSON.parse(init.body);
+      if (round === 1) {
+        return jsonResponse({ message: { role: "assistant", content: "", tool_calls: [{ function: { name: "read_file", arguments: { path: "src/a.js" } } }] } });
+      }
+      assert.match(body.messages.find((message) => message.role === "tool").content, /const x = 1/);
+      return jsonResponse({ message: { role: "assistant", content: "saw const" } });
+    },
+    readFileImpl: async () => "const x = 1;\n",
+    realpathImpl: async (value) => value,
+    statImpl: async () => ({ isFile: () => true }),
+  });
+  assert.deepEqual(await runner({ directory, prompt: "read a", model: PROVIDERS[0].model, timeoutMs: 5_000 }), { text: "saw const" });
+});
+
+test("Ollama rejects traversal and symlink escapes", async () => {
+  const traversal = await resolveSafeWorkspacePath(directory, "../outside", { realpathImpl: async (value) => value });
+  assert.match(traversal.error, /escapes/);
+  const linkEscape = await resolveSafeWorkspacePath(directory, "evil", {
+    realpathImpl: async (value) => (String(value).endsWith("evil") ? "C:\\Outside\\file.txt" : value),
+  });
+  assert.match(linkEscape.error, /link/);
+});
+
+test("Ollama rejects malformed output, unknown tools, round caps, and late replies", async () => {
+  const malformed = createOllamaRunner({ fetchImpl: async () => jsonResponse({ message: null }) });
+  assert.match((await malformed({ directory, prompt: "x", model: PROVIDERS[0].model, timeoutMs: 1_000 })).error, /no valid analysis/);
+
+  const badTool = createOllamaRunner({
+    fetchImpl: async () => jsonResponse({ message: { role: "assistant", tool_calls: [{ function: { name: "shell", arguments: { cmd: "rm" } } }] } }),
+  });
+  assert.match((await badTool({ directory, prompt: "x", model: PROVIDERS[0].model, timeoutMs: 1_000 })).error, /unknown tool/);
+
+  const capped = createOllamaRunner({
+    maxRounds: 1,
+    fetchImpl: async () => jsonResponse({ message: { role: "assistant", tool_calls: [{ function: { name: "list_files", arguments: { path: "." } } }] } }),
+    readdirImpl: async () => [],
+    realpathImpl: async (value) => value,
+  });
+  assert.match((await capped({ directory, prompt: "x", model: PROVIDERS[0].model, timeoutMs: 5_000 })).error, /round cap/);
+
+  let now = 0;
+  const late = createOllamaRunner({
+    nowImpl: () => now,
+    fetchImpl: async () => { now = 100; return jsonResponse({ message: { role: "assistant", content: "late" } }); },
+  });
+  assert.match((await late({ directory, prompt: "x", model: PROVIDERS[0].model, timeoutMs: 10 })).error, /timed out/);
+});
+
+test("Ollama never calls destructive endpoints", async () => {
+  const seen = [];
+  const runner = createOllamaRunner({
+    fetchImpl: async (url, init) => {
+      seen.push({ url, method: init.method });
+      assert.equal(init.method, "POST");
+      assert.match(url, /\/api\/chat$/);
+      assert.doesNotMatch(url, /\/api\/(generate|pull|push|delete|create)/);
+      return jsonResponse({ message: { role: "assistant", content: "ok" } });
+    },
+  });
+  await runner({ directory, prompt: "x", model: PROVIDERS[0].model, timeoutMs: 1_000 });
+  assert.equal(seen.length, 1);
 });

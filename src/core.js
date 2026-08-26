@@ -1,22 +1,41 @@
 import { spawn as defaultSpawn } from "node:child_process";
-import { readdir as defaultReaddir, readFile as defaultReadFile } from "node:fs/promises";
+import {
+  readdir as defaultReaddir,
+  readFile as defaultReadFile,
+  realpath as defaultRealpath,
+  stat as defaultStat,
+} from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
 export const DEFAULT_TIMEOUT_MS = 40_000;
-export const DEFAULT_FALLBACK_TIMEOUT_MS = 300_000;
+export const DEFAULT_FALLBACK_TIMEOUT_MS = 270_000;
 export const EXIT_GRACE_MS = 1_000;
 export const DEFAULT_VARIANT = "low";
-export const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
-export const DEFAULT_OLLAMA_NUM_CTX = 16_384;
-export const OLLAMA_CONTEXT_CHARS = 48_000;
-export const OLLAMA_SKIP_DIRS = Object.freeze(["node_modules", ".git", "dist", "build", "coverage", ".next", "out", ".venv", "__pycache__"]);
-export const OLLAMA_SOURCE_EXTS = Object.freeze([".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".go", ".rs", ".java", ".rb", ".php", ".cs", ".json", ".toml", ".yml", ".yaml"]);
+export const OLLAMA_PRIMARY_URL = "http://Zvis-MacBook-Pro.local:11434/api/chat";
+export const OLLAMA_FALLBACK_URL = "http://10.100.102.8:11434/api/chat";
+export const OLLAMA_KEEP_ALIVE = "30m";
+export const OLLAMA_THINK = false;
+export const OLLAMA_MAX_ROUNDS = 8;
+export const OLLAMA_MAX_FILES = 32;
+export const OLLAMA_MAX_FILE_BYTES = 65_536;
+export const OLLAMA_MAX_TOTAL_BYTES = 262_144;
+export const OLLAMA_MAX_CONTEXT_CHARS = 120_000;
+export const OLLAMA_MAX_OUTPUT_CHARS = 16_000;
+export const OLLAMA_SKIP_DIRS = Object.freeze([
+  "node_modules", ".git", "build", "vendor", "dist", "coverage",
+  ".next", "out", ".venv", "__pycache__", "bin", "obj",
+]);
+export const OLLAMA_BINARY_EXTS = Object.freeze([
+  ".exe", ".dll", ".so", ".dylib", ".a", ".o", ".obj", ".bin", ".wasm",
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip",
+  ".7z", ".gz", ".tar", ".rar", ".mp3", ".mp4", ".mov", ".class", ".jar",
+]);
 export const PROVIDERS = Object.freeze([
-  Object.freeze({ key: "nvidia", kind: "opencode", timeoutMs: 20_000, model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this first." }),
-  Object.freeze({ key: "mimo", kind: "opencode", timeoutMs: 30_000, model: "opencode/mimo-v2.5-free", title: "Analyze code with MiMo Free", description: "Read-only code analysis using the fixed OpenCode MiMo V2.5 Free model at low reasoning effort. Use this after NVIDIA GPT-OSS fails or is insufficient." }),
-  Object.freeze({ key: "cloudflare", kind: "opencode", timeoutMs: 45_000, model: "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash", title: "Analyze code with Cloudflare GLM", description: "Read-only code analysis using the fixed Cloudflare Workers AI GLM 4.7 Flash model at low reasoning effort. Use this only after NVIDIA GPT-OSS and MiMo fail or are insufficient." }),
-  Object.freeze({ key: "ollama", kind: "ollama", timeoutMs: 150_000, model: "gpt-oss:20b", title: "Analyze code with local Ollama", description: "Read-only code analysis using the local Ollama gpt-oss:20b model. Offline last resort; slow. Use this only after every remote provider fails." }),
+  Object.freeze({ key: "ollama", kind: "ollama", timeoutMs: 90_000, model: "qwen3.8:27b-mlx", title: "Analyze code with native Mac Ollama", description: "Read-only code analysis using the fixed native Mac Ollama qwen3.8:27b-mlx model with a bounded read-only tool loop. Use this first." }),
+  Object.freeze({ key: "nvidia", kind: "opencode", timeoutMs: 20_000, model: "nvidia/openai/gpt-oss-20b", title: "Analyze code with NVIDIA GPT-OSS", description: "Read-only code analysis using the fixed NVIDIA OpenAI GPT-OSS 20B model at low reasoning effort. Use this after native Ollama fails or is insufficient." }),
+  Object.freeze({ key: "mimo", kind: "opencode", timeoutMs: 30_000, model: "opencode/mimo-v2.5-free", title: "Analyze code with MiMo Free", description: "Read-only code analysis using the fixed OpenCode MiMo V2.5 Free model at low reasoning effort. Use this after native Ollama and NVIDIA GPT-OSS fail or are insufficient." }),
+  Object.freeze({ key: "cloudflare", kind: "opencode", timeoutMs: 45_000, model: "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash", title: "Analyze code with Cloudflare GLM", description: "Read-only code analysis using the fixed Cloudflare Workers AI GLM 4.7 Flash model at low reasoning effort. Use this only after native Ollama, NVIDIA GPT-OSS, and MiMo fail or are insufficient." }),
 ]);
 
 export const ANALYSIS_AUTHORITY_RULES = Object.freeze([
@@ -120,58 +139,356 @@ export function createOpenCodeRunner({
   };
 }
 
-export async function collectSourceContext(directory, { readdirImpl = defaultReaddir, readFileImpl = defaultReadFile, maxChars = OLLAMA_CONTEXT_CHARS } = {}) {
-  const parts = []; let used = 0;
-  const walk = async (dir) => {
-    if (used >= maxChars) return;
-    let entries;
-    try { entries = await readdirImpl(dir, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      if (used >= maxChars) return;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (!OLLAMA_SKIP_DIRS.includes(entry.name) && !entry.name.startsWith(".")) await walk(full);
-        continue;
-      }
-      if (!OLLAMA_SOURCE_EXTS.includes(path.extname(entry.name).toLowerCase())) continue;
-      let content;
-      try { content = await readFileImpl(full, "utf8"); } catch { continue; }
-      const slice = content.slice(0, Math.max(0, maxChars - used));
-      if (!slice.trim()) continue;
-      parts.push(`--- ${path.relative(directory, full)} ---\n${slice}`);
-      used += slice.length;
-    }
+export function isConnectionOrAddressFamilyError(error) {
+  const codes = new Set([
+    "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH",
+    "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "ERR_NETWORK",
+    "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET",
+  ]);
+  const visit = (err, seen = new Set()) => {
+    if (!err || seen.has(err)) return false;
+    seen.add(err);
+    if (codes.has(err.code)) return true;
+    if (/fetch failed|getaddrinfo|ENOTFOUND|ECONNREFUSED|address family|ipv6|network/i.test(String(err.message ?? ""))) return true;
+    if (Array.isArray(err.errors) && err.errors.some((item) => visit(item, seen))) return true;
+    return visit(err.cause, seen);
   };
-  await walk(directory);
-  return parts.join("\n\n");
+  return visit(error);
+}
+
+function messagesContextChars(messages) {
+  return JSON.stringify(messages).length;
+}
+
+export async function resolveSafeWorkspacePath(workspaceRoot, requestedPath, {
+  realpathImpl = defaultRealpath,
+  resolvePath = path.resolve,
+} = {}) {
+  const rootResolved = resolvePath(workspaceRoot);
+  let rootReal;
+  try {
+    rootReal = await realpathImpl(rootResolved);
+  } catch {
+    return { error: "Ollama workspace root is not accessible." };
+  }
+  const candidate = resolvePath(rootResolved, requestedPath ?? ".");
+  const relative = path.relative(rootResolved, candidate);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    return { error: "Ollama path escapes the workspace." };
+  }
+  let real;
+  try {
+    real = await realpathImpl(candidate);
+  } catch {
+    return { error: "Ollama path is not accessible." };
+  }
+  const realRelative = path.relative(rootReal, real);
+  if (realRelative.startsWith("..") || path.isAbsolute(realRelative)) {
+    return { error: "Ollama path escapes the workspace via link." };
+  }
+  return { path: real, relative: realRelative === "" ? "." : realRelative, root: rootReal };
+}
+
+function shouldSkipDirent(name, isDirectory) {
+  if (!name || name === "." || name === "..") return true;
+  return isDirectory && (OLLAMA_SKIP_DIRS.includes(name) || name.startsWith("."));
+}
+
+function isBinaryFilename(name) {
+  return OLLAMA_BINARY_EXTS.includes(path.extname(name).toLowerCase());
+}
+
+export const OLLAMA_TOOL_DEFS = Object.freeze([
+  {
+    type: "function",
+    function: {
+      name: "list_files",
+      description: "List immediate child files and directories under a workspace-relative path. Read-only.",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string", description: "Workspace-relative directory path. Defaults to '.'." } },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_text",
+      description: "Search for a literal substring in text files under a workspace-relative path. Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          path: { type: "string", description: "Workspace-relative start path. Defaults to '.'." },
+          maxMatches: { type: "integer" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read a UTF-8 text file under the workspace. Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          offset: { type: "integer", description: "Optional 1-based start line." },
+          limit: { type: "integer", description: "Optional max lines." },
+        },
+        required: ["path"],
+      },
+    },
+  },
+]);
+
+export function createOllamaToolExecutor({
+  workspaceRoot,
+  readdirImpl = defaultReaddir,
+  readFileImpl = defaultReadFile,
+  realpathImpl = defaultRealpath,
+  statImpl = defaultStat,
+  caps = {},
+} = {}) {
+  const maxFiles = caps.maxFiles ?? OLLAMA_MAX_FILES;
+  const maxFileBytes = caps.maxFileBytes ?? OLLAMA_MAX_FILE_BYTES;
+  const maxTotalBytes = caps.maxTotalBytes ?? OLLAMA_MAX_TOTAL_BYTES;
+  const state = { filesTouched: 0, bytesRead: 0 };
+
+  const touchFile = (bytes) => {
+    state.filesTouched += 1;
+    state.bytesRead += bytes;
+    if (state.filesTouched > maxFiles) return { error: "Ollama file cap exceeded." };
+    if (state.bytesRead > maxTotalBytes) return { error: "Ollama byte cap exceeded." };
+    return null;
+  };
+
+  const listFiles = async ({ path: rel = "." } = {}) => {
+    const safe = await resolveSafeWorkspacePath(workspaceRoot, rel, { realpathImpl });
+    if (safe.error) return safe;
+    let entries;
+    try {
+      entries = await readdirImpl(safe.path, { withFileTypes: true });
+    } catch {
+      return { error: "Ollama list_files failed." };
+    }
+    const rows = [];
+    for (const entry of entries) {
+      if (shouldSkipDirent(entry.name, entry.isDirectory())) continue;
+      if (!entry.isDirectory() && isBinaryFilename(entry.name)) continue;
+      rows.push(`${entry.isDirectory() ? "dir" : "file"}\t${entry.name}`);
+    }
+    return { text: rows.join("\n") || "(empty)" };
+  };
+
+  const readFileTool = async ({ path: rel, offset, limit } = {}) => {
+    if (typeof rel !== "string" || !rel.trim()) return { error: "Ollama read_file path is required." };
+    const safe = await resolveSafeWorkspacePath(workspaceRoot, rel, { realpathImpl });
+    if (safe.error) return safe;
+    if (isBinaryFilename(path.basename(safe.path))) return { error: "Ollama refused binary file." };
+    let content;
+    try {
+      const info = await statImpl(safe.path);
+      if (!info.isFile()) return { error: "Ollama read_file target is not a file." };
+      content = await readFileImpl(safe.path, "utf8");
+    } catch {
+      return { error: "Ollama read_file failed." };
+    }
+    if (content.includes("\u0000")) return { error: "Ollama refused binary file." };
+    const capped = content.slice(0, maxFileBytes);
+    const overflow = touchFile(Buffer.byteLength(capped, "utf8"));
+    if (overflow) return overflow;
+    const lines = capped.split(/\r?\n/);
+    const start = Number.isInteger(offset) && offset > 0 ? offset - 1 : 0;
+    const end = Number.isInteger(limit) && limit > 0 ? start + limit : lines.length;
+    return { text: lines.slice(start, end).join("\n") };
+  };
+
+  const searchText = async ({ query, path: rel = ".", maxMatches = 20 } = {}) => {
+    if (typeof query !== "string" || !query) return { error: "Ollama search_text query is required." };
+    const safe = await resolveSafeWorkspacePath(workspaceRoot, rel, { realpathImpl });
+    if (safe.error) return safe;
+    const matches = [];
+    const max = Math.min(50, Math.max(1, Number(maxMatches) || 20));
+
+    const walk = async (dir) => {
+      if (matches.length >= max) return;
+      let entries;
+      try {
+        entries = await readdirImpl(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (matches.length >= max) return;
+        if (shouldSkipDirent(entry.name, entry.isDirectory())) continue;
+        const full = path.join(dir, entry.name);
+        const relative = path.relative(safe.root, full);
+        const checked = await resolveSafeWorkspacePath(safe.root, relative, { realpathImpl });
+        if (checked.error) continue;
+        if (entry.isDirectory()) {
+          await walk(checked.path);
+          continue;
+        }
+        if (isBinaryFilename(entry.name)) continue;
+        let content;
+        try {
+          content = await readFileImpl(checked.path, "utf8");
+        } catch {
+          continue;
+        }
+        if (content.includes("\u0000")) continue;
+        const slice = content.slice(0, maxFileBytes);
+        const overflow = touchFile(Buffer.byteLength(slice, "utf8"));
+        if (overflow) throw Object.assign(new Error(overflow.error), { providerError: overflow.error });
+        const relFile = path.relative(safe.root, checked.path);
+        const lines = slice.split(/\r?\n/);
+        for (let i = 0; i < lines.length && matches.length < max; i++) {
+          if (lines[i].includes(query)) matches.push(`${relFile}:${i + 1}:${lines[i].slice(0, 200)}`);
+        }
+      }
+    };
+
+    try {
+      await walk(safe.path);
+    } catch (error) {
+      if (error?.providerError) return { error: error.providerError };
+      return { error: "Ollama search_text failed." };
+    }
+    return { text: matches.join("\n") || "(no matches)" };
+  };
+
+  return async (name, rawArgs) => {
+    let args = rawArgs;
+    if (typeof args === "string") {
+      try { args = JSON.parse(args); } catch { return { error: "Ollama tool arguments are malformed." }; }
+    }
+    if (args == null || typeof args !== "object" || Array.isArray(args)) {
+      return { error: "Ollama tool arguments are malformed." };
+    }
+    if (name === "list_files") return listFiles(args);
+    if (name === "search_text") return searchText(args);
+    if (name === "read_file") return readFileTool(args);
+    return { error: `Ollama unknown tool: ${name}` };
+  };
 }
 
 export function createOllamaRunner({
-  fetchImpl = globalThis.fetch, env = process.env, collectImpl = collectSourceContext,
-  url = env.OLLAMA_HELPER_URL ?? DEFAULT_OLLAMA_URL, numCtx = DEFAULT_OLLAMA_NUM_CTX,
+  fetchImpl = globalThis.fetch,
+  readdirImpl = defaultReaddir,
+  readFileImpl = defaultReadFile,
+  realpathImpl = defaultRealpath,
+  statImpl = defaultStat,
+  nowImpl = Date.now,
+  primaryUrl = OLLAMA_PRIMARY_URL,
+  fallbackUrl = OLLAMA_FALLBACK_URL,
+  maxRounds = OLLAMA_MAX_ROUNDS,
+  maxFiles = OLLAMA_MAX_FILES,
+  maxFileBytes = OLLAMA_MAX_FILE_BYTES,
+  maxTotalBytes = OLLAMA_MAX_TOTAL_BYTES,
+  maxContextChars = OLLAMA_MAX_CONTEXT_CHARS,
+  maxOutputChars = OLLAMA_MAX_OUTPUT_CHARS,
 } = {}) {
   return async ({ directory, prompt, model, timeoutMs: requestTimeoutMs, maxWords }) => {
     const wordCap = clampNumber(maxWords, MIN_MAX_WORDS, MAX_MAX_WORDS, DEFAULT_MAX_WORDS);
-    const source = await collectImpl(directory);
-    if (!source) return { error: "Ollama analysis found no readable source files." };
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), validTimeout(requestTimeoutMs, DEFAULT_TIMEOUT_MS));
-    try {
-      const response = await fetchImpl(url, {
-        method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model, stream: false, options: { num_ctx: numCtx, temperature: 0 },
-          prompt: ["You are a read-only code analysis assistant.", ...ANALYSIS_AUTHORITY_RULES,
-            `Respond only in concise English Markdown. Use clear headings and short bullets. Do not use Hebrew, include a preamble, a reasoning trace, or code excerpts unless explicitly requested. Keep the answer within ${wordCap} words.`,
-            "\nWorkspace source files:", source, "\nUser request:", prompt].join("\n"),
-        }),
+    const budgetMs = validTimeout(requestTimeoutMs, DEFAULT_TIMEOUT_MS);
+    const deadline = nowImpl() + budgetMs;
+    const executeTool = createOllamaToolExecutor({
+      workspaceRoot: directory,
+      readdirImpl,
+      readFileImpl,
+      realpathImpl,
+      statImpl,
+      caps: { maxFiles, maxFileBytes, maxTotalBytes },
+    });
+    const messages = [
+      {
+        role: "system",
+        content: [
+          "You are a read-only code analysis assistant.",
+          ...ANALYSIS_AUTHORITY_RULES,
+          "Use only the provided tools list_files, search_text, and read_file. Never request shell, write, delete, or network tools.",
+          "Stay inside the workspace. Prefer the smallest relevant files.",
+          `Respond only in concise English Markdown. No Hebrew, preamble, or reasoning traces. Keep the answer within ${wordCap} words.`,
+        ].join("\n"),
+      },
+      { role: "user", content: prompt },
+    ];
+    let activeUrl = primaryUrl;
+    let usedFallback = false;
+
+    const postChat = async (body) => {
+      if (nowImpl() > deadline) return { error: "Ollama analysis timed out." };
+      const remaining = Math.max(1, deadline - nowImpl());
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), remaining);
+      try {
+        const response = await fetchImpl(activeUrl, {
+          method: "POST",
+          signal: controller.signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) return { error: `Ollama returned HTTP ${response.status}.` };
+        let data;
+        try {
+          data = await response.json();
+        } catch {
+          return { error: "Ollama returned malformed JSON." };
+        }
+        return { data };
+      } catch (error) {
+        if (error?.name === "AbortError") return { error: "Ollama analysis timed out." };
+        if (!usedFallback && activeUrl === primaryUrl && isConnectionOrAddressFamilyError(error)) {
+          usedFallback = true;
+          activeUrl = fallbackUrl;
+          return postChat(body);
+        }
+        return { error: `Ollama request failed: ${error.message}` };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    for (let round = 0; round < maxRounds; round++) {
+      if (nowImpl() > deadline) return { error: "Ollama analysis timed out." };
+      if (messagesContextChars(messages) > maxContextChars) return { error: "Ollama context cap exceeded." };
+      const posted = await postChat({
+        model,
+        stream: false,
+        think: OLLAMA_THINK,
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        messages,
+        tools: OLLAMA_TOOL_DEFS,
       });
-      if (!response.ok) return { error: `Ollama returned HTTP ${response.status}.` };
-      const data = await response.json();
-      return typeof data?.response === "string" && data.response.trim() ? { text: data.response.trim() } : { error: "Ollama returned no valid analysis." };
-    } catch (error) {
-      return { error: error?.name === "AbortError" ? "Ollama analysis timed out." : `Ollama request failed: ${error.message}` };
-    } finally { clearTimeout(timer); }
+      if (posted.error) return { error: posted.error };
+      if (nowImpl() > deadline) return { error: "Ollama analysis timed out." };
+      const message = posted.data?.message;
+      if (!message || typeof message !== "object") return { error: "Ollama returned no valid analysis." };
+      const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (toolCalls.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: typeof message.content === "string" ? message.content : "",
+          tool_calls: toolCalls,
+        });
+        for (const call of toolCalls) {
+          const name = call?.function?.name;
+          if (typeof name !== "string" || !name) return { error: "Ollama tool call is malformed." };
+          const result = await executeTool(name, call?.function?.arguments);
+          if (result.error) return { error: result.error };
+          messages.push({ role: "tool", tool_name: name, content: String(result.text ?? "").slice(0, maxFileBytes) });
+        }
+        continue;
+      }
+      const text = typeof message.content === "string" ? message.content.trim() : "";
+      if (!text) return { error: "Ollama returned no valid analysis." };
+      if (text.length > maxOutputChars) return { error: "Ollama output cap exceeded." };
+      return { text };
+    }
+    return { error: "Ollama round cap exceeded." };
   };
 }
 
@@ -203,7 +520,7 @@ export function registerAnalysisTools(server, { runner, ollamaRunner = createOll
     return result.error ? { content: [{ type: "text", text: result.error }], isError: true } : { content: [{ type: "text", text: result.text }] };
   };
   for (const provider of PROVIDERS) server.registerTool(`analyze_code_${provider.key}`, { title: provider.title, description: provider.description, inputSchema: analysisInputSchema }, makeHandler(provider));
-  server.registerTool("analyze_code", { title: "Analyze code with deterministic OpenCode fallback", description: "Read-only code analysis with fixed NVIDIA GPT-OSS, MiMo, Cloudflare, then local Ollama fallback. Use this first. Set maxWords higher for architecture maps or multi-file traces and lower for a single focused question; set budgetMs lower when a fast answer matters more than depth.", inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs }) => {
+  server.registerTool("analyze_code", { title: "Analyze code with deterministic provider fallback", description: "Read-only code analysis with fixed native Mac Ollama qwen3.8:27b-mlx, then NVIDIA GPT-OSS, MiMo, then Cloudflare. Use this first. Set maxWords higher for architecture maps or multi-file traces and lower for a single focused question; set budgetMs lower when a fast answer matters more than depth.", inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs }) => {
     const validationError = validate(directory);
     if (validationError) return { content: [{ type: "text", text: validationError }], isError: true };
     const result = await runWithFallback({ directory: resolvePath(directory), prompt, runner, ollamaRunner, maxWords, budgetMs });
