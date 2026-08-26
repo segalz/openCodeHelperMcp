@@ -60,6 +60,9 @@ export const MIN_MAX_WORDS = 40;
 export const MAX_MAX_WORDS = 600;
 export const MIN_BUDGET_MS = 30_000;
 export const MAX_BUDGET_MS = 270_000;
+export const DEEP_BUDGET_THRESHOLD_MS = 240_000;
+export const DEEP_OLLAMA_SHARE = 2 / 3;
+export const STANDARD_OLLAMA_SHARE = 1 / 2;
 
 export function clampNumber(value, min, max, fallback) {
   return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : fallback;
@@ -570,7 +573,9 @@ export function createOllamaRunner({
         }
         continue;
       }
-      const text = typeof message.content === "string" ? message.content.trim() : "";
+      const text = typeof message.content === "string"
+        ? sanitizeOllamaOutput(message.content, wordCap)
+        : "";
       if (!text) return { error: "Ollama returned no valid analysis." };
       if (text.length > maxOutputChars) return { error: "Ollama output cap exceeded." };
       return { text };
@@ -579,8 +584,23 @@ export function createOllamaRunner({
   };
 }
 
-export function allocateProviderTimeoutMs(providers, index, remainingMs) {
+export function sanitizeOllamaOutput(rawText, maxWords = DEFAULT_MAX_WORDS) {
+  if (typeof rawText !== "string") return "";
+  let text = rawText.trim();
+  const lastThinkEnd = text.toLowerCase().lastIndexOf("</think>");
+  if (lastThinkEnd >= 0) text = text.slice(lastThinkEnd + "</think>".length).trim();
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<\/?think>/gi, "").trim();
+  const cap = clampNumber(maxWords, MIN_MAX_WORDS, MAX_MAX_WORDS, DEFAULT_MAX_WORDS);
+  const words = text.split(/\s+/).filter(Boolean);
+  return words.length <= cap ? text : `${words.slice(0, cap).join(" ")}…`;
+}
+
+export function allocateProviderTimeoutMs(providers, index, remainingMs, totalBudgetMs = remainingMs) {
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) return 0;
+  if (index === 0 && providers[0]?.kind === "ollama") {
+    const share = totalBudgetMs >= DEEP_BUDGET_THRESHOLD_MS ? DEEP_OLLAMA_SHARE : STANDARD_OLLAMA_SHARE;
+    return Math.max(1, Math.min(Math.floor(remainingMs), Math.floor(totalBudgetMs * share)));
+  }
   const remainingProviders = providers.slice(index);
   if (remainingProviders.length <= 1) return Math.max(1, Math.floor(remainingMs));
   const totalWeight = remainingProviders.reduce((sum, provider) => sum + validTimeout(provider.timeoutMs, 1), 0);
@@ -597,7 +617,7 @@ export async function runWithFallback({ directory, prompt, runner, ollamaRunner 
     if (remainingMs <= 0) return { error: "all-providers-failed", attempts: [...attempts, { provider: provider.key, status: "deadline" }] };
     try {
       const providerRunner = provider.kind === "ollama" ? ollamaRunner : runner;
-      const attemptTimeoutMs = allocateProviderTimeoutMs(PROVIDERS, index, remainingMs);
+      const attemptTimeoutMs = allocateProviderTimeoutMs(PROVIDERS, index, remainingMs, budget);
       const result = await providerRunner({ directory, prompt, model: provider.model, timeoutMs: attemptTimeoutMs, maxWords });
       if (result?.text) return { text: result.text, provider: provider.key, attempts };
       attempts.push({ provider: provider.key, status: /timed out/i.test(result?.error ?? "") ? "timeout" : "failed" });

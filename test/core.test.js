@@ -14,6 +14,7 @@ import {
   analysisInputSchema,
   createOllamaToolExecutor,
   createOllamaRunner,
+  sanitizeOllamaOutput,
   createOpenCodeRunner,
   defaultKillProcessTree,
   isBlockedOllamaName,
@@ -178,6 +179,21 @@ test("Ollama success posts a fixed native chat payload", async () => {
   assert.equal(body.keep_alive, "30m");
   assert.deepEqual(body.tools, OLLAMA_TOOL_DEFS);
   assert.equal(Object.hasOwn(body, "prompt"), false);
+});
+
+test("Ollama strips leaked reasoning and enforces the requested word cap", async () => {
+  const leaked = "private reasoning\n</think>\n## Result\n" + Array.from({ length: 50 }, (_, index) => `word${index + 1}`).join(" ");
+  const cleaned = sanitizeOllamaOutput(leaked, 40);
+  assert.doesNotMatch(cleaned, /reasoning|think/i);
+  assert.match(cleaned, /^## Result/);
+  assert.equal(cleaned.split(/\s+/).length, 40);
+  assert.match(cleaned, /…$/);
+
+  const runner = createOllamaRunner({
+    fetchImpl: async () => jsonResponse({ message: { role: "assistant", content: leaked } }),
+  });
+  const result = await runner({ directory, prompt: "inspect", model: PROVIDERS[0].model, timeoutMs: 5_000, maxWords: 40 });
+  assert.equal(result.text, cleaned);
 });
 
 test("Ollama falls back to IPv4 only on a connection failure", async () => {
@@ -408,8 +424,11 @@ test("Ollama search does not recurse through a junction cycle", async () => {
 
 test("Grok-selected total budget is dynamically allocated without duplicate provider calls", async () => {
   const quick = allocateProviderTimeoutMs(PROVIDERS, 0, 90_000);
+  const multiFile = allocateProviderTimeoutMs(PROVIDERS, 0, 180_000);
   const deep = allocateProviderTimeoutMs(PROVIDERS, 0, 270_000);
-  assert.ok(deep > quick);
+  assert.equal(quick, 45_000);
+  assert.equal(multiFile, 90_000);
+  assert.equal(deep, 180_000);
 
   let now = 0;
   const calls = [];
