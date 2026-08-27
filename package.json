@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Read-only code analysis MCP helper: native Mac Ollama first, then NVIDIA GPT-OSS, MiMo, and Cloudflare.",
+  "description": "Read-only code analysis MCP helper: NVIDIA GPT-OSS, MiMo, and Cloudflare fallback.",
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test"
