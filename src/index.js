@@ -1,7 +1,7 @@
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createOpenCodeRunner, registerAnalysisTools, resolvePathWithinAllowedRoots } from "./core.js";
+import { createModelCatalog, createOpenCodeRunner, registerAnalysisTools, resolvePathWithinAllowedRoots } from "./core.js";
 
 const DEFAULT_ALLOWED_ROOT = "C:\\Develop";
 
@@ -14,6 +14,8 @@ async function resolveAllowedPath(directory) {
   return resolvePathWithinAllowedRoots(directory, configuredRoots());
 }
 
-const server = new McpServer({ name: "opencode-helper", version: "0.1.0" });
-registerAnalysisTools(server, { runner: createOpenCodeRunner(), resolveAllowedPath });
+const runner = createOpenCodeRunner();
+const catalog = createModelCatalog({ runner });
+const server = new McpServer({ name: "opencode-helper", version: "0.2.0" });
+registerAnalysisTools(server, { runner, catalog, resolveAllowedPath });
 await server.connect(new StdioServerTransport());
