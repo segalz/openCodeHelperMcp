@@ -53,7 +53,7 @@ export async function runEdits(rawInput, {
   const limits = guardSchema.parse(input.guard ?? {}), guardState = createGuard(limits), usage = emptyUsage();
   const verification = { required: !("none" in input.verify), passed: null, command: "none" in input.verify ? null : input.verify,
     ...("none" in input.verify ? { reason: input.verify.reason } : {}), attempts: [], fixRuns: 0, restored: false, kept: false };
-  const result = { status: "failed", model: input.model, verification, usage, evidence: {} };
+  const result = { status: "failed", model: input.model, codeMapSource: "none", verification, usage, evidence: {} };
   let root, release, snapshot, identity, identityRefused = false, completed = false, sessionID;
   const check = () => {
     if (signal?.aborted) throw failure("cancelled", "Edit lifecycle cancelled.");
@@ -97,6 +97,7 @@ export async function runEdits(rawInput, {
       try { response = await runner({ directory: root, prompt, model: input.model, variant, mode: "edits", codeMap: input.codeMap ?? true,
         guardState, sessionID, ignoredPaths, signal: controller.signal, timeoutMs: Math.max(1, deadline - nowImpl()) }); }
       catch (error) { response = { error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard }; }
+      result.codeMapSource = response?.codeMapSource ?? "none";
       if (response?.usage) for (const key of Object.keys(usage)) usage[key] += Number.isFinite(response.usage[key]) ? response.usage[key] : 0;
       if (response?.guard?.kind) result.guard = response.guard;
       const returnedSession = response?.sessionID;
@@ -159,7 +160,7 @@ export function registerEditTools(server, { runner, catalog, resolveAllowedPath,
       controller.signal.addEventListener("abort", cancelled, { once: true });
       Promise.resolve().then(operation).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
     });
-    const respond = result => ({ ...(result.error ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
+    const respond = result => ({ ...(result.error ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify({ codeMapSource: "none", ...result }, null, 2) }] });
     try {
       const input = inputSchema.parse(raw);
       if (!isAbsolute(input.directory)) throw new Error("directory must be absolute.");

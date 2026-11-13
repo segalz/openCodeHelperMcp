@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, access, readdir } from "node:f
 import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { runEdits, verificationSchema, registerEditTools } from "../src/edits.js";
@@ -171,13 +172,48 @@ test("runner launches build with explicit edits permissions and --session, never
 
 test("MCP edits return structured verification and validate explicit model without fallback", async t => {
   const f = await repository(t), tools = new Map();
+  let codeMapSource = "codeindex";
   registerEditTools({ registerTool: (name, config, handler) => tools.set(name, { config, handler }) }, {
-    runner: async () => response(), catalog: { list: async () => ({ models: [{ id: "opencode/test-free" }] }) },
+    runner: async () => ({ ...response(), codeMapSource }), catalog: { list: async () => ({ models: [{ id: "opencode/test-free" }] }) },
     resolveAllowedPath: async dir => dir === f.root ? f.root : null, lifecycleOptions: { ...f.options, verifyImpl: async () => passedCheck() },
   });
-  const out = await tools.get("apply_opencode_edits").handler(input(f.root)); const payload = JSON.parse(out.content[0].text);
-  assert.equal(out.isError, undefined); assert.equal(payload.verification.passed, true);
+  for (const source of ["codeindex", "regex", "none"]) {
+    codeMapSource = source;
+    const out = await tools.get("apply_opencode_edits").handler(input(f.root)); const payload = JSON.parse(out.content[0].text);
+    assert.equal(out.isError, undefined); assert.equal(payload.verification.passed, true); assert.equal(payload.codeMapSource, source);
+  }
   const refused = await tools.get("apply_opencode_edits").handler({ ...input(f.root), model: "m/not-listed" }); assert.equal(refused.isError, true);
+  assert.equal(JSON.parse(refused.content[0].text).codeMapSource, "none");
+});
+
+test("structural map rebuilds at the resolved checkout root for initial edits and repairs", async t => {
+  const f = await repository(t), cli = path.join(f.base, "map cli.mjs"), launches = [], prompts = [];
+  await mkdir(path.join(f.root, "subdir"));
+  await writeFile(cli, `import { readFileSync } from 'node:fs'; import path from 'node:path';
+    let query=''; for await (const chunk of process.stdin) query+=chunk;
+    const root=process.argv[process.argv.indexOf('--root')+1];
+    console.log(JSON.stringify({schemaVersion:2,command:'map',referencesAreCandidates:true,truncated:false,anchors:[],
+      map:'STRUCTURAL '+root+' CONTENT '+readFileSync(path.join(root,'main.js'),'utf8')}));`);
+  let checks = 0;
+  const runner = createOpenCodeRunner({ env: { ...process.env, CODEINDEX_CLI: cli }, spawnImpl: (exe, args, options) => {
+    if (exe === process.execPath) launches.push({ args, options });
+    if (args[0] !== "run") return spawn(exe, args, options);
+    prompts.push(args.at(-1));
+    const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    child.stdout.setEncoding = child.stderr.setEncoding = () => {};
+    setImmediate(async () => {
+      await writeFile(path.join(f.root, "main.js"), "partial");
+      child.stdout.emit("data", JSON.stringify({ type: "text", sessionID: "ses_fixture", text: "changed" }) + "\n"); child.emit("close", 0);
+    }); return child;
+  } });
+  const out = await runEdits({ ...input(path.join(f.root, "subdir")), codeMap: true }, { ...f.options, runner,
+    verifyImpl: async () => ++checks === 1 ? failedCheck() : passedCheck() });
+  assert.equal(out.status, "done"); assert.equal(out.codeMapSource, "codeindex"); assert.equal(launches.length, 2);
+  for (const launch of launches) {
+    assert.equal(launch.args[launch.args.indexOf("--root") + 1], f.root);
+    assert.equal(launch.options.cwd, f.root);
+  }
+  assert.match(prompts[0], /CONTENT owner dirty bytes/); assert.match(prompts[1], /CONTENT partial/);
 });
 
 test("deadline/cancellation restore before returning; neither spends fixes", async t => {

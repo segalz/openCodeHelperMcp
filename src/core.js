@@ -294,16 +294,24 @@ export function createOpenCodeRunner({
     if (sessionID) args.push("--session", sessionID);
     const render = map => mode === "edits" ? buildEditPrompt(prompt, { directory, platform, map }) : raw ? [...READ_ONLY_RULES, prompt].join("\n") : buildAnalysisPrompt(prompt, maxWords, { directory, platform, map });
     const commandLength = map => windowsCommandLineLength(executable, [...args, render(map)]);
-    let map;
+    let map, codeMapSource = "none";
+    const cancelled = () => ({ status: "failed", localFailure: true, codeMapSource: "none", error: "OpenCode preparation cancelled.", elapsedMs: nowImpl() - started });
+    if (signal?.aborted) return cancelled();
     if (!raw && codeMap && (codeMapBuilder !== buildCodeMap || existsSync(directory))) {
-      try { map = await codeMapBuilder(directory, { prompt, spawnImpl, signal, timeBudgetMs: effectiveTimeoutMs, commandLineLength: commandLength }); } catch { /* optional context */ }
+      try {
+        map = await codeMapBuilder(directory, { prompt, spawnImpl, signal, env,
+          timeBudgetMs: Math.max(0, effectiveTimeoutMs - (nowImpl() - started)), commandLineLength: commandLength,
+          onSource: source => { codeMapSource = source; } });
+      } catch { if (signal?.aborted) return cancelled(); /* optional context */ }
     }
+    if (signal?.aborted) return cancelled();
     // Clamp even injected map builders; optional context must never break launch.
     if (map && (map.length > 6000 || commandLength(map) > WINDOWS_COMMAND_LINE_LIMIT - 1000)) map = undefined;
-    if (platform === "win32" && commandLength(map) > WINDOWS_COMMAND_LINE_LIMIT - 1000) return { status: "failed", localFailure: true, error: "Analysis prompt exceeds the Windows command-line limit.", elapsedMs: nowImpl() - started };
+    codeMapSource = map ? (codeMapSource === "codeindex" ? "codeindex" : "regex") : "none";
+    if (platform === "win32" && commandLength(map) > WINDOWS_COMMAND_LINE_LIMIT - 1000) return { status: "failed", localFailure: true, codeMapSource: "none", error: "Analysis prompt exceeds the Windows command-line limit.", elapsedMs: nowImpl() - started };
     args.push(render(map));
     const remaining = effectiveTimeoutMs - (nowImpl() - started);
-    if (remaining <= 0) return { status: "timeout", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
+    if (remaining <= 0) return { status: "timeout", codeMapSource: "none", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
     let verdict, streamFatal;
     const parser = createEventStream({ onEvent: event => { verdict ??= detector.observe(event); return !verdict; }, onFatal: detail => { streamFatal = detail; } });
     const result = await runBoundedProcess({ executable, args, cwd: directory, env: effectiveEnv, timeoutMs: remaining,
@@ -311,7 +319,7 @@ export function createOpenCodeRunner({
       onStdout: chunk => { parser.write(chunk); return verdict?.kind ?? (streamFatal ? "event_error" : undefined); },
     });
     const parsed = parser.end(), elapsedMs = nowImpl() - started;
-    const metrics = { elapsedMs, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported, guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)) };
+    const metrics = { elapsedMs, codeMapSource, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported, guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)) };
     if (sessionID && parsed.sessionID && parsed.sessionID !== sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation session mismatch." };
     if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
     if (result.spawnError || result.timedOut || result.overflowed) return { ...metrics, ...describeProcessFailure(result) };
@@ -522,12 +530,12 @@ export function allocateAttemptTimeoutMs({ remainingMs, attemptsLeft, attemptCap
   return Math.max(1, Math.floor(Math.min(attemptCapMs, available)));
 }
 
-export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runner, models, guard, codeMap = true, deadline: outerDeadline, nowImpl = Date.now, attemptCapMs = DEFAULT_ATTEMPT_TIMEOUT_MS }) {
+export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runner, models, guard, codeMap = true, signal, deadline: outerDeadline, nowImpl = Date.now, attemptCapMs = DEFAULT_ATTEMPT_TIMEOUT_MS }) {
   const budget = clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, DEFAULT_BUDGET_MS);
   const deadline = outerDeadline ?? nowImpl() + budget;
   const guardState = createGuard(guard);
   const usage = { inputTokens: 0, uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, cost: 0, steps: 0 };
-  let sessionID;
+  let sessionID, codeMapSource = "none";
   const attempts = [];
   const seen = new Set();
   const queue = models.filter((model) => !seen.has(model.id) && seen.add(model.id));
@@ -542,29 +550,31 @@ export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runne
     const started = nowImpl();
     let result;
     try {
-      result = await runner({ directory, prompt, model: model.id, variant: variantFor(model), timeoutMs, maxWords, guardState, codeMap });
+      result = await runner({ directory, prompt, model: model.id, variant: variantFor(model), timeoutMs, maxWords, guardState, codeMap, signal });
     } catch (error) {
       result = { status: "failed", error: redactSecrets(error?.message ?? String(error)) };
     }
     const elapsedMs = Number.isFinite(result?.elapsedMs) ? result.elapsedMs : nowImpl() - started;
     if (result?.usage) for (const key of Object.keys(usage)) usage[key] += result.usage[key] ?? 0;
     sessionID = result?.sessionID ?? sessionID;
-    if (result?.guard?.kind || guardState.snapshot().kind || result?.localFailure) {
-      const error = result?.error ?? result?.guard?.kind ?? guardState.snapshot().kind ?? "Local preparation failed.";
+    codeMapSource = result?.codeMapSource ?? "none";
+    if (signal?.aborted || result?.guard?.kind || guardState.snapshot().kind || result?.localFailure) {
+      const error = signal?.aborted ? "OpenCode analysis cancelled." : result?.error ?? result?.guard?.kind ?? guardState.snapshot().kind ?? "Local preparation failed.";
       attempts.push({ model: model.id, status: "failed", elapsedMs, timeoutMs, reason: error });
-      return { error, message: error, attempts, budgetMs: budget, guard: result.guard ?? guardState.snapshot(), usage, sessionID };
+      return { error, message: error, attempts, budgetMs: budget, guard: result.guard ?? guardState.snapshot(), usage, sessionID, codeMapSource };
     }
     if (result?.text) {
       attempts.push({ model: model.id, status: "ok", elapsedMs, timeoutMs, reason: result.warning });
-      return { text: result.text, model: model.id, elapsedMs, attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID };
+      return { text: result.text, model: model.id, elapsedMs, attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID, codeMapSource };
     }
     attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: result?.error ?? "no answer" });
   }
-  return { error: "all-models-failed", attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID };
+  return { error: "all-models-failed", attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID, codeMapSource };
 }
 
 export function formatAnalysisResult(result) {
   const lines = ["## CodeHelper", `- Model: ${result?.model ?? "none"}${result?.model ? ` (${result.elapsedMs} ms)` : ""}`];
+  lines.push(`- code map: ${result?.codeMapSource ?? "none"}`);
   if (result?.selection) lines.push(`- Selection: ${result.selection}`);
   if (result?.guard) lines.push(`- Guard: ${JSON.stringify(result.guard)}`);
   if (result?.usage) lines.push(`- Usage: ${JSON.stringify(result.usage)}`);
@@ -670,7 +680,7 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
     return textResult(JSON.stringify(payload, null, 2));
   });
 
-  server.registerTool("analyze_code", { title: "Analyze code with a free OpenCode model", description: ANALYZE_DESCRIPTION, inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs, model, models, guard, codeMap = true }) => {
+  server.registerTool("analyze_code", { title: "Analyze code with a free OpenCode model", description: ANALYZE_DESCRIPTION, inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs, model, models, guard, codeMap = true }, extra = {}) => {
     const deadline = nowImpl() + clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, DEFAULT_BUDGET_MS);
     const guardValidation = guardSchema.safeParse(guard ?? {});
     if (!guardValidation.success) return textResult("Invalid guard options.", true);
@@ -682,7 +692,7 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
     if (requested.error) return textResult(requested.error, true);
     const chain = requested.auto ? buildAutoOrder(listed.models, { recentProbe: catalog.recentProbe }) : requested.models;
     if (chain.length === 0) return textResult("No free OpenCode models are currently available. Call list_free_models with refresh=true.", true);
-    const result = await runAnalysis({ directory: validated.directory, prompt, maxWords, budgetMs, runner, models: chain, guard: guardValidation.data, codeMap, deadline, nowImpl });
+    const result = await runAnalysis({ directory: validated.directory, prompt, maxWords, budgetMs, runner, models: chain, guard: guardValidation.data, codeMap, signal: extra.signal, deadline, nowImpl });
     result.selection = requested.auto ? `auto (${chain.map((m) => m.id).join(" → ")})` : "caller";
     return textResult(formatAnalysisResult(result), Boolean(result.error));
   });

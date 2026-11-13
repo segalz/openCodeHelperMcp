@@ -3,6 +3,7 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { defaultKillTree, WINDOWS_COMMAND_LINE_LIMIT } from "./process-utils.js";
 import { excludedPath } from "./permissions.js";
+import { tryCodeindexMap } from "./codeindex.js";
 export const CODE_MAP_HEADER = "## Code map (bridge-generated, line numbers in current checkout contents)";
 const MAX_FILES = 3_000;
 const MAX_BYTES = 512 * 1024;
@@ -113,7 +114,7 @@ function formatMap(entries, omitted, fits) {
     return fits(result) ? result : undefined;
 }
 /** Best-effort, bounded map of tracked files. A scan-budget stop keeps completed entries; I/O failure omits the map. */
-export async function buildCodeMap(root, options = {}) {
+async function buildRegexMap(root, options = {}) {
     const controller = new AbortController();
     let timer;
     const abort = () => controller.abort();
@@ -209,4 +210,35 @@ export async function buildCodeMap(root, options = {}) {
         options.signal?.removeEventListener("abort", abort);
         controller.abort();
     }
+}
+
+/** String API retained; onSource reports the context actually selected for launch. */
+export async function buildCodeMap(root, options = {}) {
+    const started = performance.now();
+    const cli = (options.env ?? process.env).CODEINDEX_CLI;
+    let map;
+    if (cli) {
+        options.signal?.throwIfAborted();
+        const commandLimit = WINDOWS_COMMAND_LINE_LIMIT - 1_000;
+        const headroom = options.commandLineLength ? commandLimit - options.commandLineLength("") : Infinity;
+        // A UTF-16 unit may require two units after Windows argument escaping.
+        const budget = Math.floor(Math.min(6000, options.maxChars ?? 6000, (headroom - 4) / 2));
+        if (headroom < 800 || !Number.isFinite(budget) || budget <= 0) {
+            options.onSource?.("none");
+            return undefined;
+        }
+        map = await tryCodeindexMap(root, { cli, prompt: options.prompt, budget,
+            timeBudgetMs: (options.timeBudgetMs ?? Infinity) - (performance.now() - started), signal: options.signal, env: options.env,
+            spawnImpl: options.spawnImpl, killTreeImpl: options.killTreeImpl });
+        options.signal?.throwIfAborted();
+        if (typeof map === "string" && map.length <= budget && (!options.commandLineLength || options.commandLineLength(map + "\n\n") <= commandLimit)) {
+            options.onSource?.(map ? "codeindex" : "none");
+            return map || undefined;
+        }
+    }
+    const remaining = (options.timeBudgetMs ?? Infinity) - (performance.now() - started);
+    map = remaining > 0 ? await buildRegexMap(root, { ...options, timeBudgetMs: Math.min(TIME_BUDGET_MS, remaining) }) : undefined;
+    if (cli) options.signal?.throwIfAborted();
+    options.onSource?.(map ? "regex" : "none");
+    return map;
 }

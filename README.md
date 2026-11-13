@@ -93,7 +93,7 @@ Typical call to `analyze_code` (replace the directory and sample model with your
 }
 ```
 
-The response is Markdown headed `## CodeHelper`: selected model, selection mode, guard report, usage, last captured session ID when available, and the attempted models with timing and redacted error details. The final assistant message follows the header. Usage and guard counters include earlier failed attempts in the same call. Analysis does not expose a session-continuation parameter.
+The response is Markdown headed `## CodeHelper`: selected model, selection mode, `code map: codeindex | regex | none`, guard report, usage, last captured session ID when available, and the attempted models with timing and redacted error details. The final assistant message follows the header. Usage and guard counters include earlier failed attempts in the same call. Analysis does not expose a session-continuation parameter.
 
 ## `apply_opencode_edits`
 
@@ -161,6 +161,7 @@ The response is JSON encoded in MCP text content. Failures set MCP `isError:true
 ```text
 status: "done" | "failed"
 model, text?, sessionID?, elapsedMs
+codeMapSource: "codeindex" | "regex" | "none"
 verification: {
   required, passed: true | false | null,
   command: {command, args?, timeoutSeconds?} | null, reason?,
@@ -196,9 +197,11 @@ Input-token budgets sum uncached input, cache reads and cache writes once per un
 
 The guard sees terminal tool results and per-step usage, not tool starts or every generated token. It can overshoot while a tool or model step is active. The wall-clock timeout is separate from those event-driven limits.
 
-The optional map lists tracked paths, line counts and regex-detected symbols with 1-based positions in current checkout contents. It includes dirty tracked contents, excludes untracked files and common hidden/credential, vendor/generated, binary, non-UTF-8, minified and lock files, and prioritizes prompt-mentioned paths. It is not an AST or a guarantee against concurrent edits. Non-Git paths and map failures omit it without failing analysis.
+By default, the optional map lists tracked paths, line counts and regex-detected symbols with 1-based positions in current checkout contents. It includes dirty tracked contents, excludes untracked files and common hidden/credential, vendor/generated, binary, non-UTF-8, minified and lock files, and prioritizes prompt-mentioned paths. It is not an AST or a guarantee against concurrent edits. Non-Git paths and map failures omit it without failing analysis.
 
-Map scanning is limited to 3,000 candidate files, 512 KiB per file and 1.5 seconds; rendered output is at most 6,000 characters and shortened or omitted to fit the escaped Windows command line with a 1,000-unit margin below 32,000 UTF-16 units. Oversized mandatory prompts fail instead of being silently truncated. Set `codeMap:false` to omit map generation.
+Set `CODEINDEX_CLI` to the absolute script path of an optional structural code index CLI implementing the codeindex map contract. It is invoked through the current Node executable with `map --root <directory> --json --budget <characters> --deadline-ms <milliseconds>` and the query on stdin, without a shell or an added package dependency. The adapter validates the schema version 2 map reply, including anchor diagnostics, and caps stdout at 64 KiB. It uses the exact analysis directory or edit checkout root on every launch, including repairs; non-Git directories and checkout subdirectories skip the structural CLI rather than expanding scope. Missing/unconfigured scripts retain the default behavior. Launch failures, nonzero exits, deadlines, invalid replies and output overflow silently fall back to the regex map. Caller cancellation kills the process tree and stops without fallback.
+
+Regex scanning is limited to 3,000 candidate files, 512 KiB per file and 1.5 seconds. The structural CLI gets up to 10 seconds for cold caches. All map preparation counts against the remaining attempt budget. Either map is at most 6,000 characters and shortened or omitted to fit the escaped Windows command line with a 1,000-unit margin below 32,000 UTF-16 units; no map is generated with less than 800 units of headroom. The structural CLI's requested budget is reduced when necessary to allow for escaping. Oversized mandatory prompts fail instead of being silently truncated. Set `codeMap:false` to omit map generation. The analysis header reports `code map: codeindex | regex | none`; edit JSON reports `codeMapSource` with the same values for the last launch (or `none` before any launch).
 
 ## Budgets and limits
 
@@ -217,6 +220,7 @@ Errors include available CLI exit/error details and bounded stderr tails, with c
 | Environment variable | Meaning |
 |---|---|
 | `OPENCODE_BIN` | Explicit executable path. Otherwise, on Windows use the existing native `%APPDATA%\npm\node_modules\opencode-ai\bin\opencode.exe`, then fall back to `opencode` on PATH. Windows CLI shims cannot be launched with `shell:false`. |
+| `CODEINDEX_CLI` | Optional absolute path to the `dist/cli.js` script of an optional structural code index CLI implementing the codeindex map contract. Unset or missing keeps the regex map; see Guard, usage and code map. |
 | `OPENCODE_HELPER_ALLOWED_ROOTS` | Semicolon-separated allowed roots; default `C:\Develop`. Paths are checked after resolving junctions/symlinks. |
 | `OPENCODE_HELPER_ATTEMPT_TIMEOUT_MS` | Runner fallback timeout when no request timeout is supplied; default 120,000 ms. The MCP tools supply their own timeouts, so this does not override their documented budgets. |
 | `OPENCODE_HELPER_TIMEOUT_MS` | Legacy fallback, used only when `OPENCODE_HELPER_ATTEMPT_TIMEOUT_MS` is unset. |
