@@ -8,6 +8,8 @@ Read-only MCP server for code analysis through [OpenCode](https://opencode.ai). 
 
 Returns JSON with the currently available free models (`id`, `provider`, `name`, `free_basis`, `context`).
 
+Catalog membership confirms model metadata, not remaining provider quota or a working response. A 30-second probe can also time out for a working but slower model. Require a substantive `analyze_code` answer before treating a model as a usable reviewer; pass the verified model id explicitly when automatic selection chooses a quota-limited provider.
+
 | Input | Default | Meaning |
 |---|---|---|
 | `probe` | `false` | Send a tiny read-only health prompt to each listed model in parallel (4 at a time, 30 s cap each). Adds `probe: { status: ok\|failed\|timeout, latency_ms, error }`. |
@@ -54,7 +56,7 @@ Failures report the exit code, the error message from OpenCode's NDJSON output w
 
 | Env var | Meaning |
 |---|---|
-| `OPENCODE_BIN` | Path to `opencode` (default: `opencode` on PATH). |
+| `OPENCODE_BIN` | Explicit executable path. On Windows, defaults to the existing native `%APPDATA%\npm\node_modules\opencode-ai\bin\opencode.exe` when present, otherwise `opencode` on PATH. `.cmd` and `.ps1` shims cannot run with `shell: false`. |
 | `OPENCODE_HELPER_ALLOWED_ROOTS` | Allowed workspace roots (default `C:\Develop`). |
 | `OPENCODE_HELPER_ATTEMPT_TIMEOUT_MS` | Fallback per-attempt timeout when no budget is given (default 120 000; `OPENCODE_HELPER_TIMEOUT_MS` is still read for compatibility). |
 

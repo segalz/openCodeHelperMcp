@@ -1,4 +1,5 @@
 import { spawn as defaultSpawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { realpath as defaultRealpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -175,6 +176,16 @@ export function defaultKillProcessTree(child, { platform = process.platform, spa
   child.kill();
 }
 
+export function resolveOpenCodeExecutable({ env = process.env, platform = process.platform, exists = existsSync } = {}) {
+  if (env.OPENCODE_BIN) return env.OPENCODE_BIN;
+  // npm's Windows .cmd/.ps1 shims cannot be spawned with shell: false.
+  if (platform === "win32" && env.APPDATA) {
+    const native = path.win32.join(env.APPDATA, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe");
+    if (exists(native)) return native;
+  }
+  return "opencode";
+}
+
 function childEnv(env, execPath) {
   return {
     ...env,
@@ -272,7 +283,7 @@ export function createOpenCodeRunner({
 } = {}) {
   const terminate = killProcessTreeImpl ?? ((child) => defaultKillProcessTree(child, { platform, spawnImpl }));
   return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false }) => {
-    const executable = env.OPENCODE_BIN ?? "opencode";
+    const executable = resolveOpenCodeExecutable({ env, platform });
     const args = ["run", "--dir", directory, "--model", model];
     if (variant) args.push("--variant", variant);
     args.push("--agent", "plan", "--format", "json", raw ? [...READ_ONLY_RULES, prompt].join("\n") : buildAnalysisPrompt(prompt, maxWords));
@@ -399,7 +410,7 @@ export function createModelCatalog({
   const probes = new Map(); // id -> { status, latency_ms, error?, at }
 
   const runModelsCommand = (extraArgs) => runBoundedProcess({
-    executable: env.OPENCODE_BIN ?? "opencode", args: ["models", ...extraArgs], cwd: probeDirectory, env: childEnv(env, execPath),
+    executable: resolveOpenCodeExecutable({ env, platform }), args: ["models", ...extraArgs], cwd: probeDirectory, env: childEnv(env, execPath),
     timeoutMs: listTimeoutMs, maxStdoutBytes: OPENCODE_MAX_LIST_STDOUT_BYTES, spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, nowImpl,
   });
 
@@ -585,7 +596,7 @@ export const ANALYZE_DESCRIPTION = [
 ].join(" ");
 
 export const LIST_DESCRIPTION = [
-  "List the free OpenCode models available right now (id, provider, name, free basis). Free = zero input/output cost in OpenCode's model metadata; models without tool calls are excluded.",
+  "List free models from OpenCode's current catalog (id, provider, name, free basis). Catalog membership does not prove live provider quota or response availability. Free = zero input/output cost in OpenCode's model metadata; models without tool calls are excluded.",
   `Cached for ${MODEL_CACHE_TTL_MS / 60_000} minutes; refresh=true re-reads. probe=true sends a tiny read-only health prompt to each model in parallel (cap ${PROBE_TIMEOUT_MS / 1000}s each) and returns status ok/failed/timeout, latency_ms and a short error. Use the result to choose \`model\`/\`models\` for analyze_code.`,
 ].join(" ");
 

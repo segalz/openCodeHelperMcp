@@ -31,6 +31,15 @@ import {
 
 const directory = "C:\\Develop\\sample";
 
+test("Windows npm launcher resolves native EXE while explicit overrides and other platforms retain precedence", () => {
+  const env = { APPDATA: "C:\\Users\\sample\\AppData\\Roaming" };
+  const native = "C:\\Users\\sample\\AppData\\Roaming\\npm\\node_modules\\opencode-ai\\bin\\opencode.exe";
+  assert.equal(core.resolveOpenCodeExecutable({ env, platform: "win32", exists: (candidate) => candidate === native }), native);
+  assert.equal(core.resolveOpenCodeExecutable({ env, platform: "win32", exists: () => false }), "opencode");
+  assert.equal(core.resolveOpenCodeExecutable({ env: { ...env, OPENCODE_BIN: "D:\\custom\\opencode.exe" }, platform: "win32", exists: () => { throw new Error("override must not probe"); } }), "D:\\custom\\opencode.exe");
+  assert.equal(core.resolveOpenCodeExecutable({ env, platform: "linux", exists: () => true }), "opencode");
+});
+
 function fakeChild({ pid = 1234 } = {}) {
   const stdout = new EventEmitter();
   stdout.setEncoding = () => {};
