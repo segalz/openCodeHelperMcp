@@ -4,6 +4,14 @@ import { realpath as defaultRealpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { redactSecrets } from "./safety.js";
+export { redactSecrets } from "./safety.js";
+import { createEventStream } from "./events.js";
+import { createGuard, guardSchema } from "./guard.js";
+import { permissionEnvironment } from "./permissions.js";
+import { buildCodeMap } from "./codemap.js";
+import { WORKING_RULES, buildEnvironmentLine } from "./rules.js";
+import { windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT } from "./process-utils.js";
 
 // ---------------------------------------------------------------------------
 // Limits and defaults
@@ -77,6 +85,8 @@ function validTimeout(value, fallback) {
 const modelIdSchema = z.string().min(3).max(200).regex(/^[A-Za-z0-9][\w.:@\/-]*$/, "Model ids look like provider/model.");
 
 export const analysisInputSchema = Object.freeze({
+  guard: guardSchema.optional().describe("Cumulative loop/tool/input-token budgets across all attempts; a trip stops without fallback."),
+  codeMap: z.boolean().optional().describe("Bounded map of current tracked source contents (default true)."),
   directory: z.string().min(1).describe("Absolute workspace path under an allowed root."),
   prompt: z.string().min(1).max(12_000).describe("The focused code-analysis question."),
   maxWords: z.number().int().min(MIN_MAX_WORDS).max(MAX_MAX_WORDS).optional()
@@ -104,40 +114,9 @@ export const listModelsInputSchema = Object.freeze({
 // Secret redaction and error formatting
 // ---------------------------------------------------------------------------
 
-const SECRET_PATTERNS = [
-  [/(authorization\s*[:=]\s*)(?:bearer|basic|token)?\s*[^\s"',;]+/gi, "$1[REDACTED]"],
-  [/\bbearer\s+[A-Za-z0-9._~+\/=-]{8,}/gi, "Bearer [REDACTED]"],
-  [/("(?:api[_-]?key|apikey|key|token|access(?:_token)?|refresh(?:_token)?|secret|password|client_secret|authorization)"\s*:\s*)"(?:[^"\\]|\\.)*"/gi, '$1"[REDACTED]"'],
-  [/\b((?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|secret|password|client[_-]?secret|key)\s*[=:]\s*)[^\s"',;&]+/gi, "$1[REDACTED]"],
-  [/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, "[REDACTED]"],
-  [/\b(?:nvapi|gsk|ghp|gho|ghu|ghs|ghr|github_pat|xox[abpr]|hf|cf)[-_][A-Za-z0-9_-]{8,}/g, "[REDACTED]"],
-  [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED]"],
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[REDACTED]"],
-  [/\b(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{32,}\b/g, "[REDACTED]"],
-];
-
-export function redactSecrets(text) {
-  let out = String(text ?? "");
-  // A dumped auth.json (provider -> { type, key|access|refresh }) is dropped entirely.
-  out = out.replace(/\{[^{}]*"type"\s*:\s*"(?:api|oauth|wellknown)"[^{}]*\}/gi, "{[REDACTED credentials]}");
-  for (const [pattern, replacement] of SECRET_PATTERNS) out = out.replace(pattern, replacement);
-  return out;
-}
-
 export function tailText(text, max = ERROR_TAIL_CHARS) {
   const value = String(text ?? "").replace(/\u001b\[[0-9;]*[A-Za-z]/g, "").trim();
   return value.length > max ? `…${value.slice(-max)}` : value;
-}
-
-function errorMessageOf(event) {
-  const candidates = [
-    event?.error?.data?.message, event?.error?.message, event?.error?.name && event?.error?.data ? `${event.error.name}: ${JSON.stringify(event.error.data)}` : undefined,
-    typeof event?.error === "string" ? event.error : undefined,
-    event?.part?.error?.message, event?.part?.error, event?.message, event?.text,
-  ];
-  for (const value of candidates) if (typeof value === "string" && value.trim()) return value.trim();
-  if (event?.error && typeof event.error === "object") return JSON.stringify(event.error);
-  return "unknown error event";
 }
 
 // ---------------------------------------------------------------------------
@@ -145,22 +124,10 @@ function errorMessageOf(event) {
 // ---------------------------------------------------------------------------
 
 export function parseOpenCodeNdjson(stdout) {
-  const events = String(stdout ?? "").trim().split(/\r?\n/).filter(Boolean).map((line) => {
-    try { return JSON.parse(line); } catch { return null; }
-  }).filter(Boolean);
-  if (events.length === 0) return { error: "OpenCode returned no valid analysis." };
-  const texts = [];
-  let errorMessage;
-  for (const event of events) {
-    if (event.error || /error|failed/i.test(event.type ?? "") || /error|failed/i.test(event.part?.type ?? "")) {
-      errorMessage ??= errorMessageOf(event);
-      continue;
-    }
-    const text = event.part?.type === "text" ? event.part.text : event.type === "text" ? event.text : event.result?.text;
-    if (typeof text === "string" && text.trim()) texts.push(text.trim());
-  }
-  if (errorMessage) return { error: "OpenCode reported an analysis error.", detail: errorMessage, text: texts.at(-1) };
-  return texts.length > 0 ? { text: texts.at(-1) } : { error: "OpenCode returned no valid analysis." };
+  const parser = createEventStream(); parser.write(String(stdout ?? ""));
+  const result = parser.end();
+  if (result.error) return { error: result.error, ...(result.detail ? { detail: result.detail } : {}) };
+  return { text: result.text };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +140,10 @@ export function defaultKillProcessTree(child, { platform = process.platform, spa
     terminator.on("error", () => child.kill());
     return;
   }
-  child.kill();
+  if (platform !== "win32" && Number.isInteger(child.pid)) {
+    try { process.kill(-child.pid, "SIGKILL"); return; } catch {}
+  }
+  child.kill("SIGKILL");
 }
 
 export function resolveOpenCodeExecutable({ env = process.env, platform = process.platform, exists = existsSync } = {}) {
@@ -201,43 +171,52 @@ function childEnv(env, execPath) {
 export function runBoundedProcess({
   executable, args, cwd, env, timeoutMs, maxStdoutBytes = OPENCODE_MAX_STDOUT_BYTES, maxStderrBytes = OPENCODE_MAX_STDERR_BYTES,
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, terminate, graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
+  onStdout, collectStdout = true,
 }) {
   const started = nowImpl();
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawnImpl(executable, args, { cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], env });
+      child = spawnImpl(executable, args, { cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", env });
     } catch (error) {
       resolve({ exitCode: null, stdout: "", stderr: "", timedOut: false, overflowed: false, spawnError: error?.code ?? error?.message ?? "spawn failed", elapsedMs: nowImpl() - started });
       return;
     }
     let stdout = ""; let stderr = ""; let settled = false; let timedOut = false; let exitCode = null;
     let stdoutBytes = 0; let stderrBytes = 0; let overflowed = false; let spawnError = null;
-    let timeoutTimer; let graceTimer;
+    let timeoutTimer; let graceTimer; let stoppedReason;
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeoutImpl(timeoutTimer);
       clearTimeoutImpl(graceTimer);
-      resolve({ exitCode, stdout, stderr, timedOut, overflowed, spawnError, elapsedMs: nowImpl() - started });
+      if (stoppedReason) {
+        child.stdout.destroy?.(); child.stderr.destroy?.(); child.unref?.();
+      }
+      resolve({ exitCode, stdout, stderr, timedOut, overflowed, spawnError, stoppedReason, elapsedMs: nowImpl() - started });
+    };
+    const stop = reason => {
+      if (settled || stoppedReason) return;
+      stoppedReason = reason;
+      graceTimer ??= setTimeoutImpl(finish, graceMs);
+      try { terminate(child); } catch { /* grace deadline still settles */ }
     };
     const failForOverflow = () => {
       if (settled || overflowed) return;
       overflowed = true;
-      terminate(child);
-      graceTimer ??= setTimeoutImpl(finish, graceMs);
+      stop("output_limit");
     };
     timeoutTimer = setTimeoutImpl(() => {
       timedOut = true;
-      terminate(child);
-      graceTimer = setTimeoutImpl(finish, graceMs);
+      stop("timeout");
     }, timeoutMs);
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      if (settled || overflowed) return;
+      if (settled || stoppedReason) return;
       stdoutBytes += Buffer.byteLength(chunk, "utf8");
       if (stdoutBytes > maxStdoutBytes) return failForOverflow();
-      stdout += chunk;
+      if (collectStdout) stdout += chunk;
+      try { const reason = onStdout?.(chunk); if (reason) stop(reason); } catch { stop("stream_error"); }
     });
     child.stderr.on("data", (chunk) => {
       if (settled || overflowed) return;
@@ -263,10 +242,12 @@ export function describeProcessFailure(result, { label = "OpenCode", ndjsonError
   return { status: "failed", error: redactSecrets(parts.join("\n")) };
 }
 
-export function buildAnalysisPrompt(prompt, maxWords) {
+export function buildAnalysisPrompt(prompt, maxWords, { directory, platform, map } = {}) {
   const wordCap = clampNumber(maxWords, MIN_MAX_WORDS, MAX_MAX_WORDS, DEFAULT_MAX_WORDS);
   return [
-    "You are a read-only code analysis assistant.", ...ANALYSIS_AUTHORITY_RULES, ...READ_ONLY_RULES,
+    ...(directory ? [buildEnvironmentLine(directory, platform)] : []),
+    "You are a read-only code analysis assistant.", ...ANALYSIS_AUTHORITY_RULES, ...READ_ONLY_RULES, WORKING_RULES,
+    ...(map ? [map] : []),
     `Respond only in concise English Markdown. Use clear headings and short bullets. Do not use Hebrew, include a preamble, a reasoning trace, or code excerpts unless explicitly requested. Keep the answer within ${wordCap} words.`,
     "\nUser request:", prompt,
   ].join("\n");
@@ -280,35 +261,47 @@ export function createOpenCodeRunner({
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout,
   killProcessTreeImpl, env = process.env, platform = process.platform, execPath = process.execPath,
   timeoutMs = Number(env.OPENCODE_HELPER_ATTEMPT_TIMEOUT_MS ?? env.OPENCODE_HELPER_TIMEOUT_MS ?? DEFAULT_ATTEMPT_TIMEOUT_MS), graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
+  codeMapBuilder = buildCodeMap,
 } = {}) {
   const terminate = killProcessTreeImpl ?? ((child) => defaultKillProcessTree(child, { platform, spawnImpl }));
-  return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false }) => {
+  return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false, codeMap = true, guard, guardState }) => {
+    const started = nowImpl();
     const executable = resolveOpenCodeExecutable({ env, platform });
+    let effectiveEnv, detector;
+    try { effectiveEnv = permissionEnvironment(childEnv(env, execPath)); detector = guardState ?? createGuard(guard); }
+    catch (error) { return { status: "failed", localFailure: true, error: redactSecrets(error.message), elapsedMs: nowImpl() - started }; }
+    const effectiveTimeoutMs = Math.min(MAX_BUDGET_MS, validTimeout(requestTimeoutMs, validTimeout(timeoutMs, DEFAULT_ATTEMPT_TIMEOUT_MS)));
     const args = ["run", "--dir", directory, "--model", model];
     if (variant) args.push("--variant", variant);
-    args.push("--agent", "plan", "--format", "json", raw ? [...READ_ONLY_RULES, prompt].join("\n") : buildAnalysisPrompt(prompt, maxWords));
-    const effectiveTimeoutMs = Math.min(MAX_BUDGET_MS, validTimeout(requestTimeoutMs, validTimeout(timeoutMs, DEFAULT_ATTEMPT_TIMEOUT_MS)));
-    const result = await runBoundedProcess({
-      executable, args, cwd: directory, env: childEnv(env, execPath), timeoutMs: effectiveTimeoutMs,
-      spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl,
+    args.push("--agent", "plan", "--format", "json");
+    const render = map => raw ? [...READ_ONLY_RULES, prompt].join("\n") : buildAnalysisPrompt(prompt, maxWords, { directory, platform, map });
+    const commandLength = map => windowsCommandLineLength(executable, [...args, render(map)]);
+    let map;
+    if (!raw && codeMap && (codeMapBuilder !== buildCodeMap || existsSync(directory))) {
+      try { map = await codeMapBuilder(directory, { prompt, spawnImpl, timeBudgetMs: effectiveTimeoutMs, commandLineLength: commandLength }); } catch { /* optional context */ }
+    }
+    // Clamp even injected map builders; optional context must never break launch.
+    if (map && (map.length > 6000 || commandLength(map) > WINDOWS_COMMAND_LINE_LIMIT - 1000)) map = undefined;
+    if (platform === "win32" && commandLength(map) > WINDOWS_COMMAND_LINE_LIMIT - 1000) return { status: "failed", localFailure: true, error: "Analysis prompt exceeds the Windows command-line limit.", elapsedMs: nowImpl() - started };
+    args.push(render(map));
+    const remaining = effectiveTimeoutMs - (nowImpl() - started);
+    if (remaining <= 0) return { status: "timeout", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
+    let verdict, streamFatal;
+    const parser = createEventStream({ onEvent: event => { verdict ??= detector.observe(event); return !verdict; }, onFatal: detail => { streamFatal = detail; } });
+    const result = await runBoundedProcess({ executable, args, cwd: directory, env: effectiveEnv, timeoutMs: remaining,
+      spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl, collectStdout: false,
+      onStdout: chunk => { parser.write(chunk); return verdict?.kind ?? (streamFatal ? "event_error" : undefined); },
     });
-    const elapsedMs = result.elapsedMs;
-    if (result.spawnError || result.timedOut || result.overflowed) return { ...describeProcessFailure(result), elapsedMs };
-    const parsed = parseOpenCodeNdjson(result.stdout);
-    if (parsed.text) {
-      const warnings = [];
-      if (result.exitCode !== 0) warnings.push(`OpenCode exited with code ${result.exitCode} after producing the answer.`);
-      if (parsed.detail) warnings.push(`OpenCode also reported an error event: ${tailText(parsed.detail, 300)}`);
-      return warnings.length ? { text: parsed.text, elapsedMs, warning: redactSecrets(warnings.join(" ")) } : { text: parsed.text, elapsedMs };
-    }
-    if (result.exitCode === 0) {
-      const detail = parsed.detail ? `${parsed.error} ${parsed.detail}` : parsed.error;
-      const stderrTail = tailText(result.stderr);
-      return { status: "failed", error: redactSecrets([detail, stderrTail && `stderr (tail): ${stderrTail}`].filter(Boolean).join("\n")), elapsedMs };
-    }
-    return { ...describeProcessFailure(result, { ndjsonError: parsed.detail }), elapsedMs };
+    const parsed = parser.end(), elapsedMs = nowImpl() - started;
+    const metrics = { elapsedMs, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported, guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)) };
+    if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
+    if (result.spawnError || result.timedOut || result.overflowed) return { ...metrics, ...describeProcessFailure(result) };
+    if (result.exitCode !== 0 || parsed.error || result.stoppedReason) return { ...metrics, ...describeProcessFailure(result, { ndjsonError: parsed.detail ?? parsed.error ?? result.stoppedReason }) };
+    return { ...metrics, text: parsed.text };
   };
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Model discovery
@@ -509,9 +502,12 @@ export function allocateAttemptTimeoutMs({ remainingMs, attemptsLeft, attemptCap
   return Math.max(1, Math.floor(Math.min(attemptCapMs, available)));
 }
 
-export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runner, models, nowImpl = Date.now, attemptCapMs = DEFAULT_ATTEMPT_TIMEOUT_MS }) {
+export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runner, models, guard, codeMap = true, deadline: outerDeadline, nowImpl = Date.now, attemptCapMs = DEFAULT_ATTEMPT_TIMEOUT_MS }) {
   const budget = clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, DEFAULT_BUDGET_MS);
-  const deadline = nowImpl() + budget;
+  const deadline = outerDeadline ?? nowImpl() + budget;
+  const guardState = createGuard(guard);
+  const usage = { inputTokens: 0, uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, cost: 0, steps: 0 };
+  let sessionID;
   const attempts = [];
   const seen = new Set();
   const queue = models.filter((model) => !seen.has(model.id) && seen.add(model.id));
@@ -526,23 +522,33 @@ export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runne
     const started = nowImpl();
     let result;
     try {
-      result = await runner({ directory, prompt, model: model.id, variant: variantFor(model), timeoutMs, maxWords });
+      result = await runner({ directory, prompt, model: model.id, variant: variantFor(model), timeoutMs, maxWords, guardState, codeMap });
     } catch (error) {
       result = { status: "failed", error: redactSecrets(error?.message ?? String(error)) };
     }
     const elapsedMs = Number.isFinite(result?.elapsedMs) ? result.elapsedMs : nowImpl() - started;
+    if (result?.usage) for (const key of Object.keys(usage)) usage[key] += result.usage[key] ?? 0;
+    sessionID = result?.sessionID ?? sessionID;
+    if (result?.guard?.kind || guardState.snapshot().kind || result?.localFailure) {
+      const error = result?.error ?? result?.guard?.kind ?? guardState.snapshot().kind ?? "Local preparation failed.";
+      attempts.push({ model: model.id, status: "failed", elapsedMs, timeoutMs, reason: error });
+      return { error, message: error, attempts, budgetMs: budget, guard: result.guard ?? guardState.snapshot(), usage, sessionID };
+    }
     if (result?.text) {
       attempts.push({ model: model.id, status: "ok", elapsedMs, timeoutMs, reason: result.warning });
-      return { text: result.text, model: model.id, elapsedMs, attempts, budgetMs: budget };
+      return { text: result.text, model: model.id, elapsedMs, attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID };
     }
     attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: result?.error ?? "no answer" });
   }
-  return { error: "all-models-failed", attempts, budgetMs: budget };
+  return { error: "all-models-failed", attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID };
 }
 
 export function formatAnalysisResult(result) {
   const lines = ["## CodeHelper", `- Model: ${result?.model ?? "none"}${result?.model ? ` (${result.elapsedMs} ms)` : ""}`];
   if (result?.selection) lines.push(`- Selection: ${result.selection}`);
+  if (result?.guard) lines.push(`- Guard: ${JSON.stringify(result.guard)}`);
+  if (result?.usage) lines.push(`- Usage: ${JSON.stringify(result.usage)}`);
+  if (result?.sessionID) lines.push(`- Session: ${result.sessionID}`);
   lines.push("- Attempts:");
   const attempts = Array.isArray(result?.attempts) ? result.attempts : [];
   if (attempts.length === 0) lines.push("  - none");
@@ -554,6 +560,7 @@ export function formatAnalysisResult(result) {
   });
   const header = lines.join("\n");
   if (result?.error) {
+    if (result.guard?.kind) return `${header}\n\nStopped by guard: ${result.guard.kind}; no fallback was attempted after the trip.`;
     const why = result.message ? `\n\n${redactSecrets(result.message)}` : "";
     return `${header}${why}\n\nAll CodeHelper attempts failed. Call list_free_models with probe=true and pass a working model.`;
   }
@@ -592,6 +599,7 @@ export const ANALYZE_DESCRIPTION = [
   "Read-only code analysis through OpenCode (plan agent, no edits) using FREE models only.",
   "Recommended flow: first call list_free_models (probe=true when unsure which models are healthy right now), then pick the model yourself and pass it as `model`, optionally with an ordered fallback list in `models`.",
   "Both fields are optional: without them the helper auto-orders the currently listed free models (preferring DeepSeek V4.1 Flash, GLM 5.3 Flash, MiMo V2.6 Flash when listed) and skips models that failed a recent probe.",
+  "Explicit read/search permissions, cumulative guard budgets and optional bounded code map; guard trips stop without fallback.",
   "Only ids from the current free list are accepted. Each model is called at most once; budgetMs is shared across attempts. The result header lists the model used and every attempt with its status and real (redacted) error.",
 ].join(" ");
 
@@ -642,7 +650,10 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
     return textResult(JSON.stringify(payload, null, 2));
   });
 
-  server.registerTool("analyze_code", { title: "Analyze code with a free OpenCode model", description: ANALYZE_DESCRIPTION, inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs, model, models }) => {
+  server.registerTool("analyze_code", { title: "Analyze code with a free OpenCode model", description: ANALYZE_DESCRIPTION, inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs, model, models, guard, codeMap = true }) => {
+    const deadline = nowImpl() + clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, DEFAULT_BUDGET_MS);
+    const guardValidation = guardSchema.safeParse(guard ?? {});
+    if (!guardValidation.success) return textResult("Invalid guard options.", true);
     const validated = await validate(directory);
     if (validated.error) return textResult(validated.error, true);
     const listed = await catalog.list();
@@ -651,7 +662,7 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
     if (requested.error) return textResult(requested.error, true);
     const chain = requested.auto ? buildAutoOrder(listed.models, { recentProbe: catalog.recentProbe }) : requested.models;
     if (chain.length === 0) return textResult("No free OpenCode models are currently available. Call list_free_models with refresh=true.", true);
-    const result = await runAnalysis({ directory: validated.directory, prompt, maxWords, budgetMs, runner, models: chain });
+    const result = await runAnalysis({ directory: validated.directory, prompt, maxWords, budgetMs, runner, models: chain, guard: guardValidation.data, codeMap, deadline, nowImpl });
     result.selection = requested.auto ? `auto (${chain.map((m) => m.id).join(" → ")})` : "caller";
     return textResult(formatAnalysisResult(result), Boolean(result.error));
   });

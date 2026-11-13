@@ -105,7 +105,7 @@ test("no frozen provider list or fixed per-provider tools remain", () => {
   assert.deepEqual([...tools.keys()].sort(), ["analyze_code", "list_free_models"]);
   assert.match(tools.get("analyze_code").config.description, /list_free_models/);
   assert.match(tools.get("analyze_code").config.description, /optional/i);
-  assert.deepEqual(Object.keys(analysisInputSchema), ["directory", "prompt", "maxWords", "budgetMs", "model", "models"]);
+  assert.deepEqual(Object.keys(analysisInputSchema), ["guard", "codeMap", "directory", "prompt", "maxWords", "budgetMs", "model", "models"]);
   assert.deepEqual(Object.keys(listModelsInputSchema), ["probe", "refresh", "models", "provider"]);
   assert.equal(MAX_BUDGET_MS, 600_000);
   assert.equal(DEFAULT_ATTEMPT_TIMEOUT_MS, 120_000);
@@ -295,7 +295,7 @@ test("request timeout drives the child timer and defaults to 120s", async () => 
     child.stdout.emit("data", '{"type":"text","text":"done"}\n');
     child.emit("close", 0);
     assert.equal((await pending).text, "done");
-    assert.equal(timers[0], expected);
+    assert.ok(timers[0] > 0 && timers[0] <= expected);
   }
 });
 
@@ -318,8 +318,8 @@ test("failures return exit code, the NDJSON error, and a redacted stderr tail", 
   assert.match(zeroExit.error, /quota exceeded/);
 
   const answeredThenFailed = await createOpenCodeRunner({ spawnImpl: scriptedSpawn(() => ({ code: 1, stdout: '{"type":"text","text":"answer"}\n' })), env: {} })({ directory, prompt: "x", model: "m/x" });
-  assert.equal(answeredThenFailed.text, "answer");
-  assert.match(answeredThenFailed.warning, /exited with code 1 after producing the answer/);
+  assert.equal(answeredThenFailed.text, undefined);
+  assert.match(answeredThenFailed.error, /exited with code 1/);
 });
 
 test("timeouts terminate the process tree and report elapsed ms", async () => {
