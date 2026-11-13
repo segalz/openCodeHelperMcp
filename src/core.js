@@ -171,7 +171,7 @@ function childEnv(env, execPath) {
 export function runBoundedProcess({
   executable, args, cwd, env, timeoutMs, maxStdoutBytes = OPENCODE_MAX_STDOUT_BYTES, maxStderrBytes = OPENCODE_MAX_STDERR_BYTES,
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, terminate, graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
-  onStdout, collectStdout = true, signal,
+  onStdout, onStderr, collectStdout = true, signal,
 }) {
   const started = nowImpl();
   return new Promise((resolve) => {
@@ -226,6 +226,7 @@ export function runBoundedProcess({
       stderrBytes += Buffer.byteLength(chunk, "utf8");
       if (stderrBytes > maxStderrBytes) return failForOverflow();
       stderr += chunk;
+      try { const reason = onStderr?.(chunk); if (reason) stop(reason); } catch { stop("stream_error"); }
     });
     child.on("error", (error) => { spawnError = error?.code ?? error?.message ?? "spawn failed"; finish(); });
     child.on("exit", (code) => { exitCode = code; graceTimer ??= setTimeoutImpl(finish, graceMs); });
@@ -233,6 +234,21 @@ export function runBoundedProcess({
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
   });
+}
+
+/**
+ * Recognize an OpenCode error-level log line that means the model cannot answer now: an exhausted
+ * quota, or rate-limit retries OpenCode already gave up on. A single 429 is left to OpenCode's retry.
+ * Returns the redacted provider message, or undefined.
+ */
+export function providerLimitError(line) {
+  const text = String(line ?? "");
+  if (!/level=ERROR/.test(text)) return undefined;
+  const quota = /free usage limit reached|insufficient_quota|quota exceeded/i.test(text);
+  const retriesExhausted = /AI_RetryError/.test(text) && /Too Many Requests|\b429\b/i.test(text);
+  if (!quota && !retriesExhausted) return undefined;
+  const detail = text.match(/error\.error="((?:[^"\\]|\\.)*)"/)?.[1] ?? text.trim();
+  return redactSecrets(detail.slice(0, 500));
 }
 
 /** Turn a failed process result into { status, error } with real, redacted details. */
@@ -290,7 +306,8 @@ export function createOpenCodeRunner({
     const effectiveTimeoutMs = Math.min(MAX_BUDGET_MS, validTimeout(requestTimeoutMs, validTimeout(timeoutMs, DEFAULT_ATTEMPT_TIMEOUT_MS)));
     const args = ["run", "--dir", directory, "--model", model];
     if (variant) args.push("--variant", variant);
-    args.push("--agent", mode === "edits" ? "build" : "plan", "--format", "json");
+    // Error-level logs on stderr are the only place OpenCode reports a provider quota while it keeps retrying.
+    args.push("--agent", mode === "edits" ? "build" : "plan", "--format", "json", "--print-logs", "--log-level", "ERROR");
     if (sessionID) args.push("--session", sessionID);
     const render = map => mode === "edits" ? buildEditPrompt(prompt, { directory, platform, map }) : raw ? [...READ_ONLY_RULES, prompt].join("\n") : buildAnalysisPrompt(prompt, maxWords, { directory, platform, map });
     const commandLength = map => windowsCommandLineLength(executable, [...args, render(map)]);
@@ -312,16 +329,24 @@ export function createOpenCodeRunner({
     args.push(render(map));
     const remaining = effectiveTimeoutMs - (nowImpl() - started);
     if (remaining <= 0) return { status: "timeout", codeMapSource: "none", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
-    let verdict, streamFatal;
+    let verdict, streamFatal, quotaError, stderrLine = "";
     const parser = createEventStream({ onEvent: event => { verdict ??= detector.observe(event); return !verdict; }, onFatal: detail => { streamFatal = detail; } });
     const result = await runBoundedProcess({ executable, args, cwd: directory, env: effectiveEnv, timeoutMs: remaining,
       spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl, collectStdout: false, signal,
       onStdout: chunk => { parser.write(chunk); return verdict?.kind ?? (streamFatal ? "event_error" : undefined); },
+      onStderr: chunk => {
+        const lines = (stderrLine + chunk).split(/\r?\n/);
+        stderrLine = lines.pop().slice(-8192);
+        for (const line of lines) quotaError ??= providerLimitError(line);
+        return quotaError ? "provider_limit" : undefined;
+      },
     });
+    quotaError ??= providerLimitError(stderrLine);
     const parsed = parser.end(), elapsedMs = nowImpl() - started;
     const metrics = { elapsedMs, codeMapSource, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported, guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)) };
     if (sessionID && parsed.sessionID && parsed.sessionID !== sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation session mismatch." };
     if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
+    if (quotaError) return { ...metrics, status: "failed", quota: true, error: `OpenCode quota or rate limit: ${quotaError}` };
     if (result.spawnError || result.timedOut || result.overflowed) return { ...metrics, ...describeProcessFailure(result) };
     if (result.exitCode !== 0 || parsed.error || result.stoppedReason) return { ...metrics, ...describeProcessFailure(result, { ndjsonError: parsed.detail ?? parsed.error ?? result.stoppedReason }) };
     if (sessionID && !parsed.sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation did not report a session ID." };
