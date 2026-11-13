@@ -19,8 +19,21 @@ export function validatePermissionProfile(profile) {
   return profile;
 }
 
-export function permissionEnvironment(env, mode = "analysis") {
-  const profile = validatePermissionProfile(PERMISSION_PROFILES[mode]);
+export function permissionEnvironment(env, mode = "analysis", ignoredPaths = [], directory) {
+  let profile = validatePermissionProfile(PERMISSION_PROFILES[mode]);
+  if (ignoredPaths.length) {
+    if (ignoredPaths.length > 20000) throw new Error("Ignored-path permission list is too large.");
+    const denied = {};
+    for (const raw of ignoredPaths) {
+      const file = raw.replaceAll("\\", "/");
+      if (/[\x00-\x1f*?\[\]{}]/.test(file) || file.startsWith("/") || file.split("/").includes("..")) throw new Error("Unsupported ignored permission path.");
+      for (const prefix of ["", ...(directory ? [directory.replaceAll("\\", "/").replace(/\/$/, "") + "/"] : [])]) {
+        denied[prefix + file.replace(/\/$/, "")] = "deny";
+        if (file.endsWith("/")) denied[prefix + file + "*"] = "deny";
+      }
+    }
+    profile = validatePermissionProfile({ ...profile, read: { ...profile.read, ...denied }, ...(mode === "edits" ? { edit: { ...profile.edit, ...denied } } : {}) });
+  }
   const agent = mode === "analysis" ? "plan" : "build";
   // Inline config is loaded after project agent definitions. Explicitly override
   // the selected agent as well as global permissions. Retain unrelated settings,
