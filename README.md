@@ -4,6 +4,17 @@ A local stdio MCP server for read-only code analysis and checked edits through t
 
 The three tools are synchronous: each call returns its final result. There are no asynchronous task-management tools. Analysis uses the OpenCode `plan` agent; edits use `build`. Both run with explicit permission profiles and without `--auto`.
 
+## Typical use
+
+1. `list_free_models` with `probe:true` to pick a responsive free model.
+2. `analyze_code` for a focused question about the current directory, including uncommitted changes. Write, shell and web tools are unavailable to the model.
+3. `apply_opencode_edits` for a scoped change with an executable `verify` check. A failed check starts up to two repairs in the same OpenCode session; if it still fails, the pre-run files are restored unless `keepOnFailure:true`.
+4. Review the resulting diff yourself. A passing check shows that your check passed, not that the change is correct.
+
+Use a clean work branch for edits so the diff is attributable to the call. The helper never commits, and it holds the same checkout lock as the Cline bridge, so the two never edit one checkout at the same time.
+
+Measured on one local 7-check Python task (`opencode/glm-5.3-flash-free`, November 2026), four edit calls all ended 7/7 in 63-87 seconds and 45-74k input tokens. In one run a requirement left out of the prompt was added by a single repair after the check failed. Results depend on the model, task and current free-tier capacity.
+
 ## Setup
 
 Install Node.js, Git and OpenCode, and configure the provider access you intend OpenCode to use. From this repository:
