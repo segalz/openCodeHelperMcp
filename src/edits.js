@@ -100,6 +100,7 @@ export async function runEdits(rawInput, {
       result.codeMapSource = response?.codeMapSource ?? "none";
       if (response?.usage) for (const key of Object.keys(usage)) usage[key] += Number.isFinite(response.usage[key]) ? response.usage[key] : 0;
       if (response?.guard?.kind) result.guard = response.guard;
+      if (response?.limitKind) result.limitKind = response.limitKind;
       const returnedSession = response?.sessionID;
       await unchanged(false); check();
       if (sessionID && returnedSession !== sessionID && (returnedSession || !response?.error)) throw failure("session_mismatch", "OpenCode repair did not continue the expected session.");

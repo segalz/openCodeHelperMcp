@@ -49,7 +49,7 @@ export const PREFERRED_MODELS = Object.freeze([
 // Used only when `opencode models --verbose` gives no cost metadata for a model.
 export const KNOWN_FREE_MODEL_IDS = Object.freeze(["opencode/big-pickle"]);
 
-export const FREE_RULE = "cost.input == 0 and cost.output == 0 from `opencode models --verbose`; when a model has no cost metadata, ids ending in -free or :free (or opencode/big-pickle) count as free. Models without tool-call support or with status deprecated are excluded.";
+export const FREE_RULE = "cost.input == 0 and cost.output == 0 from `opencode models --verbose`; when a model has no cost metadata, ids ending in -free or :free (or opencode/big-pickle) count as free. Models of providers listed in OPENCODE_HELPER_FREE_PROVIDERS count as free regardless of price. Models without tool-call support or with status deprecated are excluded.";
 
 export const PROBE_PROMPT = "Health check. Reply with exactly the single word OK. Do not read files or use any tools.";
 
@@ -238,17 +238,20 @@ export function runBoundedProcess({
 
 /**
  * Recognize an OpenCode error-level log line that means the model cannot answer now: an exhausted
- * quota, or rate-limit retries OpenCode already gave up on. A single 429 is left to OpenCode's retry.
- * Returns the redacted provider message, or undefined.
+ * quota, rate-limit retries OpenCode already gave up on, or a request larger than the provider tier
+ * allows per minute (it can never succeed). A single 429 is left to OpenCode's retry.
+ * Returns { kind: "quota" | "rate_limit" | "request_too_large", message } or undefined.
  */
 export function providerLimitError(line) {
   const text = String(line ?? "");
   if (!/level=ERROR/.test(text)) return undefined;
-  const quota = /free usage limit reached|insufficient_quota|quota exceeded/i.test(text);
-  const retriesExhausted = /AI_RetryError/.test(text) && /Too Many Requests|\b429\b/i.test(text);
-  if (!quota && !retriesExhausted) return undefined;
+  let kind;
+  if (/free usage limit reached|insufficient_quota|quota exceeded/i.test(text)) kind = "quota";
+  else if (/AI_RetryError/.test(text) && /Too Many Requests|\b429\b/i.test(text)) kind = "rate_limit";
+  else if (/Request too large/i.test(text) && /tokens per minute|\bTPM\b/i.test(text)) kind = "request_too_large";
+  else return undefined;
   const detail = text.match(/error\.error="((?:[^"\\]|\\.)*)"/)?.[1] ?? text.trim();
-  return redactSecrets(detail.slice(0, 500));
+  return { kind, message: redactSecrets(detail.slice(0, 500)) };
 }
 
 /** Turn a failed process result into { status, error } with real, redacted details. */
@@ -346,7 +349,7 @@ export function createOpenCodeRunner({
     const metrics = { elapsedMs, codeMapSource, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported, guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)) };
     if (sessionID && parsed.sessionID && parsed.sessionID !== sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation session mismatch." };
     if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
-    if (quotaError) return { ...metrics, status: "failed", quota: true, error: `OpenCode quota or rate limit: ${quotaError}` };
+    if (quotaError) return { ...metrics, status: "failed", quota: true, limitKind: quotaError.kind, error: `OpenCode quota or rate limit: ${quotaError.message}` };
     if (result.spawnError || result.timedOut || result.overflowed) return { ...metrics, ...describeProcessFailure(result) };
     if (result.exitCode !== 0 || parsed.error || result.stoppedReason) return { ...metrics, ...describeProcessFailure(result, { ndjsonError: parsed.detail ?? parsed.error ?? result.stoppedReason }) };
     if (sessionID && !parsed.sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation did not report a session ID." };
@@ -475,6 +478,9 @@ export function createModelCatalog({
       }
       failure = null;
     }
+    // Owner-declared free tiers (providers with no billing method) count as free despite catalog prices.
+    const freeProviders = new Set(String(env.OPENCODE_HELPER_FREE_PROVIDERS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
+    for (const model of all) if (!model.free && freeProviders.has(model.provider)) { model.free = true; model.freeBasis = "provider"; }
     const usable = all.filter(isUsableFreeModel);
     return { at: nowImpl(), source, models: usable, excluded: { paid: all.filter((m) => !m.free).length, freeWithoutToolsOrDeprecated: all.filter((m) => m.free && !isUsableFreeModel(m)).length }, total: all.length };
   };
@@ -592,7 +598,8 @@ export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runne
       attempts.push({ model: model.id, status: "ok", elapsedMs, timeoutMs, reason: result.warning });
       return { text: result.text, model: model.id, elapsedMs, attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID, codeMapSource };
     }
-    attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: result?.error ?? "no answer" });
+    attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: result?.error ?? "no answer",
+      ...(result?.limitKind ? { limitKind: result.limitKind } : {}) });
   }
   return { error: "all-models-failed", attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID, codeMapSource };
 }
