@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Read-only code analysis MCP helper over OpenCode: discovers the currently free models (list_free_models, optional health probe) and lets the client choose; no hard-coded models.",
+  "description": "MCP server for read-only code analysis and checked edits through OpenCode, with free-model discovery, cumulative guards, verification and snapshot recovery.",
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test"

@@ -48,3 +48,19 @@ Async tasks for OpenCode are out of scope for now (sync first).
   released on every terminal path, strict `verify` union, `none` → `passed: null`, refused executables spend no fix).
 - Tests with injected spawn/timers and realistic synthetic events; temp-repo tests for restore/lock/identity.
 - Order: O.1 + permission profiles → O.2 → O.3 → snapshot/lock/verify modules → O.4 → docs/review → live.
+
+## Results (2026-11-13)
+- Part A (1bdb4c6): streaming events, enforced read-only profile, guard, environment line, working rules, code map.
+  Live: `analyze_code` on `opencode/glm-5.3-flash-free` answered correctly in 12 s; the model had no write or shell
+  tool, and no file was created.
+- Part B (c9f7c0a): `apply_opencode_edits` with the Stage 12 lifecycle. 54 tests. AGY review: approve, no findings.
+- Live edits, same 7-check task as ClineMcp stage12-results.md, `opencode/glm-5.3-flash-free`, final check = all checks:
+
+| Run | Instructions | Time | Input tokens | Checks per attempt | Fix runs | Final |
+|---|---|---|---|---|---|---|
+| P1 | full | 75 s | 57k | 7/7 | 0 | 7/7 |
+| P2 | full | 87 s | 68k | 7/7 | 0 | 7/7 |
+| P3 | full | 63 s | 45k | 7/7 | 0 | 7/7 |
+| Q1 | one requirement left out | 83 s | 74k | 6/7 → 7/7 | 1 (same session) | 7/7 |
+
+Same behaviour as the Cline bridge, at lower time and tokens on this task.
