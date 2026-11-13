@@ -26,3 +26,25 @@ regression appears, roll back.
 | O.L | Live: `analyze_code` on a real question (read-only proven: an attempted write is denied); `apply_opencode_edits` on the 7-check task (3 runs) and a missing-requirement run (fix path). | Same behaviour as Cline Stage 12. |
 
 Async tasks for OpenCode are out of scope for now (sync first).
+
+## Agreed after the Codex plan review (16 points)
+- Read-only `analyze_code`: `OPENCODE_PERMISSION` = `{"*":"deny","read":"allow","glob":"allow","grep":"allow",
+  "list":"allow","edit":"deny","bash":"deny","task":"deny","webfetch":"deny","websearch":"deny",
+  "external_directory":"deny"}` (direct object; validated before launch). `edit` covers edit/write/apply_patch.
+  Agent-level configuration can override: detect and refuse, or pass an explicit agent profile.
+- Edits: `--agent build`, edit allowed, bash/task/web denied (the bridge runs the check); no `--auto` (unexpected
+  approval requests stay rejected). Secret paths (`.git`, credentials, ignored files) excluded from reads, map and
+  edits as far as permissions allow.
+- Parser: incremental NDJSON across chunk boundaries, bounded lines, dedupe by tool/step id, final text = text parts
+  of the last assistant message; partial text after a fatal error is not success.
+- Guard adapted to OpenCode: `part.state.status/error`, `filePath`, `patchText`, bash command targets. Input budget =
+  uncached input + cache read + cache write, once per step; output/reasoning/cost kept separately; overshoot by one
+  step reported. Counters and one deadline cumulative across fallbacks and fix runs; a trip never triggers fallback or
+  fixes.
+- Fix runs: `--session <captured id>`, same directory/model/agent/permissions; never `--continue`/`--fork`; fail
+  explicitly if continuation is unavailable. Fix prompt: objective, exact command/args, failure status, redacted
+  tails, "never weaken the check"; optional context trimmed first.
+- Recovery and verification exactly as ClineMcp Stage 12 (identity checks, retained snapshots on refusal, lock
+  released on every terminal path, strict `verify` union, `none` → `passed: null`, refused executables spend no fix).
+- Tests with injected spawn/timers and realistic synthetic events; temp-repo tests for restore/lock/identity.
+- Order: O.1 + permission profiles → O.2 → O.3 → snapshot/lock/verify modules → O.4 → docs/review → live.
