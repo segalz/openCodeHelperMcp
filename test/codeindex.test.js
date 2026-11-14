@@ -24,7 +24,8 @@ async function fixture(t, script = successScript) {
   const base = await mkdtemp(path.resolve(".codeindex-test-")), root = path.join(base, "repo"), cli = path.join(base, "fake cli.mjs");
   t.after(async () => {
     assert.equal(path.dirname(base), process.cwd());
-    await rm(base, { recursive: true, force: true });
+    // A killed child can hold its cwd briefly on Windows (EBUSY); fs.rm retries those errors.
+    await rm(base, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   });
   await mkdir(path.join(root, ".git", "objects"), { recursive: true });
   await mkdir(path.join(root, ".git", "refs", "heads"), { recursive: true });
