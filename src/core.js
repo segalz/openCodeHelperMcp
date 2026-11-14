@@ -248,6 +248,8 @@ export function providerLimitError(line) {
   let kind;
   if (/free usage limit reached|insufficient_quota|quota exceeded/i.test(text)) kind = "quota";
   else if (/AI_RetryError/.test(text) && /Too Many Requests|\b429\b/i.test(text)) kind = "rate_limit";
+  // Gateways that fail over internally (e.g. FreeLLMAPI) report a final exhaustion instead of a 429.
+  else if (/All models exhausted/i.test(text) && /rate[- ]limited|cooldown/i.test(text)) kind = "rate_limit";
   else if (/Request too large/i.test(text) && /tokens per minute|\bTPM\b/i.test(text)) kind = "request_too_large";
   else return undefined;
   const detail = text.match(/error\.error="((?:[^"\\]|\\.)*)"/)?.[1] ?? text.trim();

@@ -62,6 +62,8 @@ test("providerLimitError classifies quota, exhausted rate-limit retries and requ
   assert.equal(providerLimitError(GROQ_TOO_LARGE)?.kind, "request_too_large");
   assert.match(providerLimitError(GROQ_TOO_LARGE)?.message, /Request too large/);
   assert.equal(providerLimitError('level=INFO message="Request too large"'), undefined);
+  const gateway = 'level=ERROR message="stream error" error.error="AI_APICallError: All models exhausted: 1 route checked (1 rate-limited or on cooldown). Soonest reset ~2m."';
+  assert.equal(providerLimitError(gateway)?.kind, "rate_limit");
 });
 
 for (const [line, kind] of [[QUOTA_LINE, "quota"], [RETRY_429_LINE, "rate_limit"], [GROQ_TOO_LARGE, "request_too_large"]]) {
