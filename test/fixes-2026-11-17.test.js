@@ -91,3 +91,4 @@ test("through the tool entry point, an exhausted budget is budget_exceeded, not 
   const result = JSON.parse(response.content[0].text);
   assert.equal(result.error, "budget_exceeded", result.message);
 });
+
