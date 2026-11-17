@@ -7,7 +7,7 @@ export const emptyUsage = () => ({ inputTokens: 0, uncachedInputTokens: 0, cache
 /** Terminal tool/step events are unique observations, not deltas or snapshots. */
 export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxLineBytes = MAX_EVENT_LINE_BYTES } = {}) {
   const decoder = new StringDecoder("utf8"), tools = new Set(), steps = new Set();
-  let pending = "", sessionID, messageID, legacyText, fatal, eventCount = 0, ended = false;
+  let pending = "", sessionID, messageID, legacyText, fatal, eventCount = 0, ended = false, lastStepReason;
   const messages = new Set();
   let halted = false;
   const emit = event => { if (onEvent(event) === false) halted = true; };
@@ -38,6 +38,7 @@ export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxL
       if (!part.id) return fail("OpenCode usage event has no step ID.");
       if (steps.has(part.id)) return;
       steps.add(part.id);
+      lastStepReason = typeof part.reason === "string" ? part.reason : undefined;
       if (!part.tokens) return;
       const tokens = part.tokens;
       const delta = { inputTokens: number(tokens.input) + number(tokens.cache?.read) + number(tokens.cache?.write), uncachedInputTokens: number(tokens.input), cacheReadTokens: number(tokens.cache?.read), cacheWriteTokens: number(tokens.cache?.write), outputTokens: number(tokens.output), reasoningTokens: number(tokens.reasoning), cost: number(part.cost), steps: 1 };
@@ -69,7 +70,7 @@ export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxL
     end() { if (!ended) { ended = true; feed(decoder.end()); if (pending && !fatal) line(pending); pending = ""; } return this.snapshot(); },
     snapshot() {
       const text = texts.size ? [...texts.values()].join("\n\n") : legacyText;
-      return { ...(fatal ? { error: "OpenCode reported an analysis error.", detail: fatal } : text ? { text } : { error: "OpenCode returned no valid analysis.", ...(toolErrors.length ? { detail: toolErrors.at(-1) } : {}) }), sessionID, usage: { ...usage }, usageReported: usage.steps > 0, toolCalls: tools.size, toolErrors: [...toolErrors], eventCount };
+      return { ...(fatal ? { error: "OpenCode reported an analysis error.", detail: fatal } : text ? { text } : { error: "OpenCode returned no valid analysis.", ...(toolErrors.length ? { detail: toolErrors.at(-1) } : {}) }), sessionID, usage: { ...usage }, usageReported: usage.steps > 0, toolCalls: tools.size, toolErrors: [...toolErrors], eventCount, finalStop: lastStepReason === "stop" };
     },
   };
 }

@@ -28,6 +28,11 @@ export const editsInputSchema = Object.freeze({
 const inputSchema = z.object(editsInputSchema).strict().refine(input => Buffer.byteLength(JSON.stringify(input), "utf8") <= 64 * 1024, "Edit input exceeds 64 KiB.");
 const failure = (kind, message) => Object.assign(new Error(message), { kind });
 
+/** Time kept after a run for the final check: the check timeout plus this margin. */
+export const VERIFY_RESERVE_MARGIN_MS = 10_000;
+/** A repair run shorter than this is not launched. */
+export const MIN_FIX_RUN_MS = 30_000;
+
 export function buildFixPrompt(objective, spec, attempt, root) {
   const mandatory = `Objective:\n${objective}\n\nVerification cwd: ${root}\nExact verification command and literal args:\n${JSON.stringify(spec)}\nFix only what the check reports. Fix the code; never weaken or bypass the check. Retain existing partial edits.\nPrevious check: exit=${attempt.exitCode}; signal=${attempt.signal}; timedOut=${attempt.timedOut}; killedForOutput=${attempt.killedForOutput}\n`;
   if (mandatory.length > 18000) throw failure("prompt_limit", "Objective and exact verification specification exceed repair prompt limits.");
@@ -92,10 +97,15 @@ export async function runEdits(rawInput, {
         result.guard = { ...counters, kind: "budget_exceeded" };
         throw failure("budget_exceeded", "Cumulative edit guard budget exhausted before launch.");
       }
+      // Keep time for the final check (and restore) so a run that finishes late is still verified.
+      const reserveMs = verification.required ? (input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS : 0;
+      const runMs = deadline - nowImpl() - reserveMs;
+      if (run && runMs < MIN_FIX_RUN_MS) throw failure("budget_exceeded", "Not enough budget left for another repair run and its check.");
       if (run) verification.fixRuns++;
       let response;
       try { response = await runner({ directory: root, prompt, model: input.model, variant, mode: "edits", codeMap: input.codeMap ?? true,
-        guardState, sessionID, ignoredPaths, signal: controller.signal, timeoutMs: Math.max(1, deadline - nowImpl()) }); }
+        guardState, sessionID, ignoredPaths, signal: controller.signal,
+        timeoutMs: Math.max(1, runMs >= MIN_FIX_RUN_MS ? runMs : deadline - nowImpl()) }); }
       catch (error) { response = { error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard }; }
       result.codeMapSource = response?.codeMapSource ?? "none";
       if (response?.usage) for (const key of Object.keys(usage)) usage[key] += Number.isFinite(response.usage[key]) ? response.usage[key] : 0;
@@ -145,15 +155,34 @@ export async function runEdits(rawInput, {
   return result;
 }
 
+/** Edit calls in flight: shutdown aborts them and waits for their restore and lock release. */
+export const activeEditCalls = new Set();
+
+/** Abort every in-flight edit (as a client cancel) and wait for each to finish its recovery. */
+export async function shutdownEdits(waitMs = 120_000) {
+  const calls = [...activeEditCalls];
+  for (const call of calls) call.abort();
+  let timer;
+  await Promise.race([
+    Promise.allSettled(calls.map((call) => call.done)),
+    new Promise((resolve) => { timer = setTimeout(resolve, waitMs); }),
+  ]);
+  clearTimeout(timer);
+}
+
 export function registerEditTools(server, { runner, catalog, resolveAllowedPath, isAbsolute = path.isAbsolute, nowImpl = Date.now, lifecycleOptions = {} }) {
   server.registerTool("apply_opencode_edits", {
     title: "Apply verified OpenCode edits", inputSchema: editsInputSchema,
     description: "Edit one Git checkout using one explicit free model and build agent; shell/delegates/web denied. Required final check, up to two same-session repairs, shared Cline writer lock, one recovery snapshot, cumulative guard/deadline. Restores failed edits unless keepOnFailure=true; identity changes retain recovery evidence. Synchronous; no fallback.",
   }, async (raw, extra = {}) => {
     const deadline = nowImpl() + (raw?.budgetMs ?? DEFAULT_BUDGET_MS);
+    // `controller` stops preparation on a client cancel or the deadline. Only a real client cancel
+    // reaches runEdits as `signal`; runEdits owns the deadline, so an exhausted budget is reported as
+    // budget_exceeded and never as cancelled (the 2026-11-17 "Edit lifecycle cancelled" report).
     const controller = new AbortController(), abort = () => controller.abort();
+    const user = new AbortController(), userAbort = () => { user.abort(); abort(); };
     const timer = setTimeout(abort, Math.max(1, deadline - nowImpl()));
-    extra.signal?.addEventListener("abort", abort, { once: true }); if (extra.signal?.aborted) abort();
+    extra.signal?.addEventListener("abort", userAbort, { once: true }); if (extra.signal?.aborted) userAbort();
     const active = operation => new Promise((resolve, reject) => {
       const cancelled = () => { cleanup(); reject(new Error("Edit preparation cancelled or deadline exhausted.")); };
       const cleanup = () => controller.signal.removeEventListener("abort", cancelled);
@@ -174,8 +203,11 @@ export function registerEditTools(server, { runner, catalog, resolveAllowedPath,
         if (!await active(() => resolveAllowedPath(root))) throw new Error("Git checkout root is outside the allowed roots.");
         return root;
       };
-      return respond(await runEdits({ ...input, directory }, { ...lifecycleOptions, runner, resolveRoot, nowImpl, deadline, signal: controller.signal, variant: variantFor(selected.models[0]) }));
+      const running = runEdits({ ...input, directory }, { ...lifecycleOptions, runner, resolveRoot, nowImpl, deadline, signal: user.signal, variant: variantFor(selected.models[0]) });
+      const call = { abort: userAbort, done: running };
+      activeEditCalls.add(call);
+      try { return respond(await running); } finally { activeEditCalls.delete(call); }
     } catch (error) { return respond({ error: "edits_refused", message: redactSecrets(error?.message ?? String(error)) }); }
-    finally { clearTimeout(timer); extra.signal?.removeEventListener("abort", abort); }
+    finally { clearTimeout(timer); extra.signal?.removeEventListener("abort", userAbort); }
   });
 }

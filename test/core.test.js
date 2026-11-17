@@ -231,8 +231,12 @@ test("auto order follows the preference list, then other free models, and skips 
 });
 
 test("budget is shared across attempts without duplicate calls and never exceeded", async () => {
-  assert.equal(allocateAttemptTimeoutMs({ remainingMs: 300_000, attemptsLeft: 4 }), 120_000);
+  assert.equal(allocateAttemptTimeoutMs({ remainingMs: 300_000, attemptsLeft: 4 }), 150_000);
+  assert.equal(allocateAttemptTimeoutMs({ remainingMs: 200_000, attemptsLeft: 4 }), 110_000);
   assert.equal(allocateAttemptTimeoutMs({ remainingMs: 90_000, attemptsLeft: 3 }), 30_000);
+  // The 2026-11-17 failure: a 420 s review with 4 models got 120 s per try. Now the first try gets 210 s.
+  assert.equal(allocateAttemptTimeoutMs({ remainingMs: 420_000, attemptsLeft: 4 }), 210_000);
+  assert.equal(allocateAttemptTimeoutMs({ remainingMs: 600_000, attemptsLeft: 2 }), 300_000);
   assert.equal(allocateAttemptTimeoutMs({ remainingMs: 300_000, attemptsLeft: 1, totalAttempts: 1 }), 300_000);
   let now = 0;
   const calls = [];
@@ -244,7 +248,9 @@ test("budget is shared across attempts without duplicate calls and never exceede
   assert.equal(result.error, "all-models-failed");
   assert.deepEqual(calls.map((c) => c.model), ["opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free", "nvidia/z-ai/glm-5.3-flash"]);
   assert.ok(calls.reduce((sum, c) => sum + c.timeoutMs, 0) <= 300_000);
-  assert.ok(calls.every((c) => c.timeoutMs <= DEFAULT_ATTEMPT_TIMEOUT_MS || calls.length === 1));
+  // First try gets half the budget, later tries the cap or what is left after their reserve.
+  assert.deepEqual(calls.map((c) => c.timeoutMs), [150_000, 120_000, 30_000]);
+  assert.ok(calls.every((c) => c.timeoutMs >= Math.min(DEFAULT_ATTEMPT_TIMEOUT_MS, 30_000)));
   assert.equal(calls[0].variant, "low");
   const text = formatAnalysisResult(result);
   assert.match(text, /1\. opencode\/deepseek-v4\.1-flash-free — timeout/);

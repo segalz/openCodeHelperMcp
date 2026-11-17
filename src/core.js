@@ -251,6 +251,8 @@ export function providerLimitError(line) {
   // Gateways that fail over internally (e.g. FreeLLMAPI) report a final exhaustion instead of a 429.
   else if (/All models exhausted/i.test(text) && /rate[- ]limited|cooldown/i.test(text)) kind = "rate_limit";
   else if (/Request too large/i.test(text) && /tokens per minute|\bTPM\b/i.test(text)) kind = "request_too_large";
+  // Nvidia and other providers answer overload with 503; it is temporary like a rate limit.
+  else if (/\b503\b|service (?:temporarily )?(?:unavailable|overloaded)|\boverloaded\b/i.test(text)) kind = "rate_limit";
   else return undefined;
   const detail = text.match(/error\.error="((?:[^"\\]|\\.)*)"/)?.[1] ?? text.trim();
   return { kind, message: redactSecrets(detail.slice(0, 500)) };
@@ -352,6 +354,11 @@ export function createOpenCodeRunner({
     if (sessionID && parsed.sessionID && parsed.sessionID !== sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation session mismatch." };
     if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
     if (quotaError) return { ...metrics, status: "failed", quota: true, limitKind: quotaError.kind, error: `OpenCode quota or rate limit: ${quotaError.message}` };
+    // The model finished its answer (last step ended with "stop") but the process did not exit in time:
+    // keep the answer instead of discarding a completed analysis.
+    if (result.timedOut && !result.spawnError && !result.overflowed && parsed.text && parsed.finalStop) {
+      return { ...metrics, text: parsed.text, warning: "OpenCode timed out after its final answer; the answer is kept." };
+    }
     if (result.spawnError || result.timedOut || result.overflowed) return { ...metrics, ...describeProcessFailure(result) };
     if (result.exitCode !== 0 || parsed.error || result.stoppedReason) return { ...metrics, ...describeProcessFailure(result, { ndjsonError: parsed.detail ?? parsed.error ?? result.stoppedReason }) };
     if (sessionID && !parsed.sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation did not report a session ID." };
@@ -554,13 +561,18 @@ export function resolveRequestedModels({ model, models } = {}, freeModels) {
   return { auto: false, models: requested.map((id) => byId.get(id)) };
 }
 
-/** Per-attempt timeout: up to the attempt cap, leaving a reserve for later attempts. A single attempt may use the whole budget. */
+/**
+ * Per-attempt timeout, leaving a reserve for later attempts. A single attempt may use the whole budget.
+ * The cap scales with the budget (half of what remains, at least `attemptCapMs`): a fixed 120 s cap split
+ * a 420 s multi-file review into four 2-minute tries that all timed out (2026-11-17).
+ */
 export function allocateAttemptTimeoutMs({ remainingMs, attemptsLeft, attemptCapMs = DEFAULT_ATTEMPT_TIMEOUT_MS, totalAttempts = attemptsLeft }) {
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) return 0;
   if (totalAttempts <= 1) return Math.max(1, Math.floor(remainingMs));
   const reserve = Math.max(0, attemptsLeft - 1) * MIN_ATTEMPT_RESERVE_MS;
   const available = remainingMs - reserve > 0 ? remainingMs - reserve : remainingMs / Math.max(1, attemptsLeft);
-  return Math.max(1, Math.floor(Math.min(attemptCapMs, available)));
+  const cap = Math.max(attemptCapMs, remainingMs / 2);
+  return Math.max(1, Math.floor(Math.min(cap, available)));
 }
 
 export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runner, models, guard, codeMap = true, signal, deadline: outerDeadline, nowImpl = Date.now, attemptCapMs = DEFAULT_ATTEMPT_TIMEOUT_MS }) {

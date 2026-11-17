@@ -44,7 +44,10 @@ export function createGuard(options = {}) {
       const exit = event.metadata?.exit ?? event.metadata?.exitCode;
       const bashFailure = tool === "bash" && (event.metadata?.timeout === true || (typeof exit === "number" && exit !== 0) || /Command exited with code [1-9]\d*\b/.test(event.output ?? ""));
       const failed = event.status === "error" || bashFailure;
-      const signature = `${tool}:${target}`;
+      // A call to a tool the model does not have fails the same way whatever its target, so the
+      // target must not hide the loop (2026-11-17: 17 'unavailable tool' errors, all different commands).
+      const unavailable = failed && /unavailable tool|tool .{0,40}not available|not an available tool/i.test(String(event.error ?? event.output ?? ""));
+      const signature = unavailable ? `${tool}:unavailable` : `${tool}:${target}`;
       window.push({ signature, failed }); if (window.length > limits.window) window.shift();
       if (failed) { errors.push(redactSecrets(String(event.error ?? event.output ?? "Tool failed")).slice(-300)); if (errors.length > 3) errors.shift(); }
       else if (/write|edit|patch/.test(tool)) paths.forEach(p => files.add(redactSecrets(p)));

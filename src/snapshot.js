@@ -272,13 +272,16 @@ export async function headAndIndexIdentity(checkoutRoot, signal) {
     const head = (await git(root, ["rev-parse", "HEAD"], signal)).toString("utf8").trim();
     const index = (await git(root, ["rev-parse", "--git-path", "index"], signal)).toString("utf8").trim();
     try {
-        return { head, indexHash: hash(await readFile(path.resolve(root, index))) };
+        await readFile(path.resolve(root, index));
     }
     catch (err) {
         if (missing(err))
             return { head, indexHash: null };
         throw err;
     }
+    // Hash the staged entries, not the raw index bytes: `git status`, editors and Git tools rewrite the
+    // index's stat cache without changing what is staged, which used to refuse restores as "index changed".
+    return { head, indexHash: hash(await git(root, ["ls-files", "--stage", "-z"], signal)) };
 }
 
 export async function resolveCheckoutRoot(directory, signal) {
