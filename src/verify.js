@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { access } from "node:fs/promises";
 import path from "node:path";
 import { defaultKillTree } from "./process-utils.js";
+import { confirmTreeDead } from "./proctree.js";
+import { ChildProcess } from "node:child_process";
 import { redactSecrets } from "./safety.js";
 export class VerificationError extends Error {
     kind;
@@ -70,12 +72,17 @@ export async function runVerification(spec, cwd, signal, { spawnImpl = spawn, re
             killedForOutput: false, durationMs: performance.now() - started, stdoutTail: "", stderrTail: "" };
     return new Promise((resolve, reject) => {
         let child;
+        const rootStartedMs = Date.now();
         try { child = spawnImpl(executable.command, executable.args, {
             cwd: path.resolve(cwd), shell: false, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"]
         }); } catch { reject(new VerificationError("verification_launch_failed", "Could not launch verification executable.")); return; }
         const stdout = [], stderr = [];
         let bytes = 0, timedOut = false, killedForOutput = false, cancelled = false, done = false;
-        let killDeadline;
+        let killDeadline, confirm, exitedAt;
+        // A real verify process tree must be confirmed dead before the result returns: a restore follows.
+        const realChild = child instanceof ChildProcess && Number.isInteger(child.pid) && child.pid > 0;
+        const rootAlive = () => exitedAt === undefined && child.exitCode === null && child.signalCode === null;
+        child.once("exit", () => { exitedAt = Date.now(); });
         const stop = () => {
             if (done || killDeadline)
                 return;
@@ -86,7 +93,10 @@ export async function runVerification(spec, cwd, signal, { spawnImpl = spawn, re
                 child.stderr.destroy();
                 finish(null, "SIGKILL");
             }, 5000);
-            try { if (child.pid) killImpl(child.pid); } catch { /* bounded grace fallback */ }
+            // After exit the root PID may already belong to another process: never kill it by PID again.
+            try { if (child.pid && (!realChild || rootAlive())) killImpl(child.pid); } catch { /* bounded grace fallback */ }
+            if (realChild) confirm = confirmTreeDead(child.pid, { killRoot: () => killImpl(child.pid), isRootAlive: rootAlive,
+                rootStartedMs, rootExitedMs: () => exitedAt }).catch(() => ({ confirmed: false, alive: [child.pid], unverified: true }));
         };
         const timer = setTimeoutImpl(() => { timedOut = true; stop(); }, timeout * 1000);
         const abort = () => { cancelled = true; stop(); };
@@ -99,9 +109,12 @@ export async function runVerification(spec, cwd, signal, { spawnImpl = spawn, re
                 return;
             done = true;
             cleanup();
-            resolve({ passed: exitCode === 0 && !timedOut && !killedForOutput && !cancelled && !exitSignal,
+            const settle = (kill) => resolve({ passed: exitCode === 0 && !timedOut && !killedForOutput && !cancelled && !exitSignal,
                 exitCode, signal: exitSignal ?? (cancelled ? "SIGKILL" : null), timedOut, killedForOutput,
-                durationMs: performance.now() - started, stdoutTail: tail(stdout), stderrTail: tail(stderr) });
+                durationMs: performance.now() - started, stdoutTail: tail(stdout), stderrTail: tail(stderr),
+                ...(kill && !kill.confirmed ? { killConfirmed: false, stillAlive: kill.alive, ...(kill.unverified ? { killUnverified: true } : {}) } : {}) });
+            if (confirm) confirm.then(settle);
+            else settle();
         };
         const collect = (chunk, chunks) => {
             if (done || killedForOutput)
@@ -122,7 +135,9 @@ export async function runVerification(spec, cwd, signal, { spawnImpl = spawn, re
                 return;
             done = true;
             cleanup();
-            reject(new VerificationError("verification_launch_failed", "Could not launch verification executable."));
+            const fail = () => reject(new VerificationError("verification_launch_failed", "Could not launch verification executable."));
+            if (confirm) confirm.then(fail);
+            else fail();
         });
         child.once("close", finish);
     });

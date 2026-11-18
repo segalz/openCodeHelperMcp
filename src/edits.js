@@ -103,6 +103,13 @@ export async function runEdits(rawInput, {
   const verification = { required: !("none" in input.verify), passed: null, command: "none" in input.verify ? null : input.verify,
     ...("none" in input.verify ? { reason: input.verify.reason } : {}), attempts: [], fixRuns: 0, restored: false, kept: false };
   const result = { status: "failed", model: input.model, codeMapSource: "none", verification, usage, evidence: {} };
+  // A stopped run or verify whose processes were not confirmed dead: the restore may be overwritten later.
+  const warnIfStillRunning = (outcome) => {
+    if (outcome?.killConfirmed !== false) return;
+    const warning = "A process from the stopped run may still be running; files may change after the restore.";
+    result.warnings ??= [];
+    if (!result.warnings.includes(warning)) result.warnings.push(warning);
+  };
   let root, release, snapshot, identity, identityRefused = false, completed = false, sessionID;
   const check = () => {
     if (signal?.aborted) throw failure("cancelled", "Edit lifecycle cancelled.");
@@ -165,6 +172,7 @@ export async function runEdits(rawInput, {
       if (response?.usage) for (const key of Object.keys(usage)) usage[key] += Number.isFinite(response.usage[key]) ? response.usage[key] : 0;
       if (response?.guard?.kind) result.guard = response.guard;
       if (response?.limitKind) result.limitKind = response.limitKind;
+      warnIfStillRunning(response);
       const returnedSession = response?.sessionID;
       await unchanged(false); check();
       if (sessionID && returnedSession !== sessionID && (returnedSession || !response?.error)) throw failure("session_mismatch", "OpenCode repair did not continue the expected session.");
@@ -184,6 +192,7 @@ export async function runEdits(rawInput, {
         if (!(error instanceof VerificationError)) throw error;
         attempt = { passed: false, exitCode: null, signal: null, timedOut: false, killedForOutput: false, durationMs: 0, stdoutTail: "", stderrTail: redactSecrets(error.message), error: error.kind };
       }
+      warnIfStillRunning(attempt);
       attempt = { ...attempt, run: run + 1, stdoutTail: redactSecrets(attempt.stdoutTail ?? ""), stderrTail: redactSecrets(attempt.stderrTail ?? "") };
       verification.attempts.push(attempt); verification.passed = attempt.passed;
       await unchanged(false); check();

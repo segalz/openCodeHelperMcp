@@ -1,4 +1,4 @@
-import { spawn as defaultSpawn } from "node:child_process";
+import { ChildProcess, spawn as defaultSpawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { realpath as defaultRealpath } from "node:fs/promises";
 import path from "node:path";
@@ -12,6 +12,7 @@ import { permissionEnvironment } from "./permissions.js";
 import { buildCodeMap } from "./codemap.js";
 import { WORKING_RULES, buildEnvironmentLine } from "./rules.js";
 import { windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT } from "./process-utils.js";
+import { confirmTreeDead } from "./proctree.js";
 
 // ---------------------------------------------------------------------------
 // Limits and defaults
@@ -178,7 +179,9 @@ export function runBoundedProcess({
   return new Promise((resolve) => {
     if (signal?.aborted) { resolve({ exitCode: null, stdout: "", stderr: "", stoppedReason: "cancelled", elapsedMs: 0 }); return; }
     let child;
+    let rootStartedMs = Date.now();
     try {
+      rootStartedMs = Date.now();
       child = spawnImpl(executable, args, { cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", env });
     } catch (error) {
       resolve({ exitCode: null, stdout: "", stderr: "", timedOut: false, overflowed: false, spawnError: error?.code ?? error?.message ?? "spawn failed", elapsedMs: nowImpl() - started });
@@ -187,22 +190,55 @@ export function runBoundedProcess({
     let stdout = ""; let stderr = ""; let settled = false; let timedOut = false; let exitCode = null;
     let stdoutBytes = 0; let stderrBytes = 0; let overflowed = false; let spawnError = null;
     let timeoutTimer; let graceTimer; let stoppedReason;
+    // A real child's tree must be confirmed dead before a stopped run resolves: the edit flow restores the
+    // snapshot right after, and a living child could still write. Fake spawns (tests) keep the grace timer.
+    const realChild = child instanceof ChildProcess && Number.isInteger(child.pid) && child.pid > 0;
+    let killResult; let exitedAt; let reaping = false;
+    const rootAlive = () => exitedAt === undefined && child.exitCode === null && child.signalCode === null;
     const finish = () => {
       if (settled) return;
+      if ((stoppedReason || reaping) && realChild && !killResult) return;
       settled = true;
       clearTimeoutImpl(timeoutTimer);
       clearTimeoutImpl(graceTimer);
       signal?.removeEventListener("abort", abort);
-      if (stoppedReason) {
+      if (stoppedReason || reaping) {
         child.stdout.destroy?.(); child.stderr.destroy?.(); child.unref?.();
       }
-      resolve({ exitCode, stdout, stderr, timedOut, overflowed, spawnError, stoppedReason, elapsedMs: nowImpl() - started });
+      resolve({
+        exitCode, stdout, stderr, timedOut, overflowed, spawnError, stoppedReason,
+        ...(killResult && !killResult.confirmed
+          ? { killConfirmed: false, stillAlive: killResult.alive, ...(killResult.unverified ? { killUnverified: true } : {}) } : {}),
+        elapsedMs: nowImpl() - started,
+      });
     };
     const stop = reason => {
       if (settled || stoppedReason) return;
       stoppedReason = reason;
-      graceTimer ??= setTimeoutImpl(finish, graceMs);
-      try { terminate(child); } catch { /* grace deadline still settles */ }
+      // After exit the root PID may already belong to another process: never kill it by PID again.
+      if (!realChild || rootAlive()) { try { terminate(child); } catch { /* retried below, or the grace deadline settles */ } }
+      if (realChild && !reaping) {
+        confirmTreeDead(child.pid, {
+          killRoot: () => terminate(child), isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt,
+        }).then(result => result, () => ({ confirmed: false, alive: [child.pid], unverified: true }))
+          .then((result) => { killResult = result; finish(); });
+      } else if (!realChild) graceTimer ??= setTimeoutImpl(finish, graceMs);
+    };
+    // The root exited but its pipes stayed open, so descendants still run. On Windows nothing else stops them
+    // and the edit flow may restore next: reap them before resolving.
+    const afterExitGrace = () => {
+      if (settled || killResult) return;
+      if (realChild && process.platform !== "win32" && !stoppedReason) {
+        // The process group outlives its leader while members hold the pipes; stop them as Cline does.
+        try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already gone */ }
+      }
+      if (!realChild || process.platform !== "win32" || stoppedReason) { finish(); return; }
+      // The run already ended by itself: a deadline passing during the reap must not turn it into a timeout.
+      clearTimeoutImpl(timeoutTimer);
+      reaping = true;
+      confirmTreeDead(child.pid, { killRoot: () => {}, isRootAlive: () => false, rootStartedMs, rootExitedMs: () => exitedAt })
+        .then(result => result, () => ({ confirmed: false, alive: [child.pid], unverified: true }))
+        .then((result) => { killResult = result; finish(); });
     };
     const abort = () => stop("cancelled");
     const failForOverflow = () => {
@@ -230,7 +266,7 @@ export function runBoundedProcess({
       try { const reason = onStderr?.(chunk); if (reason) stop(reason); } catch { stop("stream_error"); }
     });
     child.on("error", (error) => { spawnError = error?.code ?? error?.message ?? "spawn failed"; finish(); });
-    child.on("exit", (code) => { exitCode = code; graceTimer ??= setTimeoutImpl(finish, graceMs); });
+    child.on("exit", (code) => { exitCode = code; exitedAt = Date.now(); graceTimer ??= setTimeoutImpl(afterExitGrace, graceMs); });
     child.on("close", (code) => { exitCode = code; finish(); });
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
@@ -351,7 +387,11 @@ export function createOpenCodeRunner({
     });
     quotaError ??= providerLimitError(stderrLine);
     const parsed = parser.end(), elapsedMs = nowImpl() - started;
-    const metrics = { elapsedMs, codeMapSource, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported, guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)) };
+    const metrics = {
+      elapsedMs, codeMapSource, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported,
+      guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)),
+      ...(result.killConfirmed === false ? { killConfirmed: false, stillAlive: result.stillAlive, ...(result.killUnverified ? { killUnverified: true } : {}) } : {}),
+    };
     if (sessionID && parsed.sessionID && parsed.sessionID !== sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation session mismatch." };
     if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
     if (quotaError) return { ...metrics, status: "failed", quota: true, limitKind: quotaError.kind, error: `OpenCode quota or rate limit: ${quotaError.message}` };
