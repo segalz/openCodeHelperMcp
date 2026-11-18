@@ -186,7 +186,7 @@ test("MCP edits return structured verification and validate explicit model witho
   assert.equal(JSON.parse(refused.content[0].text).codeMapSource, "none");
 });
 
-test("structural map rebuilds at the resolved checkout root for initial edits and repairs", async t => {
+test("structural map rebuilds at the checkout root for initial edits and repairs", async t => {
   const f = await repository(t), cli = path.join(f.base, "map cli.mjs"), launches = [], prompts = [];
   await mkdir(path.join(f.root, "subdir"));
   await writeFile(cli, `import { readFileSync } from 'node:fs'; import path from 'node:path';
@@ -206,7 +206,8 @@ test("structural map rebuilds at the resolved checkout root for initial edits an
       child.stdout.emit("data", JSON.stringify({ type: "text", sessionID: "ses_fixture", text: "changed" }) + "\n"); child.emit("close", 0);
     }); return child;
   } });
-  const out = await runEdits({ ...input(path.join(f.root, "subdir")), codeMap: true }, { ...f.options, runner,
+  // Plan S5: a subfolder now runs (and maps) in that subfolder; the checkout-root case keeps this coverage.
+  const out = await runEdits({ ...input(f.root), codeMap: true }, { ...f.options, runner,
     verifyImpl: async () => ++checks === 1 ? failedCheck() : passedCheck() });
   assert.equal(out.status, "done"); assert.equal(out.codeMapSource, "codeindex"); assert.equal(launches.length, 2);
   for (const launch of launches) {

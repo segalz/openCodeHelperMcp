@@ -1,3 +1,5 @@
+import path from "node:path";
+
 // OpenCode 1.19.x permission names, not legacy tool-toggle names.
 const deniedPaths = ["**/.*", "**/.*/**", ".*", ".*/**", ...["node_modules", "dist", "build", "coverage", "out", "vendor"].flatMap(p => [`${p}/**`, `**/${p}/**`]), "**/id_rsa*", "**/credentials*", "**/secrets*", "**/auth.json", "**/*.pem", "**/*.key", "id_rsa*", "credentials*", "secrets*", "auth.json", "*.pem", "*.key"];
 const reads = Object.freeze({ "*": "allow", ...Object.fromEntries(deniedPaths.map(p => [p, "deny"])) });
@@ -19,17 +21,26 @@ export function validatePermissionProfile(profile) {
   return profile;
 }
 
-export function permissionEnvironment(env, mode = "analysis", ignoredPaths = [], directory) {
+/**
+ * `ignoredPaths` are relative to `directory` (the checkout root). When OpenCode works in a subfolder `workDir`,
+ * the paths inside it are also denied relative to that folder, so a relative tool path cannot slip past (plan S5).
+ */
+export function permissionEnvironment(env, mode = "analysis", ignoredPaths = [], directory, workDir) {
   let profile = validatePermissionProfile(PERMISSION_PROFILES[mode]);
   if (ignoredPaths.length) {
     if (ignoredPaths.length > 20000) throw new Error("Ignored-path permission list is too large.");
     const denied = {};
+    // workDir relative to the checkout root as a "packages/app/" prefix; empty when they are the same folder.
+    const within = directory && workDir ? path.relative(directory, workDir).replaceAll("\\", "/") : "";
+    const subfolder = within && !within.startsWith("..") && !path.isAbsolute(within) ? within + "/" : "";
     for (const raw of ignoredPaths) {
       const file = raw.replaceAll("\\", "/");
       if (/[\x00-\x1f*?\[\]{}]/.test(file) || file.startsWith("/") || file.split("/").includes("..")) throw new Error("Unsupported ignored permission path.");
-      for (const prefix of ["", ...(directory ? [directory.replaceAll("\\", "/").replace(/\/$/, "") + "/"] : [])]) {
-        denied[prefix + file.replace(/\/$/, "")] = "deny";
-        if (file.endsWith("/")) denied[prefix + file + "*"] = "deny";
+      const keys = [file, ...(directory ? [directory.replaceAll("\\", "/").replace(/\/$/, "") + "/" + file] : [])];
+      if (subfolder && file.startsWith(subfolder) && file.length > subfolder.length) keys.push(file.slice(subfolder.length));
+      for (const key of keys) {
+        denied[key.replace(/\/$/, "")] = "deny";
+        if (key.endsWith("/")) denied[key + "*"] = "deny";
       }
     }
     profile = validatePermissionProfile({ ...profile, read: { ...profile.read, ...denied }, ...(mode === "edits" ? { edit: { ...profile.edit, ...denied } } : {}) });

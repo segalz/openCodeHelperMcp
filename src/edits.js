@@ -1,5 +1,6 @@
 import { z } from "zod";
 import path from "node:path";
+import { realpath } from "node:fs/promises";
 import { acquire } from "./checkoutlock.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, resolveCheckoutRoot, ignoredCheckoutPaths } from "./snapshot.js";
 import { resolveVerificationCommand, runVerification, VerificationError } from "./verify.js";
@@ -89,6 +90,18 @@ export function buildFixPrompt(objective, spec, attempt, root) {
   return render();
 }
 
+/**
+ * The requested folder spelled under `root`, or undefined when it is outside. Both sides are canonicalised first
+ * (symlinks, junctions, macOS /tmp), as the checkout root itself comes from realpath. Mirrors ClineMcp finalcheck.ts.
+ */
+export async function subfolderOf(root, directory) {
+  const [realRoot, realDirectory] = await Promise.all([realpath(root).catch(() => path.resolve(root)),
+    realpath(directory).catch(() => path.resolve(directory))]);
+  const inside = path.relative(realRoot, realDirectory);
+  if (inside.startsWith("..") || path.isAbsolute(inside)) return undefined;
+  return inside ? path.join(root, inside) : root;
+}
+
 /** A single synchronous transaction over working-tree bytes, never Git history. */
 export async function runEdits(rawInput, {
   runner, verifyImpl = runVerification, resolveRoot = resolveCheckoutRoot,
@@ -115,7 +128,9 @@ export async function runEdits(rawInput, {
     result.warnings ??= [];
     if (!result.warnings.includes(warning)) result.warnings.push(warning);
   };
-  let root, release, snapshot, identity, identityRefused = false, completed = false, sessionID;
+  // root: the checkout (lock, identity, snapshot). workDir: the requested folder, maybe a monorepo package, where
+  // OpenCode and the final check run.
+  let root, workDir, release, snapshot, identity, identityRefused = false, completed = false, sessionID;
   const check = () => {
     if (signal?.aborted) throw failure("cancelled", "Edit lifecycle cancelled.");
     if (controller.signal.aborted || nowImpl() >= deadline) throw failure("budget_exceeded", "Overall edit deadline exhausted.");
@@ -147,9 +162,11 @@ export async function runEdits(rawInput, {
   };
   try {
     check(); root = await resolveRoot(input.directory, controller.signal); check();
+    workDir = await subfolderOf(root, input.directory);
+    if (workDir === undefined) throw failure("edits_refused", "The directory is not inside its Git checkout.");
     // A check that cannot even start makes the run pointless: refuse before the lock, the snapshot and any launch.
     if (verification.required && resolveVerifyImpl) {
-      try { await resolveVerifyImpl(input.verify.command, input.verify.args ?? [], root); }
+      try { await resolveVerifyImpl(input.verify.command, input.verify.args ?? [], workDir); }
       catch (error) {
         if (error instanceof VerificationError) throw failure(error.kind, error.message);
         throw error;
@@ -178,7 +195,7 @@ export async function runEdits(rawInput, {
       if (run && runMs < MIN_FIX_RUN_MS) throw failure("budget_exceeded", "Not enough budget left for another repair run and its check.");
       if (run) verification.fixRuns++;
       let response;
-      try { response = await runner({ directory: root, prompt, model: input.model, variant, mode: "edits", codeMap: input.codeMap ?? true,
+      try { response = await runner({ directory: workDir, checkoutRoot: root, prompt, model: input.model, variant, mode: "edits", codeMap: input.codeMap ?? true,
         guardState, sessionID, ignoredPaths, signal: controller.signal,
         timeoutMs: Math.max(1, runMs >= MIN_FIX_RUN_MS ? runMs : deadline - nowImpl()) }); }
       catch (error) { response = { error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard }; }
@@ -201,7 +218,7 @@ export async function runEdits(rawInput, {
       }
       if (!verification.required) break;
       let attempt;
-      try { attempt = await verifyImpl(input.verify, root, controller.signal); }
+      try { attempt = await verifyImpl(input.verify, workDir, controller.signal); }
       catch (error) {
         if (!(error instanceof VerificationError)) throw error;
         attempt = { passed: false, exitCode: null, signal: null, timedOut: false, killedForOutput: false, durationMs: 0, stdoutTail: "", stderrTail: redactSecrets(error.message), error: error.kind };
@@ -212,7 +229,7 @@ export async function runEdits(rawInput, {
       await unchanged(false); check();
       if (attempt.passed) break;
       if (attempt.error || run >= (input.maxFixRuns ?? 2)) throw failure("verify_failed", "Final verification failed; no further automatic repairs are allowed.");
-      prompt = buildFixPrompt(input.prompt, input.verify, attempt, root);
+      prompt = buildFixPrompt(input.prompt, input.verify, attempt, workDir);
     }
     await unchanged(false); check(); completed = true;
     await discard(true); result.status = "done";

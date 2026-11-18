@@ -337,14 +337,14 @@ export function createOpenCodeRunner({
   codeMapBuilder = buildCodeMap,
 } = {}) {
   const terminate = killProcessTreeImpl ?? ((child) => defaultKillProcessTree(child, { platform, spawnImpl }));
-  return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false, codeMap = true, guard, guardState, mode = "analysis", sessionID, signal, ignoredPaths = [] }) => {
+  return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false, codeMap = true, guard, guardState, mode = "analysis", sessionID, signal, ignoredPaths = [], checkoutRoot }) => {
     const started = nowImpl();
     const executable = resolveOpenCodeExecutable({ env, platform });
     let effectiveEnv, detector;
     try {
       if (!["analysis", "edits"].includes(mode)) throw new Error("Unknown runner mode.");
       if (sessionID !== undefined && !/^[A-Za-z0-9_-]{1,200}$/.test(sessionID)) throw new Error("Invalid continuation session ID.");
-      effectiveEnv = permissionEnvironment(childEnv(env, execPath), mode, ignoredPaths, directory); detector = guardState ?? createGuard(guard);
+      effectiveEnv = permissionEnvironment(childEnv(env, execPath), mode, ignoredPaths, checkoutRoot ?? directory, directory); detector = guardState ?? createGuard(guard);
     }
     catch (error) { return { status: "failed", localFailure: true, error: redactSecrets(error.message), elapsedMs: nowImpl() - started }; }
     const effectiveTimeoutMs = Math.min(MAX_BUDGET_MS, validTimeout(requestTimeoutMs, validTimeout(timeoutMs, DEFAULT_ATTEMPT_TIMEOUT_MS)));
