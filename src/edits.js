@@ -1,7 +1,7 @@
 import { z } from "zod";
 import path from "node:path";
 import { acquire } from "./checkoutlock.js";
-import { takeSnapshot, restoreSnapshot, discardSnapshot, headAndIndexIdentity, resolveCheckoutRoot, ignoredCheckoutPaths } from "./snapshot.js";
+import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, resolveCheckoutRoot, ignoredCheckoutPaths } from "./snapshot.js";
 import { runVerification, VerificationError } from "./verify.js";
 import { createGuard, guardSchema } from "./guard.js";
 import { emptyUsage } from "./events.js";
@@ -46,7 +46,7 @@ export function buildFixPrompt(objective, spec, attempt, root) {
 export async function runEdits(rawInput, {
   runner, verifyImpl = runVerification, resolveRoot = resolveCheckoutRoot,
   takeSnapshotImpl = takeSnapshot, restoreSnapshotImpl = restoreSnapshot,
-  discardSnapshotImpl = discardSnapshot, identityImpl = headAndIndexIdentity,
+  discardSnapshotImpl = discardSnapshot, identityImpl = headAndIndexIdentity, createdFilesImpl = createdFiles,
   ignoredPathsImpl = ignoredCheckoutPaths, lockDirectory, snapshotOptions,
   signal, deadline: outerDeadline, nowImpl = Date.now, variant,
 } = {}) {
@@ -75,7 +75,17 @@ export async function runEdits(rawInput, {
     identityRefused = true;
     throw failure("identity_changed", "HEAD/index changed or could not be inspected; restoration refused and recovery snapshot retained.");
   };
-  const discard = async () => {
+  const discard = async (reportCreated = false) => {
+    // Report every new file the kept edit left behind (a stray debug script, too); report-only.
+    if (reportCreated && Array.isArray(snapshot?.manifest)) {
+      try {
+        const created = await createdFilesImpl(snapshot);
+        if (created.length) {
+          result.createdFiles = created;
+          (result.warnings ??= []).push(`The edit created ${created.length} new file(s): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
+        }
+      } catch { /* report-only */ }
+    }
     try { await discardSnapshotImpl(snapshot); snapshot = undefined; delete result.evidence.snapshotDirectory; }
     catch (error) { result.evidence.cleanupError = redactSecrets(String(error)); }
   };
@@ -133,13 +143,13 @@ export async function runEdits(rawInput, {
       prompt = buildFixPrompt(input.prompt, input.verify, attempt, root);
     }
     await unchanged(false); check(); completed = true;
-    await discard(); result.status = "done";
+    await discard(true); result.status = "done";
   } catch (error) {
     result.error = error?.kind ?? "edits_failed"; result.message = redactSecrets(error?.message ?? String(error));
     if (snapshot && !completed) {
       try {
         await unchanged(false);
-        if (input.keepOnFailure) { verification.kept = true; await discard(); }
+        if (input.keepOnFailure) { verification.kept = true; await discard(true); }
         else {
           const report = await restoreSnapshotImpl(snapshot); result.evidence.restore = report;
           if (report.failed.length) throw failure("restore_failed", "Restoration incomplete; recovery bytes retained.");

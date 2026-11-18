@@ -285,3 +285,12 @@ test("runner cancellation kills its child and preserves cancellation on a repair
   controller.abort(); const out = await pending;
   assert.deepEqual(kills, [456]); assert.match(out.error, /cancelled/);
 });
+
+test("a kept edit reports every new file it left behind (a stray debug script)", async t => {
+  const f = await repository(t);
+  const out = await runEdits(input(f.root), { ...f.options, runner: async () => {
+    await writeFile(path.join(f.root, "main.js"), "fixed"); await writeFile(path.join(f.root, "debug_test.py"), "print(1)\n"); return response(); } });
+  assert.equal(out.status, "done");
+  assert.deepEqual(out.createdFiles, ["debug_test.py"]);
+  assert.ok(out.warnings.some(w => w.includes("debug_test.py")));
+});

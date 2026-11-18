@@ -1,4 +1,5 @@
 // Ported from ClineMcp; preserve recovery/lock compatibility.
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -31,10 +32,46 @@ function pidIsGone(pid) {
     }
     return false;
 }
+/** Start time of a live process in ms, or undefined when it cannot be read (then nothing is reclaimed). */
+export function processStartMs(pid) {
+    try {
+        if (process.platform === "win32") {
+            const out = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+                `$p = Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().ToString('o')`],
+                { encoding: "utf8", windowsHide: true, timeout: 10_000 });
+            const ms = out.status === 0 ? Date.parse(out.stdout.trim()) : NaN;
+            return Number.isFinite(ms) ? ms : undefined;
+        }
+        if (process.platform === "linux") {
+            const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+            const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
+            const boot = Number(/^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"))?.[1]);
+            const hz = Number(spawnSync("getconf", ["CLK_TCK"], { encoding: "utf8" }).stdout.trim()) || 100;
+            return Number.isFinite(ticks) && Number.isFinite(boot) ? boot * 1000 + (ticks / hz) * 1000 : undefined;
+        }
+    }
+    catch { /* unknown */ }
+    return undefined;
+}
+/** Slack between the OS start time and the holder's own clock reading. */
+const START_TOLERANCE_MS = 5_000;
+/** A holder is dead when its PID is gone, or when that PID now belongs to a process started after the lock was
+ * written (PID reuse). An unreadable start time keeps the lock busy: a live lock is never reclaimed by age. */
+export function holderIsDead(holder, startMs = processStartMs) {
+    const pid = Number(holder?.pid);
+    if (pidIsGone(pid))
+        return true;
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid)
+        return false;
+    const written = typeof holder.time === "string" ? Date.parse(holder.time) : NaN;
+    if (!Number.isFinite(written))
+        return false;
+    const started = startMs(pid);
+    return started !== undefined && started > written + START_TOLERANCE_MS;
+}
 function deadHolder(file) {
     try {
-        const holder = JSON.parse(readFileSync(file, "utf8"));
-        return pidIsGone(holder.pid);
+        return holderIsDead(JSON.parse(readFileSync(file, "utf8")));
     }
     catch { /* An incomplete or unreadable lock is busy, never stale by age alone. */ }
     return false;
@@ -64,7 +101,7 @@ function claimReclamation(file, token, root) {
             if (name === own)
                 continue;
             const pid = /^(\d+)-[a-f0-9-]+\.json$/i.exec(name)?.[1];
-            if (!pid || !pidIsGone(Number(pid)))
+            if (!pid || !(pidIsGone(Number(pid)) || deadHolder(path.join(directory, name))))
                 throw new CheckoutBusyError(root);
             // The pid is encoded before creation, so even a crash before writing metadata is recoverable.
             try {

@@ -121,6 +121,16 @@ async function files(root, signal) {
     return [...new Set((await git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], signal))
             .toString("utf8").split("\0").filter(Boolean))].sort();
 }
+/** Ignored paths, with ignored folders collapsed to one "dir/" entry (cheap even with node_modules). */
+async function ignoredEntries(root, signal) {
+    return [...new Set((await git(root, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"], signal))
+            .toString("utf8").split("\0").filter(Boolean))].sort();
+}
+async function excludeFile(root, signal) {
+    const file = path.resolve(root, (await git(root, ["rev-parse", "--git-path", "info/exclude"], signal)).toString("utf8").trim());
+    try { return { path: file, content: (await readFile(file)).toString("base64") }; }
+    catch (err) { if (missing(err)) return { path: file, content: null }; throw err; }
+}
 async function checkout(root, signal) {
     const stat = await lstat(path.resolve(root));
     if (stat.isSymbolicLink())
@@ -183,7 +193,8 @@ export async function takeSnapshot(checkoutRoot, opts = {}) {
         content.push(bytes);
     }
     const directory = path.join(resolvedBase, randomUUID());
-    const handle = { checkoutRoot: root, directory, manifest: entries.map((entry, i) => ({ path: entry.path, size: content[i].length, sha256: hash(content[i]) })) };
+    const handle = { checkoutRoot: root, directory, manifest: entries.map((entry, i) => ({ path: entry.path, size: content[i].length, sha256: hash(content[i]) })),
+        ignoredEntries: await ignoredEntries(root, opts.signal), excludeFile: await excludeFile(root, opts.signal) };
     try {
         await mkdir(directory, { recursive: true, mode: 0o700 });
         for (let i = 0; i < content.length; i++)
@@ -196,29 +207,48 @@ export async function takeSnapshot(checkoutRoot, opts = {}) {
         throw err;
     }
 }
+/** Restore one baseline file in place; true when it had to be rewritten. */
+async function restoreEntry(root, handle, i) {
+    const entry = handle.manifest[i];
+    const bytes = await readFile(path.join(handle.directory, String(i)));
+    if (bytes.length !== entry.size || hash(bytes) !== entry.sha256)
+        throw new SnapshotError("snapshot_invalid", "Snapshot bytes failed integrity check.");
+    const stat = await safeFile(root, entry.path);
+    const absolute = relativePath(root, entry.path);
+    if (stat?.isFile() && hash(await readFile(absolute)) === entry.sha256)
+        return false;
+    if (stat?.isDirectory())
+        await rmdir(absolute); // Only an empty replacement directory is safe to remove.
+    else if (stat && !stat.isFile())
+        throw new SnapshotError("snapshot_unsupported", "Baseline path is no longer a regular file.");
+    await mkdir(path.dirname(absolute), { recursive: true });
+    // Replace instead of writing through a hard link to another (possibly ignored) path.
+    const temporary = path.join(path.dirname(absolute), `.cline-restore-${randomUUID()}`);
+    try {
+        await writeFile(temporary, bytes, { flag: "wx" });
+        await rename(temporary, absolute);
+    }
+    finally {
+        await rm(temporary, { force: true });
+    }
+    return true;
+}
+const isIgnoreFile = (file) => file === ".gitignore" || file.endsWith("/.gitignore");
 export async function restoreSnapshot(handle) {
     const root = await checkout(handle.checkoutRoot);
     const report = { restored: [], removed: [], failed: [] };
-    const current = await files(root);
     const baseline = new Set(handle.manifest.map(entry => entry.path));
-    // check-ignore respects tracked files. A newly ignored baseline path must not be overwritten.
-    const ignored = new Set(handle.manifest.length ? (await git(root, ["check-ignore", "-z", "--stdin"], undefined, handle.manifest.map(entry => entry.path).join("\0") + "\0", [0, 1])).toString("utf8").split("\0") : []);
     const prune = async (dir) => {
         while (dir !== root) {
-            try {
-                await rmdir(dir);
-            }
-            catch {
-                break;
-            } // Never recursively remove directories or ignored content.
+            try { await rmdir(dir); }
+            catch { break; } // Never recursively remove directories or ignored content.
             dir = path.dirname(dir);
         }
     };
-    for (const file of current.filter(file => !baseline.has(file))) {
+    const remove = async (file) => {
         try {
             const stat = await safeFile(root, file);
-            if (!stat)
-                continue;
+            if (!stat) return;
             if (!stat.isFile())
                 throw new SnapshotError("snapshot_unsupported", `Non-regular file refused: ${file}`);
             const absolute = relativePath(root, file);
@@ -226,43 +256,73 @@ export async function restoreSnapshot(handle) {
             report.removed.push(file);
             await prune(path.dirname(absolute));
         }
-        catch (err) {
-            report.failed.push({ path: file, error: err.message });
+        catch (err) { report.failed.push({ path: file, error: err.message }); }
+    };
+    // Ignore rules first: a rule the model added must not hide its new files from removal,
+    // and must not make a baseline file look "newly ignored" and stay changed.
+    const ignoreDone = new Set();
+    for (let i = 0; i < handle.manifest.length; i++) {
+        if (!isIgnoreFile(handle.manifest[i].path)) continue;
+        ignoreDone.add(i);
+        try { if (await restoreEntry(root, handle, i)) report.restored.push(handle.manifest[i].path); }
+        catch (err) { report.failed.push({ path: handle.manifest[i].path, error: err.message }); }
+    }
+    if (handle.ignoredEntries) {
+        // Remove .gitignore files the model created: visible ones, and self-ignoring ones found through
+        // ignored entries that did not exist at snapshot time. Repeat for nested ones, a bounded number of times.
+        const known = new Set(handle.ignoredEntries);
+        for (let round = 0; round < 5; round++) {
+            const candidates = new Set((await files(root)).filter(file => isIgnoreFile(file) && !baseline.has(file)));
+            for (const entry of await ignoredEntries(root)) {
+                if (known.has(entry)) continue;
+                const file = entry.endsWith("/") ? `${entry}.gitignore` : entry;
+                if (isIgnoreFile(file) && !baseline.has(file) && await statOrMissing(relativePath(root, file)).catch(() => undefined)) candidates.add(file);
+            }
+            if (!candidates.size) break;
+            const before = report.removed.length;
+            for (const file of candidates) await remove(file);
+            if (report.removed.length === before) break;
         }
     }
+    if (handle.excludeFile) {
+        const { path: file, content } = handle.excludeFile;
+        try {
+            const now = await readFile(file).then(b => b.toString("base64"), err => { if (missing(err)) return null; throw err; });
+            if (now !== content) {
+                if (content === null) await rm(file, { force: true });
+                else await writeFile(file, Buffer.from(content, "base64"));
+                report.restored.push("info/exclude");
+            }
+        }
+        catch (err) { report.failed.push({ path: "info/exclude", error: err.message }); }
+    }
+    const current = await files(root);
+    // check-ignore respects tracked files. A newly ignored baseline path must not be overwritten.
+    const ignored = new Set(handle.manifest.length ? (await git(root, ["check-ignore", "-z", "--stdin"], undefined, handle.manifest.map(entry => entry.path).join("\0") + "\0", [0, 1])).toString("utf8").split("\0") : []);
+    for (const file of current.filter(file => !baseline.has(file))) await remove(file);
     for (let i = 0; i < handle.manifest.length; i++) {
+        if (ignoreDone.has(i)) continue;
         const entry = handle.manifest[i];
         try {
             if (ignored.has(entry.path))
                 throw new SnapshotError("snapshot_unsupported", "Baseline path is now ignored; left untouched.");
-            const bytes = await readFile(path.join(handle.directory, String(i)));
-            if (bytes.length !== entry.size || hash(bytes) !== entry.sha256)
-                throw new SnapshotError("snapshot_invalid", "Snapshot bytes failed integrity check.");
-            const stat = await safeFile(root, entry.path);
-            const absolute = relativePath(root, entry.path);
-            if (stat?.isFile() && hash(await readFile(absolute)) === entry.sha256)
-                continue;
-            if (stat?.isDirectory())
-                await rmdir(absolute); // Only an empty replacement directory is safe to remove.
-            else if (stat && !stat.isFile())
-                throw new SnapshotError("snapshot_unsupported", "Baseline path is no longer a regular file.");
-            await mkdir(path.dirname(absolute), { recursive: true });
-            // Replace instead of writing through a hard link to another (possibly ignored) path.
-            const temporary = path.join(path.dirname(absolute), `.cline-restore-${randomUUID()}`);
-            try {
-                await writeFile(temporary, bytes, { flag: "wx" });
-                await rename(temporary, absolute);
-            }
-            finally {
-                await rm(temporary, { force: true });
-            }
-            report.restored.push(entry.path);
+            if (await restoreEntry(root, handle, i)) report.restored.push(entry.path);
         }
-        catch (err) {
-            report.failed.push({ path: entry.path, error: err.message });
-        }
+        catch (err) { report.failed.push({ path: entry.path, error: err.message }); }
     }
     return report;
+}
+/** Files that exist now but not in the baseline (ignored files excluded, so build caches do not show up). */
+export async function createdFiles(handle) {
+    const baseline = new Set(handle.manifest.map(entry => entry.path));
+    const root = await checkout(handle.checkoutRoot);
+    const created = [];
+    // A tracked file deleted before the run is listed by Git but absent: only files that exist now count.
+    for (const file of (await files(root)).filter(file => !baseline.has(file))) {
+        try { if (await statOrMissing(relativePath(root, file.endsWith("/") ? file.slice(0, -1) : file))) created.push(file); }
+        catch { created.push(file); }
+    }
+    return created;
 }
 export async function discardSnapshot(handle) {
     await rm(handle.directory, { recursive: true, force: true });
