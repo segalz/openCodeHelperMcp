@@ -2,14 +2,17 @@ import { z } from "zod";
 import path from "node:path";
 import { acquire } from "./checkoutlock.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, resolveCheckoutRoot, ignoredCheckoutPaths } from "./snapshot.js";
-import { runVerification, VerificationError } from "./verify.js";
+import { resolveVerificationCommand, runVerification, VerificationError } from "./verify.js";
 import { createGuard, guardSchema } from "./guard.js";
 import { emptyUsage } from "./events.js";
 import { redactSecrets } from "./safety.js";
 import { analysisInputSchema, DEFAULT_BUDGET_MS, resolveRequestedModels, variantFor } from "./core.js";
 
+const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
+  + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
+  + "node_modules/.bin shims (vitest, tsc, eslint) are resolved to their program.";
 export const verificationSchema = z.union([
-  z.object({ command: z.string().min(1).refine(s => s.trim().length > 0 && !s.includes("\0")),
+  z.object({ command: z.string().min(1).refine(s => s.trim().length > 0 && !s.includes("\0")).describe(VERIFY_COMMAND_HELP),
     args: z.array(z.string().refine(s => !s.includes("\0"))).optional(),
     timeoutSeconds: z.number().int().min(1).max(300).optional() }).strict(),
   z.object({ none: z.literal(true), reason: z.string().trim().min(10).max(500) }).strict(),
@@ -89,6 +92,8 @@ export function buildFixPrompt(objective, spec, attempt, root) {
 /** A single synchronous transaction over working-tree bytes, never Git history. */
 export async function runEdits(rawInput, {
   runner, verifyImpl = runVerification, resolveRoot = resolveCheckoutRoot,
+  // Up-front check that the verify command can start; skipped when only a custom verifyImpl is injected.
+  resolveVerifyImpl = verifyImpl === runVerification ? resolveVerificationCommand : undefined,
   takeSnapshotImpl = takeSnapshot, restoreSnapshotImpl = restoreSnapshot,
   discardSnapshotImpl = discardSnapshot, identityImpl = headAndIndexIdentity, createdFilesImpl = createdFiles,
   ignoredPathsImpl = ignoredCheckoutPaths, lockDirectory, snapshotOptions,
@@ -142,6 +147,15 @@ export async function runEdits(rawInput, {
   };
   try {
     check(); root = await resolveRoot(input.directory, controller.signal); check();
+    // A check that cannot even start makes the run pointless: refuse before the lock, the snapshot and any launch.
+    if (verification.required && resolveVerifyImpl) {
+      try { await resolveVerifyImpl(input.verify.command, input.verify.args ?? [], root); }
+      catch (error) {
+        if (error instanceof VerificationError) throw failure(error.kind, error.message);
+        throw error;
+      }
+      check();
+    }
     release = acquire(root, { lockDirectory });
     identity = await identityImpl(root, controller.signal); check();
     snapshot = await takeSnapshotImpl(root, { ...snapshotOptions, signal: controller.signal });

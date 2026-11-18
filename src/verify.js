@@ -1,6 +1,6 @@
 // Ported from ClineMcp; preserve recovery/lock compatibility.
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { defaultKillTree } from "./process-utils.js";
 import { confirmTreeDead } from "./proctree.js";
@@ -20,39 +20,103 @@ export async function resolveVerificationCommand(command, args = [], cwd = proce
     if (!command || command.includes("\0") || args.some(arg => typeof arg !== "string" || arg.includes("\0"))) {
         throw new VerificationError("verification_refused", "Verification requires a command and literal string arguments.");
     }
-    if (process.platform !== "win32")
-        return { command, args };
-    const npm = /^(npm|npx)(?:\.cmd)?$/i.exec(path.basename(command));
-    if (npm) {
-        const script = npm[1].toLowerCase() + "-cli.js";
-        const candidates = [path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", script),
-            ...(process.env.APPDATA ? [path.join(process.env.APPDATA, "npm", "node_modules", "npm", "bin", script)] : [])];
-        for (const candidate of candidates) {
-            try {
-                await access(candidate);
-                return { command: process.execPath, args: [candidate, ...args] };
-            }
-            catch { /* Try the next supported npm installation. */ }
-        }
-        throw new VerificationError("verification_refused", "Could not resolve the npm installation's CLI script.");
+  const hasDirectory = command.includes("/") || command.includes("\\");
+  const bare = !hasDirectory && !path.extname(command);
+  if (process.platform !== "win32") {
+    // POSIX spawns resolve through PATH; only check that the program exists so a missing one is refused up front.
+    const found = hasDirectory ? await exists(path.resolve(cwd, command))
+      : (await Promise.all(pathDirectories().map(dir => exists(path.join(dir, command))))).some(Boolean);
+    if (!found) throw new VerificationError("verification_launch_failed", "Verification executable was not found on PATH.");
+    return { command, args };
+  }
+  const npm = /^(npm|npx)(?:\.cmd)?$/i.exec(path.basename(command));
+  if (npm) {
+    const script = npm[1].toLowerCase() + "-cli.js";
+    const candidates = [path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", script),
+      ...(process.env.APPDATA ? [path.join(process.env.APPDATA, "npm", "node_modules", "npm", "bin", script)] : [])];
+    for (const candidate of candidates) {
+      if (await exists(candidate)) return { command: process.execPath, args: [candidate, ...args] };
     }
-    if (/\.(cmd|bat)$/i.test(command))
-        throw new VerificationError("verification_refused", "Windows batch commands require a shell and are refused.");
-    // Resolve plain executable names ourselves so PATHEXT cannot silently select a batch shim.
-    const hasDirectory = command.includes("/") || command.includes("\\");
-    const directories = hasDirectory ? [""] : (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
-    const extensions = path.extname(command) ? [""] : [".exe", ".com"];
-    for (const directory of directories)
-        for (const extension of extensions) {
-            const candidate = path.resolve(cwd, directory.replace(/^"|"$/g, ""), command + extension);
-            try {
-                await access(candidate);
-                return { command: candidate, args };
-            }
-            catch { /* Continue PATH search. */ }
-        }
-    throw new VerificationError("verification_launch_failed", "Verification executable was not found on PATH.");
+    throw new VerificationError("verification_refused", "Could not resolve the npm installation's CLI script.");
+  }
+  if (/\.(cmd|bat)$/i.test(command)) throw new VerificationError("verification_refused", "Windows batch commands require a shell and are refused.");
+  // A project-local tool (vitest, tsc, eslint...) wins, as with `npm run`: the nearest node_modules/.bin upward.
+  if (bare) {
+    const local = await nearestBinShim(command, cwd);
+    if (local) return resolveCmdShim(local, args, 0);
+  }
+  // Resolve names ourselves so PATHEXT cannot silently run a batch file. As on Windows, the first PATH folder
+  // that has the name wins; a global npm/corepack .cmd shim (pnpm, yarn) there is parsed, never run by cmd.exe.
+  for (const directory of hasDirectory ? [""] : pathDirectories()) {
+    for (const extension of path.extname(command) ? [""] : [".exe", ".com"]) {
+      const candidate = path.resolve(cwd, directory, command + extension);
+      if (await exists(candidate)) return { command: candidate, args };
+    }
+    const shim = bare ? path.resolve(cwd, directory, command + ".cmd") : undefined;
+    if (shim && await exists(shim)) return resolveCmdShim(shim, args, 0);
+  }
+  throw new VerificationError("verification_launch_failed", "Verification executable was not found on PATH.");
 }
+
+const exists = (file) => access(file).then(() => true, () => false);
+const pathDirectories = () => (process.env.PATH ?? "").split(path.delimiter).map(dir => dir.replace(/^"|"$/g, "")).filter(Boolean);
+
+async function findOnPath(fileName, first) {
+  for (const directory of [...(first ? [first] : []), ...pathDirectories()]) {
+    const candidate = path.resolve(directory, fileName);
+    if (await exists(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** The nearest `node_modules/.bin/<name>.cmd` from `cwd` upward, stopping at the repository root (`.git`). */
+async function nearestBinShim(name, cwd) {
+  for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
+    const candidate = path.join(dir, "node_modules", ".bin", name + ".cmd");
+    if (await exists(candidate)) return candidate;
+    if (path.dirname(dir) === dir || await exists(path.join(dir, ".git"))) return undefined;
+  }
+}
+
+// The launch line of an npm cmd-shim, in its current and older forms:
+//   endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\vitest\vitest.mjs" %*
+//   "%~dp0\node.exe"  "%~dp0\..\x\cli.js" %*      node  "%~dp0\..\x\cli.js" %*      "%dp0%\..\esbuild\esbuild.exe" %*
+const SHIM_PREFIX = String.raw`^(?:endLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & )?@?`;
+const SHIM_TARGET = String.raw`"%~?dp0%?[\\/]?([^"]+)"\s+%\*$`;
+const SHIM_NODE = [
+  new RegExp(SHIM_PREFIX + String.raw`"%_prog%"\s+` + SHIM_TARGET, "i"),
+  new RegExp(SHIM_PREFIX + String.raw`"%~?dp0%?[\\/]?(?:[^"]*[\\/])?node(?:\.exe)?"\s+` + SHIM_TARGET, "i"),
+  new RegExp(SHIM_PREFIX + String.raw`node(?:\.exe)?\s+` + SHIM_TARGET, "i")
+];
+const SHIM_EXE = new RegExp(SHIM_PREFIX + String.raw`"%~?dp0%?[\\/]?([^"]+\.exe)"\s+%\*$`, "i");
+
+/**
+ * Turn an npm cmd-shim (or a corepack `@corepack <tool> %*` shim) into a direct, shell-free launch: node plus
+ * the JS entry, or the wrapped .exe. Anything else is a real batch file and stays refused.
+ * Keep in step with ClineMcp `src/verify.ts`.
+ */
+async function resolveCmdShim(file, args, depth) {
+  const refuse = (why) => new VerificationError("verification_refused",
+    `${file} is a batch file that cannot run without a shell (${why}); give the program directly.`);
+  let text;
+  try { text = await readFile(file, "utf8"); } catch { throw refuse("unreadable"); }
+  const corepack = /^@?corepack\s+([A-Za-z0-9._-]+)\s+%\*$/i.exec(text.trim());
+  if (corepack) {
+    if (depth > 0) throw refuse("nested shim");
+    const inner = await findOnPath("corepack.cmd", path.dirname(file));
+    if (!inner) throw refuse("corepack not found");
+    return resolveCmdShim(inner, [corepack[1], ...args], depth + 1);
+  }
+  const line = text.split(/\r?\n/).map(l => l.trim()).filter(l => /%\*$/.test(l)).pop() ?? "";
+  const viaNode = SHIM_NODE.map(pattern => pattern.exec(line)).find(Boolean);
+  const exe = viaNode ? undefined : SHIM_EXE.exec(line);
+  const relative = viaNode?.[1] ?? exe?.[1];
+  if (!relative) throw refuse("not an npm shim");
+  const target = path.resolve(path.dirname(file), relative);
+  if (!await exists(target)) throw refuse(`its target ${target} does not exist`);
+  return viaNode ? { command: process.execPath, args: [target, ...args] } : { command: target, args };
+}
+
 function tail(chunks) {
     const redacted = Buffer.from(redactSecrets(Buffer.concat(chunks).toString("utf8")), "utf8");
     let start = Math.max(0, redacted.length - TAIL_LIMIT);
