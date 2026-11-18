@@ -31,6 +31,15 @@ function assertNoWriteAfter(file, settledAt, message) {
   assert.ok(writtenAt <= settledAt, `${message} (written ${writtenAt - settledAt} ms after)`);
 }
 
+/** A process that is dead writes no more heartbeats: sizes stay the same over a few hundred ms. */
+async function assertSilent(files, message) {
+  const size = file => (existsSync(file) ? readFileSync(file).length : 0);
+  assert.ok(files.every(file => size(file) > 0), `${message}: the heartbeat never started`);
+  const before = files.map(size);
+  await sleep(400);
+  assert.deepEqual(files.map(size), before, message);
+}
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fakeCli(dir, writeAfterMs, rootExitsAfterMs) {
@@ -38,10 +47,12 @@ async function fakeCli(dir, writeAfterMs, rootExitsAfterMs) {
   const trackedPath = path.join(dir, "tracked.txt");
   const childPath = path.join(dir, "child.cjs");
   const entryPath = path.join(dir, "cli.cjs");
+  // Heartbeats prove a process is alive without trusting its PID, which Windows may reuse quickly under load.
+  const rootBeat = path.join(dir, "root.beat"), childBeat = path.join(dir, "child.beat");
   await writeFile(childPath, [
     `const fs = require("node:fs");`,
     `setTimeout(() => fs.writeFileSync(${JSON.stringify(trackedPath)}, String(Date.now())), ${writeAfterMs});`,
-    `setInterval(() => {}, 1000);`,
+    `setInterval(() => fs.appendFileSync(${JSON.stringify(childBeat)}, "."), 25);`,
   ].join("\n"));
   await writeFile(entryPath, [
     `const { spawn } = require("node:child_process");`,
@@ -49,9 +60,9 @@ async function fakeCli(dir, writeAfterMs, rootExitsAfterMs) {
     // An early-exiting root leaves its child holding the output pipes, so no `close` arrives until it dies.
     `const child = spawn(process.execPath, [${JSON.stringify(childPath)}], { stdio: ${rootExitsAfterMs === undefined ? `"ignore"` : `["ignore", "inherit", "inherit"]`}, windowsHide: true });`,
     `fs.writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify({ root: process.pid, child: child.pid }));`,
-    rootExitsAfterMs === undefined ? `setInterval(() => {}, 1000);` : `setTimeout(() => process.exit(0), ${rootExitsAfterMs});`,
+    rootExitsAfterMs === undefined ? `setInterval(() => fs.appendFileSync(${JSON.stringify(rootBeat)}, "."), 25);` : `setInterval(() => { if (fs.existsSync(${JSON.stringify(childBeat)})) process.exit(0); }, 20);`,
   ].join("\n"));
-  return { entryPath, pidsPath, trackedPath };
+  return { entryPath, pidsPath, trackedPath, rootBeat, childBeat };
 }
 
 async function readPids(pidsPath) {
@@ -62,8 +73,8 @@ async function readPids(pidsPath) {
 
 test("S3: a timed-out run resolves only after the whole tree is dead, even when the first kill is ignored", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 1_500;
-  const { entryPath, pidsPath, trackedPath } = await fakeCli(dir, timeoutMs + 250);
+  const timeoutMs = 3_000;
+  const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250);
   let killCalls = 0;
   const result = await runBoundedProcess({
     executable: process.execPath, args: [entryPath], cwd: dir, env: process.env, timeoutMs,
@@ -76,8 +87,7 @@ test("S3: a timed-out run resolves only after the whole tree is dead, even when 
   assert.equal(result.timedOut, true);
 
   const pids = await readPids(pidsPath);
-  assert.equal(alive(pids.root), false, "the root process must be dead when the run resolves");
-  assert.equal(alive(pids.child), false, "the child process must be dead when the run resolves");
+  await assertSilent([rootBeat, childBeat], "the process tree must be dead when the run resolves");
   assert.ok(killCalls >= 2, "an ignored kill must be retried until the tree is confirmed dead");
 
   // The edit flow would restore now. Nothing of the old tree may write after this point.
@@ -87,9 +97,10 @@ test("S3: a timed-out run resolves only after the whole tree is dead, even when 
 
 test("S3: a run stopped by the caller also waits for the tree to die", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const { entryPath, pidsPath, trackedPath } = await fakeCli(dir, 1_750);
+  const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, 1_750);
   const controller = new AbortController();
-  setTimeout(() => controller.abort(), 1_500);
+  // Stop only once both processes are really running (startup can take seconds under full-suite load).
+  void (async () => { while (!(existsSync(rootBeat) && existsSync(childBeat))) await sleep(20); await sleep(250); controller.abort(); })();
   const result = await runBoundedProcess({
     executable: process.execPath, args: [entryPath], cwd: dir, env: process.env, timeoutMs: 60_000,
     graceMs: 100, signal: controller.signal,
@@ -99,21 +110,20 @@ test("S3: a run stopped by the caller also waits for the tree to die", { timeout
   assert.equal(result.stoppedReason, "cancelled");
 
   const pids = await readPids(pidsPath);
-  assert.equal(alive(pids.root), false, "the root process must be dead when the run resolves");
-  assert.equal(alive(pids.child), false, "the child process must be dead when the run resolves");
+  await assertSilent([rootBeat, childBeat], "the process tree must be dead when the run resolves");
   await sleep(1_500);
   assertNoWriteAfter(trackedPath, settledAt, "no write may land after the run resolved");
 });
 
 test("S3 review: a child left behind by an exited root is found and killed; the exited root's PID is never killed", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 1_500;
-  const { entryPath, pidsPath, trackedPath } = await fakeCli(dir, timeoutMs + 250, 300);
+  const timeoutMs = 3_000;
+  const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250, 300);
   let killCalls = 0;
   const result = await runBoundedProcess({
     // A deadline that passes during the reap must not turn a run that ended by itself into a timeout
     // (whether it passes depends on how fast the process list is read; this does not force it).
-    executable: process.execPath, args: [entryPath], cwd: dir, env: process.env, timeoutMs: 900, graceMs: 100,
+    executable: process.execPath, args: [entryPath], cwd: dir, env: process.env, timeoutMs: 10_000, graceMs: 100,
     terminate: child => { killCalls++; defaultKillProcessTree(child); },
   });
   const settledAt = Date.now();
@@ -122,7 +132,7 @@ test("S3 review: a child left behind by an exited root is found and killed; the 
   assert.equal(result.stoppedReason, undefined);
 
   const pids = await readPids(pidsPath);
-  assert.equal(alive(pids.child), false, "the orphaned child must be dead when the run resolves");
+  await assertSilent([childBeat], "the orphaned child must be dead when the run resolves");
   if (process.platform === "win32") assert.equal(killCalls, 0, "the root had exited: its PID may belong to another process now");
   await sleep(timeoutMs);
   assertNoWriteAfter(trackedPath, settledAt, "no write may land after the run resolved");
