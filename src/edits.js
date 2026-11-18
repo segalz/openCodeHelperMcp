@@ -27,6 +27,50 @@ export const editsInputSchema = Object.freeze({
 });
 const inputSchema = z.object(editsInputSchema).strict().refine(input => Buffer.byteLength(JSON.stringify(input), "utf8") <= 64 * 1024, "Edit input exceeds 64 KiB.");
 const failure = (kind, message) => Object.assign(new Error(message), { kind });
+const QUESTION_LINE_RE = /^[-–—\s]*[*_`\[(]*(?:QUESTION|Question)[*_`\])]*:\s*(.*)$/;
+
+function cleanQuestionRest(raw) {
+  let s = String(raw ?? "").trim().replace(/[.\s]+$/, "");
+  s = s.replace(/[*_`]/g, "").trim();
+  s = s.replace(/^[-–—\s]+/, "").trim();
+  while ((s.startsWith("(") && s.endsWith(")")) || (s.startsWith("[") && s.endsWith("]"))) {
+    s = s.slice(1, -1).trim().replace(/[.\s]+$/, "");
+    s = s.replace(/^[-–—\s]+/, "").trim();
+  }
+  return s;
+}
+
+function isNoQuestionRest(rest) {
+  if (!rest) return true;
+  return /^(?:not applicable|none|nothing|n\/a|na|nil|no)(?!\w)/i.test(rest);
+}
+
+function parseQuestionLine(line) {
+  const match = String(line ?? "").trim().match(QUESTION_LINE_RE);
+  if (!match) return null;
+  const rest = cleanQuestionRest(match[1]);
+  return { isQuestion: !isNoQuestionRest(rest), rest };
+}
+
+const isInputRequired = text => {
+  if (typeof text !== "string" || !text.trim()) return true;
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const lastLine = lines.at(-1) ?? "";
+  const parsed = parseQuestionLine(lastLine);
+  if (!parsed) return false;
+  return parsed.isQuestion;
+};
+
+function hasEarlierQuestion(text) {
+  if (typeof text !== "string") return false;
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length <= 1) return false;
+  for (const line of lines.slice(0, -1)) {
+    const parsed = parseQuestionLine(line);
+    if (parsed?.isQuestion) return true;
+  }
+  return false;
+}
 
 /** Time kept after a run for the final check: the check timeout plus this margin. */
 export const VERIFY_RESERVE_MARGIN_MS = 10_000;
@@ -126,8 +170,13 @@ export async function runEdits(rawInput, {
       if (sessionID && returnedSession !== sessionID && (returnedSession || !response?.error)) throw failure("session_mismatch", "OpenCode repair did not continue the expected session.");
       sessionID = returnedSession ?? sessionID; result.sessionID = sessionID;
       if (response?.error || response?.guard?.kind || guardState.snapshot().kind) throw failure(response?.guard?.kind ?? guardState.snapshot().kind ?? "opencode_error", response?.error ?? "Guard stopped edits.");
-      if (!response?.text || /^\s*(?:QUESTION|Question):/m.test(response.text)) throw failure("input_required", "OpenCode returned no final answer or requested caller input.");
+      if (isInputRequired(response?.text)) throw failure("input_required", "OpenCode returned no final answer or requested caller input.");
       result.text = response.text;
+      if (hasEarlierQuestion(response?.text)) {
+        const warning = "The model asked a question on an earlier line; caller should read text.";
+        result.warnings ??= [];
+        if (!result.warnings.includes(warning)) result.warnings.push(warning);
+      }
       if (!verification.required) break;
       let attempt;
       try { attempt = await verifyImpl(input.verify, root, controller.signal); }

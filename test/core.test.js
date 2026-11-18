@@ -436,3 +436,16 @@ test("Windows tree termination targets only the known child pid", () => {
   assert.deepEqual(invocations[0][1], ["/pid", "4242", "/t", "/f"]);
   assert.equal(invocations[0][2].shell, false);
 });
+
+// Review of S2 (Sonnet): analysis must not return narration from an earlier message as the answer.
+test("S2 review: analysis fails when the only text was followed by tool-only messages", async () => {
+  const ndjson = [
+    { type: "text", sessionID: "ses_1", part: { type: "text", messageID: "msg_1", id: "prt_1", text: "Let me look at X" } },
+    { type: "tool_use", sessionID: "ses_1", part: { type: "tool", messageID: "msg_2", id: "call_1", callID: "call_1", tool: "read", state: { status: "completed" } } },
+    { type: "step_finish", sessionID: "ses_1", part: { type: "step-finish", messageID: "msg_2", id: "stp_1", reason: "tool-calls", tokens: { input: 1, output: 1 } } },
+  ].map(e => JSON.stringify(e)).join("\n") + "\n";
+  const runner = createOpenCodeRunner({ spawnImpl: scriptedSpawn(() => ({ stdout: ndjson })), env: { OPENCODE_BIN: "C:\tools\opencode.exe" }, platform: "win32", graceMs: 1 });
+  const result = await runner({ directory, prompt: "inspect", model: "opencode/glm-5.3-flash-free" });
+  assert.equal(result.text, undefined, JSON.stringify(result));
+  assert.ok(result.error);
+});

@@ -8,7 +8,7 @@ export const emptyUsage = () => ({ inputTokens: 0, uncachedInputTokens: 0, cache
 export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxLineBytes = MAX_EVENT_LINE_BYTES } = {}) {
   const decoder = new StringDecoder("utf8"), tools = new Set(), steps = new Set();
   let pending = "", sessionID, messageID, legacyText, fatal, eventCount = 0, ended = false, lastStepReason;
-  const messages = new Set();
+  const messages = new Set(), messageOrder = new Map(), toolMessages = new Set();
   let halted = false;
   const emit = event => { if (onEvent(event) === false) halted = true; };
   const texts = new Map(), usage = emptyUsage(), toolErrors = [];
@@ -21,11 +21,13 @@ export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxL
       sessionID = event.sessionID;
     }
     const part = event.part;
+    const msgId = part?.messageID ?? event.messageID;
+    if (msgId && !messageOrder.has(msgId)) messageOrder.set(msgId, messageOrder.size);
+    if (event.type === "tool_use" && msgId) toolMessages.add(msgId);
     if (event.error || event.type === "error") {
       const error = event.error;
       return fail(typeof error === "string" ? error : error?.data?.message ?? error?.message ?? JSON.stringify(error ?? event));
     }
-    if (part?.messageID && !messages.has(part.messageID)) { messages.add(part.messageID); messageID = part.messageID; texts.clear(); legacyText = undefined; }
     if (event.type === "tool_use" && part?.type === "tool" && ["completed", "error"].includes(part.state?.status)) {
       const id = part.callID ?? part.id;
       if (!id) return fail("OpenCode tool event has no call or part ID.");
@@ -47,9 +49,11 @@ export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxL
     } else {
       const text = part?.type === "text" ? part.text : event.type === "text" ? event.text : event.result?.text;
       if (typeof text !== "string" || !text.trim()) return;
-      if (part?.messageID && part.messageID !== messageID) return;
-      if (part?.messageID) texts.set(part.id ?? "text", text.trim());
-      else legacyText = text.trim(); // Preserve legacy synthetic/older CLI output.
+      if (part?.messageID) {
+        if (!messages.has(part.messageID)) { messages.add(part.messageID); messageID = part.messageID; texts.clear(); legacyText = undefined; }
+        else if (part.messageID !== messageID) return;
+        texts.set(part.id ?? "text", text.trim());
+      } else legacyText = text.trim(); // Preserve legacy synthetic/older CLI output.
       emit({ type: "text", text });
     }
   }
@@ -70,7 +74,17 @@ export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxL
     end() { if (!ended) { ended = true; feed(decoder.end()); if (pending && !fatal) line(pending); pending = ""; } return this.snapshot(); },
     snapshot() {
       const text = texts.size ? [...texts.values()].join("\n\n") : legacyText;
-      return { ...(fatal ? { error: "OpenCode reported an analysis error.", detail: fatal } : text ? { text } : { error: "OpenCode returned no valid analysis.", ...(toolErrors.length ? { detail: toolErrors.at(-1) } : {}) }), sessionID, usage: { ...usage }, usageReported: usage.steps > 0, toolCalls: tools.size, toolErrors: [...toolErrors], eventCount, finalStop: lastStepReason === "stop" };
+      let textIsFinal = Boolean(text && !fatal);
+      if (texts.size && messageID) {
+        const textOrder = messageOrder.get(messageID) ?? -1;
+        for (const toolMsg of toolMessages) {
+          if (toolMsg !== messageID && (messageOrder.get(toolMsg) ?? -1) > textOrder) {
+            textIsFinal = false;
+            break;
+          }
+        }
+      }
+      return { ...(fatal ? { error: "OpenCode reported an analysis error.", detail: fatal } : text ? { text } : { error: "OpenCode returned no valid analysis.", ...(toolErrors.length ? { detail: toolErrors.at(-1) } : {}) }), sessionID, usage: { ...usage }, usageReported: usage.steps > 0, toolCalls: tools.size, toolErrors: [...toolErrors], eventCount, finalStop: lastStepReason === "stop", textIsFinal };
     },
   };
 }

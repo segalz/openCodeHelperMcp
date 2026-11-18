@@ -294,3 +294,43 @@ test("a kept edit reports every new file it left behind (a stray debug script)",
   assert.deepEqual(out.createdFiles, ["debug_test.py"]);
   assert.ok(out.warnings.some(w => w.includes("debug_test.py")));
 });
+
+// Plan S2 (review item A4): a summary that mentions questions is a final answer, not a request for input.
+for (const summary of ["Changed main.js\nQuestion: none", "Changed main.js\nQuestions: none remaining\nChecks: not run by me", "Question: should this be async? Decided yes.\nChanged main.js"]) {
+  test(`S2: summary ${JSON.stringify(summary.slice(0, 40))} runs verify and succeeds`, async t => {
+    const f = await repository(t);
+    let checks = 0;
+    const out = await runEdits(input(f.root), { ...f.options, verifyImpl: async () => { checks++; return passedCheck(); }, runner: async () => { await writeFile(path.join(f.root, "main.js"), "fixed"); return { ...response(), text: summary }; } });
+    assert.equal(out.error, undefined, JSON.stringify(out));
+    assert.equal(checks, 1);
+    assert.equal(out.verification.passed, true);
+  });
+}
+
+test("S2: a final line that asks the caller a real question still stops for input", async t => {
+  const f = await repository(t);
+  const out = await runEdits(input(f.root), { ...f.options, verifyImpl: () => assert.fail("no check"), runner: async () => ({ ...response(), text: "I need a decision.\nQUESTION: Should main.js keep the old API?" }) });
+  assert.equal(out.error, "input_required");
+});
+
+// Review of S2 (Sonnet): more "no question" phrasings keep the work; a real question that is not last adds a warning.
+for (const last of ["Question: (none)", "Question: No open questions", "Question: N/A (all clear)", "Question: **none**", "Question: nothing", "Question: —", "**Question:** none"]) {
+  test(`S2 review: last line ${JSON.stringify(last)} is not a request for input`, async t => {
+    const f = await repository(t);
+    const out = await runEdits(input(f.root), { ...f.options, verifyImpl: async () => passedCheck(), runner: async () => { await writeFile(path.join(f.root, "main.js"), "fixed"); return { ...response(), text: `Changed main.js\n${last}` }; } });
+    assert.equal(out.error, undefined, JSON.stringify(out));
+  });
+}
+
+test("S2 review: Question: nonexistent dir? is a real question", async t => {
+  const f = await repository(t);
+  const out = await runEdits(input(f.root), { ...f.options, verifyImpl: () => assert.fail("no check"), runner: async () => ({ ...response(), text: "Partly done.\nQuestion: nonexistent dir src/x — should I create it?" }) });
+  assert.equal(out.error, "input_required");
+});
+
+test("S2 review: a real question on an earlier line keeps the work and adds a warning", async t => {
+  const f = await repository(t);
+  const out = await runEdits(input(f.root), { ...f.options, verifyImpl: async () => passedCheck(), runner: async () => { await writeFile(path.join(f.root, "main.js"), "fixed"); return { ...response(), text: "QUESTION: Should the old API stay?\nChanged main.js\nChecks: not run by me" }; } });
+  assert.equal(out.error, undefined, JSON.stringify(out));
+  assert.ok((out.warnings ?? []).some(w => /question/i.test(w)), JSON.stringify(out.warnings));
+});

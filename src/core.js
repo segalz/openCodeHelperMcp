@@ -127,6 +127,7 @@ export function parseOpenCodeNdjson(stdout) {
   const parser = createEventStream(); parser.write(String(stdout ?? ""));
   const result = parser.end();
   if (result.error) return { error: result.error, ...(result.detail ? { detail: result.detail } : {}) };
+  if (result.text && !result.textIsFinal) return { error: "OpenCode returned no valid analysis.", ...(result.detail ? { detail: result.detail } : {}) };
   return { text: result.text };
 }
 
@@ -354,13 +355,19 @@ export function createOpenCodeRunner({
     if (sessionID && parsed.sessionID && parsed.sessionID !== sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation session mismatch." };
     if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
     if (quotaError) return { ...metrics, status: "failed", quota: true, limitKind: quotaError.kind, error: `OpenCode quota or rate limit: ${quotaError.message}` };
+    const isEdits = mode === "edits";
+    const textUsable = Boolean(parsed.text && (isEdits || parsed.textIsFinal));
     // The model finished its answer (last step ended with "stop") but the process did not exit in time:
     // keep the answer instead of discarding a completed analysis.
-    if (result.timedOut && !result.spawnError && !result.overflowed && parsed.text && parsed.finalStop) {
+    if (result.timedOut && !result.spawnError && !result.overflowed && textUsable && parsed.finalStop) {
       return { ...metrics, text: parsed.text, warning: "OpenCode timed out after its final answer; the answer is kept." };
     }
     if (result.spawnError || result.timedOut || result.overflowed) return { ...metrics, ...describeProcessFailure(result) };
-    if (result.exitCode !== 0 || parsed.error || result.stoppedReason) return { ...metrics, ...describeProcessFailure(result, { ndjsonError: parsed.detail ?? parsed.error ?? result.stoppedReason }) };
+    const analysisNarration = !isEdits && Boolean(parsed.text && !parsed.textIsFinal);
+    if (result.exitCode !== 0 || parsed.error || result.stoppedReason || analysisNarration) {
+      const ndjsonError = analysisNarration ? (parsed.detail ?? "OpenCode returned no valid analysis.") : (parsed.detail ?? parsed.error ?? result.stoppedReason);
+      return { ...metrics, ...describeProcessFailure(result, { ndjsonError }) };
+    }
     if (sessionID && !parsed.sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation did not report a session ID." };
     return { ...metrics, text: parsed.text };
   };
