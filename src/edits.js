@@ -302,10 +302,16 @@ export function registerEditTools(server, { runner, catalog, resolveAllowedPath,
         if (!await active(() => resolveAllowedPath(root))) throw new Error("Git checkout root is outside the allowed roots.");
         return root;
       };
-      const running = runEdits({ ...input, directory }, { ...lifecycleOptions, runner, resolveRoot, nowImpl, deadline, signal: user.signal, variant: variantFor(selected.models[0]) });
+      const model = selected.models[0];
+      const running = runEdits({ ...input, directory }, { ...lifecycleOptions, runner, resolveRoot, nowImpl, deadline, signal: user.signal, variant: variantFor(model) });
       const call = { abort: userAbort, done: running };
       activeEditCalls.add(call);
-      try { return respond(await running); } finally { activeEditCalls.delete(call); }
+      try {
+        const result = await running;
+        if (result.limitKind) catalog.recordLimit?.(model, { kind: result.limitKind, message: result.message ?? result.error });
+        else if (result.verification?.passed) catalog.recordSuccess?.(model);
+        return respond(result);
+      } finally { activeEditCalls.delete(call); }
     } catch (error) { return respond({ error: "edits_refused", message: redactSecrets(error?.message ?? String(error)) }); }
     finally { clearTimeout(timer); extra.signal?.removeEventListener("abort", userAbort); }
   });

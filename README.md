@@ -36,6 +36,8 @@ Restart or reconnect the MCP client after server changes so it reloads the tool 
 
 Returns JSON in MCP text content with model IDs, providers, names, `free_basis`, available context limits, and available probe results. Use the returned IDs for the other tools.
 
+During a cooldown, the model's `limit` field reports `kind`, `scope`, `until_ms_from_now` and `strikes`.
+
 | Input | Default | Meaning |
 |---|---|---|
 | `probe` | `false` | Send a small read-only health prompt to the selected models; concurrency 4, timeout 30 seconds per model. |
@@ -68,14 +70,16 @@ The prompt includes the actual cwd and OS, working rules, and an optional code m
 |---|---|---|
 | `directory` | Required | Absolute directory resolving under an allowed root. Analysis does not require a Git repository. |
 | `prompt` | Required | Focused analysis request, 1-12,000 characters. |
-| `model` | Automatic | One current free model ID, tried first. |
+| `model` | Automatic | First-choice free model ID. Models on cooldown move to the end. |
 | `models` | None | Ordered fallback IDs, up to 8 entries, following `model`; duplicate IDs are removed. |
 | `maxWords` | `120` | Requested answer budget, 40-600 words. This is a prompt instruction. |
 | `budgetMs` | `300000` | Shared work deadline, 30,000-600,000 ms; see Budgets and limits. |
 | `codeMap` | `true` | Add a bounded map of current tracked source files when available. |
 | `guard` | Shared defaults | Loop/tool/input-token limits described below. |
 
-When IDs are supplied, every ID must be in the current free catalog; models are attempted in the supplied order, at most once each, stopping at the first successful answer. Without IDs, automatic selection makes at most four attempts. It prefers `opencode/deepseek-v4.1-flash-free`, `opencode/glm-5.3-flash-free` and `opencode/mimo-v2.6-flash-free` when listed, then sorts other models by recent probe success, latency, provider and ID. Recent failed/timed-out probes are filtered out; if that removes every candidate, listed preferred models are tried again despite their probe failures.
+When you supply IDs from the current free catalog, the helper follows your order, tries each model at most once and stops at the first successful answer. Without IDs, automatic selection makes at most four attempts. It prefers `opencode/deepseek-v4.1-flash-free`, `opencode/glm-5.3-flash-free` and `opencode/mimo-v2.6-flash-free` when listed, then sorts other models by recent probe success, latency, provider and ID. It skips recent failed or timed-out probes unless every candidate failed or timed out. In that case, the full ordered list is eligible.
+
+In both selection modes, models on cooldown move to the end, preserving relative order within each group. The bridge remembers limits for the life of the process. A quota limit cools the whole provider for one hour by default. Repeated rate limits cool the affected model for 1, 3, 10 and then 30 minutes. A provider retry delay sets the duration when available. Every cooldown lasts at least 5 seconds and at most 24 hours. Limits less than 2 seconds apart count as one strike, and a rate limit more than 30 minutes after the last one starts the ladder again. Analysis runs, edit runs and health probes all record limits; a successful analysis, a passing edit or an answered probe clears that model's strikes and its provider's quota cooldown.
 
 Ordinary run failures can advance to the next model. OpenCode runs with error-level logs on stderr. An exhausted quota ("Free usage limit reached", `insufficient_quota`) or rate-limit retries that OpenCode itself gave up on end the attempt at once, with `quota: true` and the provider's message, instead of waiting for the timeout. The same applies to a request larger than the provider tier allows per minute. Attempts and edit results carry `limitKind` (`quota`, `rate_limit` or `request_too_large`). A single 429 is left to OpenCode's own retry. Pass fallback IDs in `models` so such a failure moves to another provider. A loop trip (`loop_detected`) moves to the next model with a fresh loop window; the tool-call and input-token budgets stay shared. A budget trip, a stopped process that could not be confirmed dead, or a local preparation refusal stops the chain immediately. Known limit: after a loop trip the process is stopped at once, so token records OpenCode writes after that point are not counted; the input-token count can be low, and a fallback model can then exceed the real input budget. Fatal CLI events, nonzero exits, timeouts and output overflows cannot succeed on partial answer text. A recovered tool error can remain in the guard's diagnostic history without making the final answer fail. Real runs use each model's default reasoning variant; health probes use `low` when the catalog advertises it, to stay cheap.
 

@@ -25,6 +25,11 @@ export const PROBE_TIMEOUT_MS = 30_000;
 export const PROBE_CONCURRENCY = 4;
 export const LIST_TIMEOUT_MS = 60_000;
 export const MODEL_CACHE_TTL_MS = 600_000;
+export const RATE_LIMIT_LADDER_MS = Object.freeze([60_000, 180_000, 600_000, 1_800_000]);
+export const QUOTA_COOLDOWN_MS = 3_600_000;
+export const RATE_LIMIT_STRIKE_WINDOW_MS = 1_800_000;
+export const MIN_COOLDOWN_MS = 5_000;
+export const MAX_COOLDOWN_MS = 86_400_000;
 export const MAX_AUTO_ATTEMPTS = 4;
 export const MAX_EXPLICIT_MODELS = 8;
 export const PREFERRED_VARIANT = "low";
@@ -95,9 +100,9 @@ export const analysisInputSchema = Object.freeze({
   budgetMs: z.number().int().min(MIN_BUDGET_MS).max(MAX_BUDGET_MS).optional()
     .describe(`Total wall-clock budget (${MIN_BUDGET_MS}-${MAX_BUDGET_MS}, default ${DEFAULT_BUDGET_MS}): about 90000 focused, 180000 multi-file, 300000+ deep. Unused time from a failed attempt moves to the next one; the total never exceeds this value.`),
   model: modelIdSchema.optional()
-    .describe("Optional. One free model id from list_free_models (e.g. opencode/deepseek-v4.1-flash-free). Tried first."),
+    .describe("Optional. First-choice free model id from list_free_models (e.g. opencode/deepseek-v4.1-flash-free). Models on cooldown move to the end."),
   models: z.array(modelIdSchema).min(1).max(MAX_EXPLICIT_MODELS).optional()
-    .describe(`Optional. Ordered fallback list of free model ids from list_free_models (max ${MAX_EXPLICIT_MODELS}). Tried in order after \`model\`; each model is called at most once.`),
+    .describe(`Optional. Ordered fallback list of free model ids from list_free_models (max ${MAX_EXPLICIT_MODELS}). Each model is called at most once. Models on cooldown move to the end.`),
 });
 
 export const listModelsInputSchema = Object.freeze({
@@ -508,8 +513,36 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
+const RETRY_UNIT_MS = Object.freeze({
+  ms: 1, millisecond: 1, milliseconds: 1,
+  s: 1_000, sec: 1_000, secs: 1_000, second: 1_000, seconds: 1_000,
+  m: 60_000, min: 60_000, mins: 60_000, minute: 60_000, minutes: 60_000,
+  h: 3_600_000, hr: 3_600_000, hrs: 3_600_000, hour: 3_600_000, hours: 3_600_000,
+  d: 86_400_000, day: 86_400_000, days: 86_400_000,
+});
+
+export function parseRetryAfterMs(text) {
+  if (typeof text !== "string") return undefined;
+  const label = /\b(?:try\s+again\s+in|retry[-\s]+after)\b\s*(?:\\*["'])?\s*[:=]?\s*(?:\\*["'])?\s*(?=\d)/i.exec(text);
+  if (!label) return undefined;
+
+  const value = text.slice(label.index + label[0].length);
+  // Sticky matching keeps unrelated numbers later in the error out of the delay.
+  const parts = /\s*(?:,\s*)?(?:and\s+)?(\d+(?:\.\d+)?)\s*(milliseconds?|ms|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/giy;
+  let delayMs;
+  for (const [, amount, unit] of value.matchAll(parts)) {
+    delayMs = (delayMs ?? 0) + Number(amount) * RETRY_UNIT_MS[unit.toLowerCase()];
+  }
+  if (delayMs === undefined) {
+    // Only treat a unitless number as seconds; an unknown unit word (e.g. "2 weeks") returns undefined.
+    const seconds = /^\d+(?:\.\d+)?\b(?![ \t]*\p{L})/iu.exec(value);
+    if (seconds) delayMs = Number(seconds[0]) * 1_000;
+  }
+  return Number.isFinite(delayMs) ? delayMs : undefined;
+}
+
 /**
- * Discovers free OpenCode models, caches them and their probe results.
+ * Discovers free OpenCode models and tracks probes and runtime limits.
  */
 export function createModelCatalog({
   runner, spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, killProcessTreeImpl,
@@ -521,6 +554,41 @@ export function createModelCatalog({
   let listCache = null; // { at, models, source, excluded }
   let inflightList = null;
   const probes = new Map(); // id -> { status, latency_ms, error?, at }
+  const providerQuotas = new Map();
+  const modelRateLimits = new Map();
+
+  const recordLimit = (model, { kind, message }) => {
+    if (kind !== "quota" && kind !== "rate_limit") return;
+    const providerWide = kind === "quota";
+    const limits = providerWide ? providerQuotas : modelRateLimits;
+    const key = providerWide ? model.provider : model.id;
+    const previous = limits.get(key);
+    const now = nowImpl();
+    const collapsed = previous && now - previous.lastAt < 2_000;
+    // A limit long after the last one starts the ladder again (same window as the Cline bridge).
+    const recent = previous && now - previous.lastAt <= RATE_LIMIT_STRIKE_WINDOW_MS;
+    const strikes = (recent ? previous.limit.strikes : 0) + (collapsed ? 0 : 1);
+    const fallbackMs = providerWide ? QUOTA_COOLDOWN_MS : RATE_LIMIT_LADDER_MS[Math.min(strikes, RATE_LIMIT_LADDER_MS.length) - 1];
+    const clampedFallbackMs = clampNumber(fallbackMs, MIN_COOLDOWN_MS, MAX_COOLDOWN_MS, MIN_COOLDOWN_MS);
+    const until = now + clampNumber(parseRetryAfterMs(message) ?? clampedFallbackMs, MIN_COOLDOWN_MS, MAX_COOLDOWN_MS, clampedFallbackMs);
+    const limit = {
+      kind, scope: providerWide ? "provider" : "model", strikes, message,
+      until: collapsed ? Math.max(previous.limit.until, until) : until,
+    };
+    limits.set(key, { lastAt: now, limit });
+  };
+
+  const activeLimit = (model) => {
+    const quota = providerQuotas.get(model.provider)?.limit;
+    const rate = modelRateLimits.get(model.id)?.limit;
+    const limit = quota && (!rate || quota.until >= rate.until) ? quota : rate;
+    return limit && nowImpl() < limit.until ? limit : undefined;
+  };
+
+  const recordSuccess = (model) => {
+    modelRateLimits.delete(model.id);
+    providerQuotas.delete(model.provider);
+  };
 
   const runModelsCommand = (extraArgs) => runBoundedProcess({
     executable: resolveOpenCodeExecutable({ env, platform }), args: ["models", ...extraArgs], cwd: probeDirectory, env: childEnv(env, execPath),
@@ -577,18 +645,30 @@ export function createModelCatalog({
         ? { status: "ok", latency_ms: outcome.elapsedMs }
         : { status: outcome?.status === "timeout" ? "timeout" : "failed", latency_ms: outcome?.elapsedMs, error: tailText(redactSecrets(outcome?.error ?? "no answer"), 300) };
       probes.set(model.id, { ...entry, at: nowImpl() });
+      if (outcome?.limitKind) recordLimit(model, { kind: outcome.limitKind, message: outcome.error });
+      else if (outcome?.text) recordSuccess(model);
     });
     return models.map((model) => ({ id: model.id, ...recentProbe(model.id) }));
   };
 
-  return { list, probe, recentProbe, ttlMs };
+  return { list, probe, recentProbe, ttlMs, recordLimit, activeLimit, recordSuccess };
 }
 
 // ---------------------------------------------------------------------------
 // Model selection and orchestration
 // ---------------------------------------------------------------------------
 
-export function buildAutoOrder(freeModels, { recentProbe = () => undefined, maxAttempts = MAX_AUTO_ATTEMPTS, preferred = PREFERRED_MODELS } = {}) {
+function moveLimitedModelsLast(models, activeLimit) {
+  const available = [];
+  const limited = [];
+  for (const model of models) {
+    if (activeLimit(model)) limited.push(model);
+    else available.push(model);
+  }
+  return [...available, ...limited];
+}
+
+export function buildAutoOrder(freeModels, { recentProbe = () => undefined, activeLimit = () => undefined, maxAttempts = MAX_AUTO_ATTEMPTS, preferred = PREFERRED_MODELS } = {}) {
   const byId = new Map(freeModels.map((model) => [model.id, model]));
   const healthy = (model) => !["failed", "timeout"].includes(recentProbe(model.id)?.status);
   const preferredModels = preferred.map((id) => byId.get(id)).filter(Boolean);
@@ -602,7 +682,8 @@ export function buildAutoOrder(freeModels, { recentProbe = () => undefined, maxA
   });
   const ordered = [...preferredModels, ...rest];
   const filtered = ordered.filter(healthy);
-  return (filtered.length > 0 ? filtered : preferredModels).slice(0, maxAttempts);
+  const candidates = filtered.length > 0 ? filtered : ordered;
+  return moveLimitedModelsLast(candidates, activeLimit).slice(0, Math.max(1, maxAttempts));
 }
 
 export function resolveRequestedModels({ model, models } = {}, freeModels) {
@@ -678,7 +759,8 @@ export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runne
     if (result?.killConfirmed === false && !result?.text) {
       const baseError = result?.error ?? tripKind ?? "OpenCode run failed.";
       const message = `${baseError} A process from the stopped run may still be running; stopped without trying another model.`;
-      attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: message });
+      attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: message,
+        ...(result?.limitKind ? { limitKind: result.limitKind } : {}) });
       return { error: result?.error ?? tripKind ?? "process_still_running", message, ...killFields, attempts, budgetMs: budget, guard: result?.guard ?? snapshot, usage, sessionID, codeMapSource };
     }
     if (!result?.localFailure && tripKind === "loop_detected" && index + 1 < queue.length) {
@@ -784,7 +866,8 @@ export async function resolvePathWithinAllowedRoots(directory, roots, { realpath
 export const ANALYZE_DESCRIPTION = [
   "Read-only code analysis through OpenCode (plan agent, no edits) using FREE models only.",
   "Recommended flow: first call list_free_models (probe=true when unsure which models are healthy right now), then pick the model yourself and pass it as `model`, optionally with an ordered fallback list in `models`.",
-  "Both fields are optional: without them the helper auto-orders the currently listed free models (preferring DeepSeek V4.1 Flash, GLM 5.3 Flash, MiMo V2.6 Flash when listed) and skips models that failed a recent probe.",
+  "When both optional fields are omitted, the helper auto-orders the currently listed free models (preferring DeepSeek V4.1 Flash, GLM 5.3 Flash, MiMo V2.6 Flash when listed). It skips recent probe failures unless every model failed.",
+  "Automatic and caller-supplied chains try models on cooldown last. This process remembers quota per provider (default 1 hour) and rate limits per model (1/3/10/30 minutes on successive strikes). A provider retry delay overrides the default.",
   "Explicit read/search permissions, cumulative guard budgets and optional bounded code map; a loop trip moves to the next model, while a budget trip stops without fallback.",
   "Only ids from the current free list are accepted. Each model is called at most once; budgetMs is shared across attempts. The result header lists the model used and every attempt with its status and real (redacted) error.",
 ].join(" ");
@@ -825,10 +908,12 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
       count: selected.length,
       excluded: listed.excluded,
       models: selected.map((model) => {
-        const health = catalog.recentProbe(model.id);
+        const health = catalog.recentProbe?.(model.id);
+        const limit = catalog.activeLimit?.(model);
         return {
           id: model.id, provider: model.provider, name: model.name, free_basis: model.freeBasis,
           ...(model.context ? { context: model.context } : {}),
+          ...(limit ? { limit: { kind: limit.kind, scope: limit.scope, until_ms_from_now: Math.max(0, limit.until - nowImpl()), strikes: limit.strikes } } : {}),
           ...(health ? { probe: { status: health.status, latency_ms: health.latency_ms, ...(health.error ? { error: health.error } : {}), age_ms: nowImpl() - health.at } } : {}),
         };
       }),
@@ -846,9 +931,18 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
     if (listed.error) return textResult(`Could not list OpenCode free models.\n${redactSecrets(listed.error)}`, true);
     const requested = resolveRequestedModels({ model, models }, listed.models);
     if (requested.error) return textResult(requested.error, true);
-    const chain = requested.auto ? buildAutoOrder(listed.models, { recentProbe: catalog.recentProbe }) : requested.models;
+    const activeLimit = (model) => catalog.activeLimit?.(model);
+    const chain = requested.auto
+      ? buildAutoOrder(listed.models, { recentProbe: catalog.recentProbe, activeLimit })
+      : moveLimitedModelsLast(requested.models, activeLimit);
     if (chain.length === 0) return textResult("No free OpenCode models are currently available. Call list_free_models with refresh=true.", true);
     const result = await runAnalysis({ directory: validated.directory, prompt, maxWords, budgetMs, runner, models: chain, guard: guardValidation.data, codeMap, signal: extra.signal, deadline, nowImpl });
+    const byId = new Map(chain.map((model) => [model.id, model]));
+    for (const attempt of result.attempts) {
+      const attemptedModel = byId.get(attempt.model);
+      if (attempt.limitKind) catalog.recordLimit?.(attemptedModel, { kind: attempt.limitKind, message: attempt.reason });
+      if (attempt.status === "ok") catalog.recordSuccess?.(attemptedModel);
+    }
     result.selection = requested.auto ? `auto (${chain.map((m) => m.id).join(" → ")})` : "caller";
     return textResult(formatAnalysisResult(result), Boolean(result.error));
   });

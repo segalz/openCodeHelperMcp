@@ -335,3 +335,22 @@ test("S2 review: a real question on an earlier line keeps the work and adds a wa
   assert.equal(out.error, undefined, JSON.stringify(out));
   assert.ok((out.warnings ?? []).some(w => /question/i.test(w)), JSON.stringify(out.warnings));
 });
+
+test("S8: an edit run's limit is remembered by the shared catalog, and a passing edit clears limits", async t => {
+  const f = await repository(t), tools = new Map(), calls = [];
+  let reply = { status: "failed", quota: true, limitKind: "quota", error: "OpenCode quota or rate limit: free usage limit reached" };
+  registerEditTools({ registerTool: (name, config, handler) => tools.set(name, { config, handler }) }, {
+    runner: async () => reply,
+    catalog: { list: async () => ({ models: [{ id: "opencode/test-free", provider: "opencode" }] }),
+      recordLimit: (model, limit) => calls.push(["limit", model.id, limit.kind]), recordSuccess: model => calls.push(["success", model.id]) },
+    resolveAllowedPath: async dir => dir === f.root ? f.root : null, lifecycleOptions: { ...f.options, verifyImpl: async () => passedCheck() },
+  });
+  const failed = await tools.get("apply_opencode_edits").handler({ ...input(f.root), maxFixRuns: 0 });
+  assert.equal(failed.isError, true);
+  assert.deepEqual(calls, [["limit", "opencode/test-free", "quota"]]);
+  calls.length = 0;
+  reply = response();
+  const passed = await tools.get("apply_opencode_edits").handler(input(f.root));
+  assert.equal(JSON.parse(passed.content[0].text).verification.passed, true);
+  assert.deepEqual(calls, [["success", "opencode/test-free"]]);
+});
