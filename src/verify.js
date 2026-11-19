@@ -4,6 +4,7 @@ import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { defaultKillTree } from "./process-utils.js";
 import { confirmTreeDead } from "./proctree.js";
+import { createWindowsJob } from "./jobobject.js";
 import { ChildProcess } from "node:child_process";
 import { redactSecrets } from "./safety.js";
 export class VerificationError extends Error {
@@ -16,6 +17,7 @@ export class VerificationError extends Error {
 }
 const OUTPUT_LIMIT = 1024 * 1024;
 const TAIL_LIMIT = 8 * 1024;
+const EXIT_GRACE_MS = 500;
 export async function resolveVerificationCommand(command, args = [], cwd = process.cwd()) {
     if (!command || command.includes("\0") || args.some(arg => typeof arg !== "string" || arg.includes("\0"))) {
         throw new VerificationError("verification_refused", "Verification requires a command and literal string arguments.");
@@ -131,49 +133,61 @@ export async function runVerification(spec, cwd, signal, { spawnImpl = spawn, re
         throw new VerificationError("verification_refused", "Verification timeout must be 1-300 seconds.");
     const started = performance.now();
     const executable = await resolveImpl(spec.command, spec.args, cwd);
-    if (signal?.aborted)
+    const prepareStarted = performance.now();
+    const useJob = process.platform === "win32" && spawnImpl === spawn;
+    const job = useJob ? await createWindowsJob(timeout * 1000, signal) : undefined;
+    const remainingMs = Math.max(0, timeout * 1000 - (useJob ? performance.now() - prepareStarted : 0));
+    if (signal?.aborted) {
+        await job?.close();
         return { passed: false, exitCode: null, signal: "SIGKILL", timedOut: false,
             killedForOutput: false, durationMs: performance.now() - started, stdoutTail: "", stderrTail: "" };
+    }
     return new Promise((resolve, reject) => {
         let child;
         const rootStartedMs = Date.now();
         try { child = spawnImpl(executable.command, executable.args, {
             cwd: path.resolve(cwd), shell: false, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"]
         }); } catch { reject(new VerificationError("verification_launch_failed", "Could not launch verification executable.")); return; }
+        job?.assign(child);
+        const pid = child.pid;
         const stdout = [], stderr = [];
-        let bytes = 0, timedOut = false, killedForOutput = false, cancelled = false, done = false;
-        let killDeadline, confirm, exitedAt;
+        let bytes = 0, timedOut = false, killedForOutput = false, cancelled = false, done = false, stopped = false;
+        let killDeadline, exitGrace, confirm, exitedAt;
         // A real verify process tree must be confirmed dead before the result returns: a restore follows.
-        const realChild = child instanceof ChildProcess && Number.isInteger(child.pid) && child.pid > 0;
+        const realChild = child instanceof ChildProcess && Number.isInteger(pid) && pid > 0;
         const rootAlive = () => exitedAt === undefined && child.exitCode === null && child.signalCode === null;
-        child.once("exit", () => { exitedAt = Date.now(); });
+        const confirmKill = () => confirmTreeDead(pid, {
+            killRoot: () => killImpl(pid), isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt
+        }).catch(() => ({ confirmed: false, alive: [pid], unverified: true }));
+        const destroyPipes = () => { child.stdout.destroy(); child.stderr.destroy(); };
         const stop = () => {
-            if (done || killDeadline)
-                return;
+            if (done || stopped) return;
+            stopped = true;
+            clearTimeoutImpl(timer);
+            clearTimeoutImpl(exitGrace);
+            if (realChild) confirm = confirmKill();
             // Settle even if an inherited pipe or OS kill failure prevents a close event.
             killDeadline = setTimeoutImpl(() => {
-                child.kill("SIGKILL");
-                child.stdout.destroy();
-                child.stderr.destroy();
+                if (!realChild || rootAlive()) { try { child.kill("SIGKILL"); } catch { /* bounded grace fallback */ } }
                 finish(null, "SIGKILL");
+                destroyPipes();
             }, 5000);
-            // After exit the root PID may already belong to another process: never kill it by PID again.
-            try { if (child.pid && (!realChild || rootAlive())) killImpl(child.pid); } catch { /* bounded grace fallback */ }
-            if (realChild) confirm = confirmTreeDead(child.pid, { killRoot: () => killImpl(child.pid), isRootAlive: rootAlive,
-                rootStartedMs, rootExitedMs: () => exitedAt }).catch(() => ({ confirmed: false, alive: [child.pid], unverified: true }));
+            // After exit the root PID may already belong to another process.
+            try { if (pid && (!realChild || rootAlive())) killImpl(pid); } catch { /* bounded grace fallback */ }
+            void job?.close();
         };
-        const timer = setTimeoutImpl(() => { timedOut = true; stop(); }, timeout * 1000);
+        const timer = setTimeoutImpl(() => { timedOut = true; stop(); }, remainingMs);
         const abort = () => { cancelled = true; stop(); };
-        signal?.addEventListener("abort", abort, { once: true });
-        if (signal?.aborted)
-            abort();
-        const cleanup = () => { clearTimeoutImpl(timer); clearTimeoutImpl(killDeadline); signal?.removeEventListener("abort", abort); };
+        const cleanup = () => {
+            clearTimeoutImpl(timer); clearTimeoutImpl(exitGrace); clearTimeoutImpl(killDeadline);
+            signal?.removeEventListener("abort", abort);
+        };
         const finish = (exitCode, exitSignal) => {
             if (done)
                 return;
             done = true;
             cleanup();
-            const settle = (kill) => resolve({ passed: exitCode === 0 && !timedOut && !killedForOutput && !cancelled && !exitSignal,
+            const settle = (kill) => resolve({ passed: exitCode === 0 && !timedOut && !killedForOutput && !cancelled && !exitSignal && (!kill || kill.confirmed),
                 exitCode, signal: exitSignal ?? (cancelled ? "SIGKILL" : null), timedOut, killedForOutput,
                 durationMs: performance.now() - started, stdoutTail: tail(stdout), stderrTail: tail(stderr),
                 ...(kill && !kill.confirmed ? { killConfirmed: false, stillAlive: kill.alive, ...(kill.unverified ? { killUnverified: true } : {}) } : {}) });
@@ -203,6 +217,23 @@ export async function runVerification(spec, cwd, signal, { spawnImpl = spawn, re
             if (confirm) confirm.then(fail);
             else fail();
         });
-        child.once("close", finish);
-    });
+        child.once("exit", (code, sig) => {
+            exitedAt = Date.now();
+            void job?.close();
+            if (done || stopped || !realChild) return;
+            clearTimeoutImpl(timer);
+            // A child outside the job can keep the pipes open after the root exits.
+            exitGrace = setTimeoutImpl(() => {
+                confirm = confirmKill();
+                finish(code, sig);
+                destroyPipes();
+            }, EXIT_GRACE_MS);
+        });
+        child.once("close", (code, sig) => {
+            if (stopped) finish(null, "SIGKILL");
+            else finish(code, sig);
+        });
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+    }).finally(() => job?.close());
 }

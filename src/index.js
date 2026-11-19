@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createModelCatalog, createOpenCodeRunner, registerAnalysisTools, resolvePathWithinAllowedRoots } from "./core.js";
 import { registerEditTools, shutdownEdits } from "./edits.js";
+import { shutdownJobObjects } from "./jobobject.js";
 
 const DEFAULT_ALLOWED_ROOT = "C:\\Develop";
 
@@ -29,6 +30,7 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   await shutdownEdits(120_000).catch(() => {});
+  shutdownJobObjects();
   process.exit(0);
 };
 process.stdin.on("end", () => { void shutdown(); });

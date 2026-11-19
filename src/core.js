@@ -13,6 +13,7 @@ import { buildCodeMap } from "./codemap.js";
 import { WORKING_RULES, buildEnvironmentLine } from "./rules.js";
 import { windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT } from "./process-utils.js";
 import { confirmTreeDead } from "./proctree.js";
+import { createWindowsJob } from "./jobobject.js";
 
 // ---------------------------------------------------------------------------
 // Limits and defaults
@@ -175,12 +176,16 @@ function childEnv(env, execPath) {
  * Run one child process with a hard timeout, bounded output and process-tree kill.
  * Resolves { exitCode, stdout, stderr, timedOut, overflowed, spawnError, elapsedMs }.
  */
-export function runBoundedProcess({
+export async function runBoundedProcess({
   executable, args, cwd, env, timeoutMs, maxStdoutBytes = OPENCODE_MAX_STDOUT_BYTES, maxStderrBytes = OPENCODE_MAX_STDERR_BYTES,
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, terminate, graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
   onStdout, onStderr, collectStdout = true, signal,
 }) {
   const started = nowImpl();
+  const prepareStarted = performance.now();
+  const useJob = process.platform === "win32" && spawnImpl === defaultSpawn;
+  const job = useJob ? await createWindowsJob(timeoutMs, signal) : undefined;
+  const setupMs = useJob ? performance.now() - prepareStarted : 0;
   return new Promise((resolve) => {
     if (signal?.aborted) { resolve({ exitCode: null, stdout: "", stderr: "", stoppedReason: "cancelled", elapsedMs: 0 }); return; }
     let child;
@@ -198,6 +203,7 @@ export function runBoundedProcess({
     // A real child's tree must be confirmed dead before a stopped run resolves: the edit flow restores the
     // snapshot right after, and a living child could still write. Fake spawns (tests) keep the grace timer.
     const realChild = child instanceof ChildProcess && Number.isInteger(child.pid) && child.pid > 0;
+    if (realChild) job?.assign(child);
     let killResult; let exitedAt; let reaping = false;
     const rootAlive = () => exitedAt === undefined && child.exitCode === null && child.signalCode === null;
     const finish = () => {
@@ -223,8 +229,11 @@ export function runBoundedProcess({
       // After exit the root PID may already belong to another process: never kill it by PID again.
       if (!realChild || rootAlive()) { try { terminate(child); } catch { /* retried below, or the grace deadline settles */ } }
       if (realChild && !reaping) {
+        // Give taskkill the live root first. Close the job on root exit or the first S3 retry.
+        if (!rootAlive()) void job?.close();
         confirmTreeDead(child.pid, {
-          killRoot: () => terminate(child), isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt,
+          killRoot: () => { try { terminate(child); } finally { void job?.close(); } },
+          isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt,
         }).then(result => result, () => ({ confirmed: false, alive: [child.pid], unverified: true }))
           .then((result) => { killResult = result; finish(); });
       } else if (!realChild) graceTimer ??= setTimeoutImpl(finish, graceMs);
@@ -254,7 +263,7 @@ export function runBoundedProcess({
     timeoutTimer = setTimeoutImpl(() => {
       timedOut = true;
       stop("timeout");
-    }, timeoutMs);
+    }, Math.max(0, timeoutMs - setupMs));
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       if (settled || stoppedReason) return;
@@ -271,11 +280,16 @@ export function runBoundedProcess({
       try { const reason = onStderr?.(chunk); if (reason) stop(reason); } catch { stop("stream_error"); }
     });
     child.on("error", (error) => { spawnError = error?.code ?? error?.message ?? "spawn failed"; finish(); });
-    child.on("exit", (code) => { exitCode = code; exitedAt = Date.now(); graceTimer ??= setTimeoutImpl(afterExitGrace, graceMs); });
+    child.on("exit", (code) => {
+      exitCode = code; exitedAt = Date.now();
+      if (job?.assigned) clearTimeoutImpl(timeoutTimer);
+      void job?.close();
+      graceTimer ??= setTimeoutImpl(afterExitGrace, graceMs);
+    });
     child.on("close", (code) => { exitCode = code; finish(); });
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-  });
+  }).finally(() => job?.close());
 }
 
 /**
