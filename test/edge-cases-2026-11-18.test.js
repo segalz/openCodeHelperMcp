@@ -89,18 +89,18 @@ test("createdFiles lists new files and skips ignored build output", async () => 
   await discardSnapshot(handle);
 });
 
-test("a lock whose PID now belongs to a newer process is dead; unknown start time stays busy", () => {
+test("a lock whose PID now belongs to a newer process is dead; unknown start time stays busy", async () => {
   const pid = process.ppid;
   const written = new Date(Date.now() - 60_000).toISOString();
-  assert.equal(holderIsDead({ pid, time: written }, () => Date.now()), true);
-  assert.equal(holderIsDead({ pid, time: written }, () => Date.now() - 3_600_000), false);
-  assert.equal(holderIsDead({ pid, time: written }, () => undefined), false);
-  assert.equal(holderIsDead({ pid }, () => Date.now()), false);
-  assert.equal(holderIsDead({ pid: process.pid, time: written }, () => Date.now()), false);
+  assert.equal(await holderIsDead({ pid, time: written }, () => Date.now()), true);
+  assert.equal(await holderIsDead({ pid, time: written }, () => Date.now() - 3_600_000), false);
+  assert.equal(await holderIsDead({ pid, time: written }, () => undefined), false);
+  assert.equal(await holderIsDead({ pid }, () => Date.now()), false);
+  assert.equal(await holderIsDead({ pid: process.pid, time: written }, () => Date.now()), false);
 });
 
-test("processStartMs reads this process's real start time", { skip: !["win32", "linux"].includes(process.platform) }, () => {
-  const started = processStartMs(process.pid);
+test("processStartMs reads this process's real start time", { skip: !["win32", "linux"].includes(process.platform) }, async () => {
+  const started = await processStartMs(process.pid);
   assert.ok(started !== undefined);
   assert.ok(Math.abs(started - (Date.now() - process.uptime() * 1000)) < 10_000, String(started));
 });

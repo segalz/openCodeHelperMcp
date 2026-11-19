@@ -94,7 +94,7 @@ test("exhausted fixes restore once to owner bytes; keepOnFailure keeps explicitl
       runner: async () => { calls++; await writeFile(path.join(f.root, "main.js"), "partial"); await writeFile(path.join(f.root, "new.js"), "new"); return response(); } });
     assert.equal(calls, 3); assert.equal(snapshots, 1); assert.equal(out.verification.fixRuns, 2); assert.equal(out.error, "verify_failed"); assert.equal(out.verification.kept, keepOnFailure); assert.equal(out.verification.restored, !keepOnFailure);
     assert.equal(await readFile(path.join(f.root, "main.js"), "utf8"), keepOnFailure ? "partial" : "owner dirty bytes\n"); if (!keepOnFailure) await missing(path.join(f.root, "new.js"));
-    const release = acquire(f.root, { lockDirectory: f.options.lockDirectory }); release();
+    const release = await acquire(f.root, { lockDirectory: f.options.lockDirectory }); release();
   }
 });
 
@@ -125,7 +125,7 @@ test("HEAD/index changes refuse restoration, retain snapshot and release writer 
       return response();
     }, verifyImpl: () => assert.fail("identity failed") });
     assert.equal(out.error, "identity_changed"); assert.equal(out.verification.restored, false); await access(out.evidence.snapshotDirectory);
-    assert.equal(await readFile(path.join(f.root, "main.js"), "utf8"), "partial"); const release = acquire(f.root, { lockDirectory: f.options.lockDirectory }); release();
+    assert.equal(await readFile(path.join(f.root, "main.js"), "utf8"), "partial"); const release = await acquire(f.root, { lockDirectory: f.options.lockDirectory }); release();
   }
 });
 
@@ -142,10 +142,10 @@ test("shared Cline-compatible lock refuses a second writer and existing foreign 
   const f = await repository(t), root = canonicalCheckoutPath(f.root);
   const expected = path.join(os.homedir(), ".cline-mcp", "locks", createHash("sha256").update(root).digest("hex") + ".lock");
   assert.equal(checkoutLockPath(f.root), expected);
-  const release = acquire(f.root, { lockDirectory: f.options.lockDirectory });
-  assert.throws(() => acquire(f.root, { lockDirectory: f.options.lockDirectory }), { kind: "checkout_busy" }); release();
+  const release = await acquire(f.root, { lockDirectory: f.options.lockDirectory });
+  await assert.rejects(acquire(f.root, { lockDirectory: f.options.lockDirectory }), { kind: "checkout_busy" }); release();
   const file = checkoutLockPath(f.root, f.options.lockDirectory); await writeFile(file, JSON.stringify({ pid: process.pid, time: new Date().toISOString(), token: "foreign-cline-holder" }));
-  assert.throws(() => acquire(f.root, { lockDirectory: f.options.lockDirectory }), { kind: "checkout_busy" });
+  await assert.rejects(acquire(f.root, { lockDirectory: f.options.lockDirectory }), { kind: "checkout_busy" });
   const out = await runEdits(input(f.root), { ...f.options, runner: () => assert.fail("busy must not run") }); assert.equal(out.error, "checkout_busy"); await rm(file);
 });
 
@@ -233,7 +233,7 @@ test("partial restoration retains snapshot/evidence and releases lock", async t 
   const out = await runEdits({ ...input(f.root), maxFixRuns: 0 }, { ...f.options, runner: async () => response(), verifyImpl: async () => failedCheck(),
     restoreSnapshotImpl: async () => ({ restored: [], removed: [], failed: [{ path: "main.js", error: "locked" }] }) });
   assert.equal(out.verification.restored, false); assert.match(out.evidence.recoveryError, /incomplete/); await access(out.evidence.snapshotDirectory);
-  const release = acquire(f.root, { lockDirectory: f.options.lockDirectory }); release();
+  const release = await acquire(f.root, { lockDirectory: f.options.lockDirectory }); release();
 });
 
 test("same-session repair rejects a changed session and restores", async t => {

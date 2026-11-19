@@ -173,7 +173,7 @@ export async function runEdits(rawInput, {
       }
       check();
     }
-    release = acquire(root, { lockDirectory });
+    release = await acquire(root, { lockDirectory });
     identity = await identityImpl(root, controller.signal); check();
     snapshot = await takeSnapshotImpl(root, { ...snapshotOptions, signal: controller.signal });
     result.evidence.snapshotDirectory = snapshot.directory;
