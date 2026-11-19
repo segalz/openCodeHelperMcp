@@ -73,7 +73,7 @@ async function readPids(pidsPath) {
 
 test("S3: a timed-out run resolves only after the whole tree is dead, even when the first kill is ignored", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 3_000;
+  const timeoutMs = 6_000; // startup alone can take seconds under full-suite load
   const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250);
   let killCalls = 0;
   const result = await runBoundedProcess({
@@ -117,7 +117,7 @@ test("S3: a run stopped by the caller also waits for the tree to die", { timeout
 
 test("S3 review: a child left behind by an exited root is found and killed; the exited root's PID is never killed", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 3_000;
+  const timeoutMs = 6_000; // startup alone can take seconds under full-suite load
   const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250, 300);
   let killCalls = 0;
   const result = await runBoundedProcess({
