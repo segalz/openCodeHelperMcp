@@ -9,6 +9,7 @@ const MAX_FILES = 3_000;
 const MAX_BYTES = 512 * 1024;
 const TIME_BUDGET_MS = 1_500;
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", "out", "vendor", ".git"]);
+const PER_FILE_IO_ERRORS = new Set(["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EBUSY", "ELOOP", "EISDIR"]);
 const BINARY_EXTENSION = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|7z|rar|exe|dll|so|dylib|woff2?|ttf|eot|mp[34]|wav|ogg|wasm|class|pyc|db|sqlite)$/i;
 function trackedFiles(root, signal, optionsSpawn) {
     return new Promise((resolve, reject) => {
@@ -192,9 +193,11 @@ async function buildRegexMap(root, options = {}) {
                 entries.push({ base: `${file} (${lines.length} lines):`, symbols: symbols.length ? " " + symbols.join(", ") : "" });
             }
             catch (error) {
-                // The overall scan budget is a normal partial-result boundary. Other I/O errors omit the map.
+                // The overall scan budget is a normal partial-result boundary. Per-file I/O errors skip that file.
                 if (controller.signal.aborted && !options.signal?.aborted && entries.length > 0)
                     break;
+                if (!options.signal?.aborted && !controller.signal.aborted && PER_FILE_IO_ERRORS.has(error?.code))
+                    continue;
                 throw error;
             }
         }

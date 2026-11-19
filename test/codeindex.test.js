@@ -74,7 +74,7 @@ test("every optional CLI failure silently retains the regex map", async t => {
     ["invalid anchors", `console.log(JSON.stringify(${JSON.stringify({ ...envelope("bad"), anchors: [{ text: "x", kind: "identifier", matched: [] }] })}))`],
     ["extra properties", `console.log(JSON.stringify(${JSON.stringify({ ...envelope("bad"), extra: true })}))`],
     ["oversize stdout", "process.stdout.write('x'.repeat(65537))"],
-    ["over contract budget", `console.log(JSON.stringify(${JSON.stringify(envelope("x".repeat(6000)))}))`],
+    ["over contract budget", `console.log(JSON.stringify(${JSON.stringify(envelope("x".repeat(6001)))}))`],
   ];
   for (const [name, script] of invalid) await t.test(name, async t => {
     const f = await fixture(t, script);

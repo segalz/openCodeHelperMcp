@@ -101,9 +101,8 @@ export async function tryCodeindexMap(root, {
     if (remaining <= 0) return undefined;
     const stdout = await capture(process.execPath, [cli, "map", "--root", root, "--json",
       "--budget", String(budget), "--deadline-ms", String(remaining)], { ...options, env, input: prompt });
-    if (stdout.length > budget) return undefined;
     const reply = mapReply.safeParse(JSON.parse(stdout));
-    return reply.success ? reply.data.map : undefined;
+    return reply.success && reply.data.map.length <= budget ? reply.data.map : undefined;
   } catch {
     signal?.throwIfAborted();
     return undefined;
