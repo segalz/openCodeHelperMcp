@@ -1,7 +1,7 @@
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createModelCatalog, createOpenCodeRunner, registerAnalysisTools, resolvePathWithinAllowedRoots } from "./core.js";
+import { createModelCatalog, createOpenCodeRunner, registerAnalysisTools, resolvePathWithinAllowedRoots, shutdownAnalysis } from "./core.js";
 import { registerEditTools, shutdownEdits } from "./edits.js";
 import { shutdownJobObjects } from "./jobobject.js";
 
@@ -29,7 +29,10 @@ let shuttingDown = false;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
-  await shutdownEdits(120_000).catch(() => {});
+  await Promise.allSettled([
+    shutdownEdits(120_000).catch(() => {}),
+    shutdownAnalysis(30_000).catch(() => {}),
+  ]);
   shutdownJobObjects();
   process.exit(0);
 };

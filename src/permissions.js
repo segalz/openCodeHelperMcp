@@ -35,7 +35,7 @@ export function permissionEnvironment(env, mode = "analysis", ignoredPaths = [],
     const subfolder = within && !within.startsWith("..") && !path.isAbsolute(within) ? within + "/" : "";
     for (const raw of ignoredPaths) {
       const file = raw.replaceAll("\\", "/");
-      if (/[\x00-\x1f*?\[\]{}]/.test(file) || file.startsWith("/") || file.split("/").includes("..")) throw new Error("Unsupported ignored permission path.");
+      if (/[\x00-\x1f*?]/.test(file) || file.startsWith("/") || file.split("/").includes("..")) throw new Error("Unsupported ignored permission path.");
       const keys = [file, ...(directory ? [directory.replaceAll("\\", "/").replace(/\/$/, "") + "/" + file] : [])];
       if (subfolder && file.startsWith(subfolder) && file.length > subfolder.length) keys.push(file.slice(subfolder.length));
       for (const key of keys) {

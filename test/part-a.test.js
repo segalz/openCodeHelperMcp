@@ -18,6 +18,7 @@ const text = (id, value, messageID = "msg_answer") => ({ type: "text", sessionID
 const json = events => events.map(e => JSON.stringify(e)).join("\n") + "\n";
 function child() {
   const c = new EventEmitter(); c.pid = 42;
+  c.stdinText = ""; c.stdin = { on() {}, write(chunk) { c.stdinText += String(chunk); }, end() {} };
   c.stdout = new EventEmitter(); c.stderr = new EventEmitter();
   c.stdout.setEncoding = c.stderr.setEncoding = () => {};
   c.stderr.resume = () => {};
@@ -26,7 +27,7 @@ function child() {
 }
 function scripted(events, { code = 0, calls = [] } = {}) {
   return (executable, args, options) => {
-    calls.push({ executable, args, options }); const c = child();
+    const c = child(); calls.push({ executable, args, options, child: c });
     setImmediate(() => { for (const chunk of events) c.stdout.emit("data", chunk); c.emit("close", code); }); return c;
   };
 }
@@ -150,13 +151,13 @@ test("runner passes plan/permission profiles and optional bounded context, never
   const calls = []; let maps = 0;
   const runner = createOpenCodeRunner({ env: {}, platform: "win32", spawnImpl: scripted([json([text("a", "answer")])], { calls }), codeMapBuilder: async (_root, options) => { maps++; assert.ok(options.commandLineLength("map") < 31000); return "## Code map\nsrc/main.js (1 lines): main:1"; } });
   await runner({ directory: "C:\\sample", prompt: "q", model: "m/a" });
-  assert.equal(maps, 1); assert.match(calls[0].args.at(-1), /OS Windows/); assert.match(calls[0].args.at(-1), /glob\/list/); assert.match(calls[0].args.at(-1), /Code map/);
+  assert.equal(maps, 1); assert.match(calls[0].child.stdinText, /OS Windows/); assert.match(calls[0].child.stdinText, /glob\/list/); assert.match(calls[0].child.stdinText, /Code map/);
   assert.equal(calls[0].args.includes("--auto"), false); assert.equal(calls[0].args[calls[0].args.indexOf("--agent") + 1], "plan");
   assert.equal(JSON.parse(calls[0].options.env.OPENCODE_PERMISSION).edit, "deny");
   await runner({ directory: "C:\\sample", prompt: "q", model: "m/a", codeMap: false }); assert.equal(maps, 1);
   const oversized = createOpenCodeRunner({ env: {}, platform: "win32", spawnImpl: scripted([json([text("a", "answer")])], { calls }), codeMapBuilder: async () => "x".repeat(40000) });
-  await oversized({ directory: "C:\\sample", prompt: "q", model: "m/a" }); assert.ok(windowsCommandLineLength("opencode", calls.at(-1).args) < 31000);
-  const failure = await oversized({ directory: "C:\\sample", prompt: "x".repeat(40000), model: "m/a" }); assert.equal(failure.localFailure, true);
+  await oversized({ directory: "C:\\sample", prompt: "q", model: "m/a" }); assert.ok(windowsCommandLineLength("opencode", calls.at(-1).args) < 31000); assert.ok(!calls.at(-1).child.stdinText.includes("x".repeat(100)));
+  const failure = await oversized({ directory: "C:\\sample\\" + "x".repeat(40000), prompt: "q", model: "m/a" }); assert.equal(failure.localFailure, true);
 });
 
 test("code map uses current files, excludes secrets/vendor/binary, clamps and tolerates non-Git paths", async () => {

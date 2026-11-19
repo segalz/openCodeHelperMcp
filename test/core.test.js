@@ -47,6 +47,8 @@ function fakeChild({ pid = 1234 } = {}) {
   stderr.setEncoding = () => {};
   const child = new EventEmitter();
   child.pid = pid;
+  child.stdinText = "";
+  child.stdin = { on() {}, write(chunk) { child.stdinText += String(chunk); }, end() {} };
   child.stdout = stdout;
   child.stderr = stderr;
   child.kill = () => child.emit("exit", null);
@@ -56,8 +58,8 @@ function fakeChild({ pid = 1234 } = {}) {
 /** spawn mock that answers each call from a script: (executable, args) => { stdout, stderr, code } */
 function scriptedSpawn(script, calls = []) {
   return (executable, args, options) => {
-    calls.push({ executable, args, options });
     const child = fakeChild();
+    calls.push({ executable, args, options, child });
     const reply = script(executable, args) ?? {};
     setImmediate(() => {
       if (reply.stdout) child.stdout.emit("data", reply.stdout);
@@ -282,10 +284,10 @@ test("OpenCode runner launches the executable read-only with the model's variant
   const runner = createOpenCodeRunner({ spawnImpl: scriptedSpawn(() => ({ stdout: '{"type":"text","text":"draft"}\n{"type":"text","text":"final analysis"}\n' }), calls), env: { OPENCODE_BIN: "C:\\tools\\opencode.exe" }, platform: "win32", graceMs: 1 });
   const result = await runner({ directory, prompt: "inspect", model: "opencode/glm-5.3-flash-free", variant: "low" });
   assert.equal(result.text, "final analysis");
-  const { executable, args, options } = calls[0];
+  const { executable, args, options, child } = calls[0];
   assert.equal(executable, "C:\\tools\\opencode.exe");
   assert.deepEqual(args.slice(0, 10), ["run", "--dir", directory, "--model", "opencode/glm-5.3-flash-free", "--variant", "low", "--agent", "plan", "--format", "json"].slice(0, 10));
-  assert.match(args.at(-1), /Do not create, edit, delete/);
+  assert.match(child.stdinText, /Do not create, edit, delete/);
   assert.equal(options.shell, false);
 
   const noVariant = [];

@@ -168,6 +168,7 @@ function childEnv(env, execPath) {
   return {
     ...env,
     NO_COLOR: "1",
+    GIT_OPTIONAL_LOCKS: "0",
     PATH: [path.join(env.APPDATA ?? "", "npm"), path.dirname(execPath), env.PATH ?? ""].filter(Boolean).join(path.delimiter),
   };
 }
@@ -179,20 +180,21 @@ function childEnv(env, execPath) {
 export async function runBoundedProcess({
   executable, args, cwd, env, timeoutMs, maxStdoutBytes = OPENCODE_MAX_STDOUT_BYTES, maxStderrBytes = OPENCODE_MAX_STDERR_BYTES,
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, terminate, graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
-  onStdout, onStderr, collectStdout = true, signal,
+  onStdout, onStderr, collectStdout = true, signal, input,
 }) {
   const started = nowImpl();
   const prepareStarted = performance.now();
   const useJob = process.platform === "win32" && spawnImpl === defaultSpawn;
   const job = useJob ? await createWindowsJob(timeoutMs, signal) : undefined;
   const setupMs = useJob ? performance.now() - prepareStarted : 0;
+  const hasInput = typeof input === "string";
   return new Promise((resolve) => {
     if (signal?.aborted) { resolve({ exitCode: null, stdout: "", stderr: "", stoppedReason: "cancelled", elapsedMs: 0 }); return; }
     let child;
     let rootStartedMs = Date.now();
     try {
       rootStartedMs = Date.now();
-      child = spawnImpl(executable, args, { cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", env });
+      child = spawnImpl(executable, args, { cwd, shell: false, windowsHide: true, stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"], detached: process.platform !== "win32", env });
     } catch (error) {
       resolve({ exitCode: null, stdout: "", stderr: "", timedOut: false, overflowed: false, spawnError: error?.code ?? error?.message ?? "spawn failed", elapsedMs: nowImpl() - started });
       return;
@@ -214,7 +216,7 @@ export async function runBoundedProcess({
       clearTimeoutImpl(graceTimer);
       signal?.removeEventListener("abort", abort);
       if (stoppedReason || reaping) {
-        child.stdout.destroy?.(); child.stderr.destroy?.(); child.unref?.();
+        child.stdin?.destroy?.(); child.stdout.destroy?.(); child.stderr.destroy?.(); child.unref?.();
       }
       resolve({
         exitCode, stdout, stderr, timedOut, overflowed, spawnError, stoppedReason,
@@ -288,7 +290,14 @@ export async function runBoundedProcess({
     });
     child.on("close", (code) => { exitCode = code; finish(); });
     signal?.addEventListener("abort", abort, { once: true });
+    if (hasInput && child.stdin) child.stdin.on?.("error", () => {});
     if (signal?.aborted) abort();
+    else if (hasInput && child.stdin) {
+      try {
+        if (typeof child.stdin.write === "function") child.stdin.write(input);
+        child.stdin.end?.();
+      } catch { /* EPIPE/EOF handled */ }
+    }
   }).finally(() => job?.close());
 }
 
@@ -345,6 +354,24 @@ export function buildEditPrompt(prompt, { directory, platform, map } = {}) {
     ...(map ? [map] : []), "Return a concise English Markdown summary of changed files, checks and unresolved questions. Do not claim checks were run by you.", "User objective:", prompt].join("\n");
 }
 
+/** Runner calls in flight: shutdown aborts them and waits for each to settle. */
+const activeRunnerCalls = new Set();
+let analysisShutDown = false;
+
+/** Abort every in-flight OpenCode runner call and wait for each to settle. */
+export async function shutdownAnalysis(waitMs = 30_000) {
+  analysisShutDown = true;
+  const calls = [...activeRunnerCalls];
+  for (const call of calls) call.controller.abort();
+  if (calls.length === 0) return;
+  let timer;
+  await Promise.race([
+    Promise.allSettled(calls.map((call) => call.done)),
+    new Promise((resolve) => { timer = setTimeout(resolve, waitMs); timer.unref?.(); }),
+  ]);
+  clearTimeout(timer);
+}
+
 /**
  * runner({ directory, prompt, model, variant?, timeoutMs, maxWords, raw? })
  *   -> { text, elapsedMs, warning? } | { error, status: "failed"|"timeout", elapsedMs }
@@ -358,85 +385,103 @@ export function createOpenCodeRunner({
   const terminate = killProcessTreeImpl ?? ((child) => defaultKillProcessTree(child, { platform, spawnImpl }));
   return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false, codeMap = true, guard, guardState, mode = "analysis", sessionID, signal, ignoredPaths = [], checkoutRoot }) => {
     const started = nowImpl();
-    const executable = resolveOpenCodeExecutable({ env, platform });
-    let effectiveEnv, detector;
+    if (analysisShutDown) {
+      return { status: "failed", localFailure: true, cancelled: true, codeMapSource: "none", error: "OpenCode run cancelled.", elapsedMs: nowImpl() - started };
+    }
+    const runController = new AbortController();
+    const onCallerAbort = () => runController.abort(signal.reason);
+    if (signal?.aborted) runController.abort(signal.reason);
+    else signal?.addEventListener("abort", onCallerAbort, { once: true });
+    const runSignal = runController.signal;
+    let resolveDone;
+    const entry = { controller: runController, done: new Promise((resolve) => { resolveDone = resolve; }) };
+    activeRunnerCalls.add(entry);
     try {
-      if (!["analysis", "edits"].includes(mode)) throw new Error("Unknown runner mode.");
-      if (sessionID !== undefined && !/^[A-Za-z0-9_-]{1,200}$/.test(sessionID)) throw new Error("Invalid continuation session ID.");
-      effectiveEnv = permissionEnvironment(childEnv(env, execPath), mode, ignoredPaths, checkoutRoot ?? directory, directory); detector = guardState ?? createGuard(guard);
-    }
-    catch (error) { return { status: "failed", localFailure: true, error: redactSecrets(error.message), elapsedMs: nowImpl() - started }; }
-    const effectiveTimeoutMs = Math.min(MAX_BUDGET_MS, validTimeout(requestTimeoutMs, validTimeout(timeoutMs, DEFAULT_ATTEMPT_TIMEOUT_MS)));
-    const args = ["run", "--dir", directory, "--model", model];
-    if (variant) args.push("--variant", variant);
-    // Error-level logs on stderr are the only place OpenCode reports a provider quota while it keeps retrying.
-    args.push("--agent", mode === "edits" ? "build" : "plan", "--format", "json", "--print-logs", "--log-level", "ERROR");
-    if (sessionID) args.push("--session", sessionID);
-    const render = map => mode === "edits" ? buildEditPrompt(prompt, { directory, platform, map }) : raw ? [...READ_ONLY_RULES, prompt].join("\n") : buildAnalysisPrompt(prompt, maxWords, { directory, platform, map });
-    const commandLength = map => windowsCommandLineLength(executable, [...args, render(map)]);
-    let map, codeMapSource = "none";
-    const cancelled = () => ({ status: "failed", localFailure: true, codeMapSource: "none", error: "OpenCode preparation cancelled.", elapsedMs: nowImpl() - started });
-    if (signal?.aborted) return cancelled();
-    if (!raw && codeMap && (codeMapBuilder !== buildCodeMap || existsSync(directory))) {
+      const executable = resolveOpenCodeExecutable({ env, platform });
+      let effectiveEnv, detector;
       try {
-        map = await codeMapBuilder(directory, { prompt, spawnImpl, signal, env,
-          timeBudgetMs: Math.max(0, effectiveTimeoutMs - (nowImpl() - started)), commandLineLength: commandLength,
-          onSource: source => { codeMapSource = source; } });
-      } catch { if (signal?.aborted) return cancelled(); /* optional context */ }
+        if (!["analysis", "edits"].includes(mode)) throw new Error("Unknown runner mode.");
+        if (sessionID !== undefined && !/^[A-Za-z0-9_-]{1,200}$/.test(sessionID)) throw new Error("Invalid continuation session ID.");
+        effectiveEnv = permissionEnvironment(childEnv(env, execPath), mode, ignoredPaths, checkoutRoot ?? directory, directory); detector = guardState ?? createGuard(guard);
+      }
+      catch (error) { return { status: "failed", localFailure: true, error: redactSecrets(error.message), elapsedMs: nowImpl() - started }; }
+      const effectiveTimeoutMs = Math.min(MAX_BUDGET_MS, validTimeout(requestTimeoutMs, validTimeout(timeoutMs, DEFAULT_ATTEMPT_TIMEOUT_MS)));
+      const args = ["run", "--dir", directory, "--model", model];
+      if (variant) args.push("--variant", variant);
+      // Error-level logs on stderr are the only place OpenCode reports a provider quota while it keeps retrying.
+      args.push("--agent", mode === "edits" ? "build" : "plan", "--format", "json", "--print-logs", "--log-level", "ERROR");
+      if (sessionID) args.push("--session", sessionID);
+      const render = map => mode === "edits" ? buildEditPrompt(prompt, { directory, platform, map }) : raw ? [...READ_ONLY_RULES, prompt].join("\n") : buildAnalysisPrompt(prompt, maxWords, { directory, platform, map });
+      const argsCommandLength = () => windowsCommandLineLength(executable, args);
+      let map, codeMapSource = "none";
+      const cancelled = () => ({ status: "failed", localFailure: true, cancelled: true, codeMapSource: "none", error: "OpenCode preparation cancelled.", elapsedMs: nowImpl() - started });
+      if (runSignal.aborted) return cancelled();
+      if (!raw && codeMap && (codeMapBuilder !== buildCodeMap || existsSync(directory))) {
+        try {
+          map = await codeMapBuilder(directory, { prompt, spawnImpl, signal: runSignal, env,
+            timeBudgetMs: Math.max(0, effectiveTimeoutMs - (nowImpl() - started)), commandLineLength: argsCommandLength,
+            onSource: source => { codeMapSource = source; } });
+        } catch { if (runSignal.aborted) return cancelled(); /* optional context */ }
+      }
+      if (analysisShutDown || runSignal.aborted) return cancelled();
+      // Clamp even injected map builders; optional context must never break launch.
+      if (map && map.length > 6000) map = undefined;
+      codeMapSource = map ? (codeMapSource === "codeindex" ? "codeindex" : "regex") : "none";
+      if (platform === "win32" && argsCommandLength() > WINDOWS_COMMAND_LINE_LIMIT - 1000) return { status: "failed", localFailure: true, codeMapSource: "none", error: "OpenCode arguments exceed the Windows command-line limit.", elapsedMs: nowImpl() - started };
+      const input = render(map);
+      const remaining = effectiveTimeoutMs - (nowImpl() - started);
+      if (remaining <= 0) return { status: "timeout", codeMapSource: "none", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
+      let verdict, streamFatal, quotaError, stderrLine = "";
+      const parser = createEventStream({
+        onEvent: event => {
+          const observed = detector.observe(event);
+          if (observed) verdict = observed;
+          if (!verdict) return true;
+          return verdict.kind === "loop_detected" ? "usage_only" : false;
+        },
+        onFatal: detail => { streamFatal = detail; },
+      });
+      const result = await runBoundedProcess({ executable, args, cwd: directory, env: effectiveEnv, timeoutMs: remaining, input,
+        spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl, collectStdout: false, signal: runSignal,
+        onStdout: chunk => { parser.write(chunk); return verdict?.kind ?? (streamFatal ? "event_error" : undefined); },
+        onStderr: chunk => {
+          const lines = (stderrLine + chunk).split(/\r?\n/);
+          stderrLine = lines.pop().slice(-8192);
+          for (const line of lines) quotaError ??= providerLimitError(line);
+          return quotaError ? "provider_limit" : undefined;
+        },
+      });
+      quotaError ??= providerLimitError(stderrLine);
+      const parsed = parser.end(), elapsedMs = nowImpl() - started;
+      const metrics = {
+        elapsedMs, codeMapSource, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported,
+        guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)),
+        ...(result.killConfirmed === false ? { killConfirmed: false, stillAlive: result.stillAlive, ...(result.killUnverified ? { killUnverified: true } : {}) } : {}),
+      };
+      if (runSignal.aborted) return { ...metrics, status: "failed", cancelled: true, error: "OpenCode run cancelled." };
+      if (sessionID && parsed.sessionID && parsed.sessionID !== sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation session mismatch." };
+      if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
+      if (quotaError) return { ...metrics, status: "failed", quota: true, limitKind: quotaError.kind, error: `OpenCode quota or rate limit: ${quotaError.message}` };
+      const isEdits = mode === "edits";
+      const textUsable = Boolean(parsed.text && (isEdits || parsed.textIsFinal));
+      // The model finished its answer (last step ended with "stop") but the process did not exit in time:
+      // keep the answer instead of discarding a completed analysis.
+      if (result.timedOut && !result.spawnError && !result.overflowed && textUsable && parsed.finalStop) {
+        return { ...metrics, text: parsed.text, warning: "OpenCode timed out after its final answer; the answer is kept." };
+      }
+      if (result.spawnError || result.timedOut || result.overflowed) return { ...metrics, ...describeProcessFailure(result) };
+      const analysisNarration = !isEdits && Boolean(parsed.text && !parsed.textIsFinal);
+      if (result.exitCode !== 0 || parsed.error || result.stoppedReason || analysisNarration) {
+        const ndjsonError = analysisNarration ? (parsed.detail ?? "OpenCode returned no valid analysis.") : (parsed.detail ?? parsed.error ?? result.stoppedReason);
+        return { ...metrics, ...describeProcessFailure(result, { ndjsonError }), ...(result.stoppedReason === "cancelled" ? { cancelled: true } : {}) };
+      }
+      if (sessionID && !parsed.sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation did not report a session ID." };
+      return { ...metrics, text: parsed.text };
+    } finally {
+      signal?.removeEventListener("abort", onCallerAbort);
+      activeRunnerCalls.delete(entry);
+      resolveDone();
     }
-    if (signal?.aborted) return cancelled();
-    // Clamp even injected map builders; optional context must never break launch.
-    if (map && (map.length > 6000 || commandLength(map) > WINDOWS_COMMAND_LINE_LIMIT - 1000)) map = undefined;
-    codeMapSource = map ? (codeMapSource === "codeindex" ? "codeindex" : "regex") : "none";
-    if (platform === "win32" && commandLength(map) > WINDOWS_COMMAND_LINE_LIMIT - 1000) return { status: "failed", localFailure: true, codeMapSource: "none", error: "Analysis prompt exceeds the Windows command-line limit.", elapsedMs: nowImpl() - started };
-    args.push(render(map));
-    const remaining = effectiveTimeoutMs - (nowImpl() - started);
-    if (remaining <= 0) return { status: "timeout", codeMapSource: "none", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
-    let verdict, streamFatal, quotaError, stderrLine = "";
-    const parser = createEventStream({
-      onEvent: event => {
-        const observed = detector.observe(event);
-        if (observed) verdict = observed;
-        if (!verdict) return true;
-        return verdict.kind === "loop_detected" ? "usage_only" : false;
-      },
-      onFatal: detail => { streamFatal = detail; },
-    });
-    const result = await runBoundedProcess({ executable, args, cwd: directory, env: effectiveEnv, timeoutMs: remaining,
-      spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl, collectStdout: false, signal,
-      onStdout: chunk => { parser.write(chunk); return verdict?.kind ?? (streamFatal ? "event_error" : undefined); },
-      onStderr: chunk => {
-        const lines = (stderrLine + chunk).split(/\r?\n/);
-        stderrLine = lines.pop().slice(-8192);
-        for (const line of lines) quotaError ??= providerLimitError(line);
-        return quotaError ? "provider_limit" : undefined;
-      },
-    });
-    quotaError ??= providerLimitError(stderrLine);
-    const parsed = parser.end(), elapsedMs = nowImpl() - started;
-    const metrics = {
-      elapsedMs, codeMapSource, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported,
-      guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)),
-      ...(result.killConfirmed === false ? { killConfirmed: false, stillAlive: result.stillAlive, ...(result.killUnverified ? { killUnverified: true } : {}) } : {}),
-    };
-    if (sessionID && parsed.sessionID && parsed.sessionID !== sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation session mismatch." };
-    if (verdict) return { ...metrics, status: "failed", error: verdict.kind, guard: verdict };
-    if (quotaError) return { ...metrics, status: "failed", quota: true, limitKind: quotaError.kind, error: `OpenCode quota or rate limit: ${quotaError.message}` };
-    const isEdits = mode === "edits";
-    const textUsable = Boolean(parsed.text && (isEdits || parsed.textIsFinal));
-    // The model finished its answer (last step ended with "stop") but the process did not exit in time:
-    // keep the answer instead of discarding a completed analysis.
-    if (result.timedOut && !result.spawnError && !result.overflowed && textUsable && parsed.finalStop) {
-      return { ...metrics, text: parsed.text, warning: "OpenCode timed out after its final answer; the answer is kept." };
-    }
-    if (result.spawnError || result.timedOut || result.overflowed) return { ...metrics, ...describeProcessFailure(result) };
-    const analysisNarration = !isEdits && Boolean(parsed.text && !parsed.textIsFinal);
-    if (result.exitCode !== 0 || parsed.error || result.stoppedReason || analysisNarration) {
-      const ndjsonError = analysisNarration ? (parsed.detail ?? "OpenCode returned no valid analysis.") : (parsed.detail ?? parsed.error ?? result.stoppedReason);
-      return { ...metrics, ...describeProcessFailure(result, { ndjsonError }) };
-    }
-    if (sessionID && !parsed.sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation did not report a session ID." };
-    return { ...metrics, text: parsed.text };
   };
 }
 
@@ -765,7 +810,7 @@ export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runne
       || snapshot.budgetInputTokens >= guardLimits.maxInputTokens
       || (Number.isFinite(result?.guard?.totalToolCalls) && result.guard.totalToolCalls >= guardLimits.maxToolCalls)
       || (Number.isFinite(result?.guard?.budgetInputTokens) && result.guard.budgetInputTokens >= guardLimits.maxInputTokens);
-    if (signal?.aborted) {
+    if (signal?.aborted || result?.cancelled) {
       const error = "OpenCode analysis cancelled.";
       attempts.push({ model: model.id, status: "failed", elapsedMs, timeoutMs, reason: error });
       return { error, message: error, cancelled: true, ...killFields, attempts, budgetMs: budget, guard: result?.guard ?? snapshot, usage, sessionID, codeMapSource };

@@ -159,15 +159,16 @@ test("verification resolves literal Node commands, redacts tails and refuses Win
 test("runner launches build with explicit edits permissions and --session, never auto/fork", async () => {
   const calls = [];
   const spawnImpl = (exe, args, options) => {
-    calls.push({ args, options }); const c = new EventEmitter(); c.pid = 42; c.stdout = new EventEmitter(); c.stderr = new EventEmitter(); c.stdout.setEncoding = c.stderr.setEncoding = () => {};
+    const c = new EventEmitter(); c.pid = 42; c.stdinText = ""; c.stdin = { on() {}, write(chunk) { c.stdinText += String(chunk); }, end() {} }; c.stdout = new EventEmitter(); c.stderr = new EventEmitter(); c.stdout.setEncoding = c.stderr.setEncoding = () => {};
+    calls.push({ args, options, child: c });
     setImmediate(() => { c.stdout.emit("data", JSON.stringify({ type: "text", sessionID: "ses_fixture", part: { type: "text", id: "p", messageID: "m", text: "fixed" } }) + "\n"); c.emit("close", 0); }); return c;
   };
   const runner = createOpenCodeRunner({ env: {}, spawnImpl });
   const out = await runner({ directory: "C:\\fake", prompt: "repair", model: "m/a", mode: "edits", sessionID: "ses_fixture", codeMap: false, ignoredPaths: ["cache/", "ignored.txt"] });
-  assert.equal(out.text, "fixed"); const { args, options } = calls[0]; assert.equal(args[args.indexOf("--agent") + 1], "build"); assert.equal(args[args.indexOf("--session") + 1], "ses_fixture");
+  assert.equal(out.text, "fixed"); const { args, options, child } = calls[0]; assert.equal(args[args.indexOf("--agent") + 1], "build"); assert.equal(args[args.indexOf("--session") + 1], "ses_fixture");
   for (const flag of ["--auto", "--continue", "--fork"]) assert.equal(args.includes(flag), false);
   const permissions = JSON.parse(options.env.OPENCODE_PERMISSION); assert.equal(permissions.edit["*"], "allow"); assert.equal(permissions.edit["ignored.txt"], "deny");
-  for (const key of ["bash", "task", "webfetch", "websearch"]) assert.equal(permissions[key], "deny"); assert.doesNotMatch(args.at(-1), /edits.*unavailable in analysis/);
+  for (const key of ["bash", "task", "webfetch", "websearch"]) assert.equal(permissions[key], "deny"); assert.doesNotMatch(child.stdinText, /edits.*unavailable in analysis/);
 });
 
 test("MCP edits return structured verification and validate explicit model without fallback", async t => {
@@ -198,8 +199,9 @@ test("structural map rebuilds at the checkout root for initial edits and repairs
   const runner = createOpenCodeRunner({ env: { ...process.env, CODEINDEX_CLI: cli }, spawnImpl: (exe, args, options) => {
     if (exe === process.execPath) launches.push({ args, options });
     if (args[0] !== "run") return spawn(exe, args, options);
-    prompts.push(args.at(-1));
+    const index = prompts.push("") - 1;
     const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    child.stdin = { on() {}, write(chunk) { prompts[index] += String(chunk); }, end() {} };
     child.stdout.setEncoding = child.stderr.setEncoding = () => {};
     setImmediate(async () => {
       await writeFile(path.join(f.root, "main.js"), "partial");
