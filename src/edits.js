@@ -26,7 +26,7 @@ export const editsInputSchema = Object.freeze({
   maxFixRuns: z.number().int().min(0).max(2).optional().describe("Automatic repairs after a failed check, default 2; same session and cumulative budgets."),
   keepOnFailure: z.boolean().optional().describe("Default false: restore pre-run bytes on failure. True keeps failed edits explicitly unverified."),
   codeMap: analysisInputSchema.codeMap,
-  guard: analysisInputSchema.guard,
+  guard: guardSchema.optional().describe("Cumulative loop, tool-call, and input-token budgets across the edit and its repairs; any trip stops the edit without repair or fallback."),
   budgetMs: analysisInputSchema.budgetMs,
 });
 const inputSchema = z.object(editsInputSchema).strict().refine(input => Buffer.byteLength(JSON.stringify(input), "utf8") <= 64 * 1024, "Edit input exceeds 64 KiB.");
@@ -185,7 +185,7 @@ export async function runEdits(rawInput, {
       if (run && !sessionID) throw failure("session_unavailable", "Cannot repair: OpenCode did not return a continuation session ID.");
       if (guardState.snapshot().kind) throw failure(guardState.snapshot().kind, "Guard stopped edits; no repair launch is allowed.");
       const counters = guardState.snapshot();
-      if (counters.totalToolCalls >= limits.maxToolCalls || counters.totalInputTokens >= limits.maxInputTokens) {
+      if (counters.totalToolCalls >= limits.maxToolCalls || counters.budgetInputTokens >= limits.maxInputTokens) {
         result.guard = { ...counters, kind: "budget_exceeded" };
         throw failure("budget_exceeded", "Cumulative edit guard budget exhausted before launch.");
       }

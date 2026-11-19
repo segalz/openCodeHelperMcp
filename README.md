@@ -77,7 +77,7 @@ The prompt includes the actual cwd and OS, working rules, and an optional code m
 
 When IDs are supplied, every ID must be in the current free catalog; models are attempted in the supplied order, at most once each, stopping at the first successful answer. Without IDs, automatic selection makes at most four attempts. It prefers `opencode/deepseek-v4.1-flash-free`, `opencode/glm-5.3-flash-free` and `opencode/mimo-v2.6-flash-free` when listed, then sorts other models by recent probe success, latency, provider and ID. Recent failed/timed-out probes are filtered out; if that removes every candidate, listed preferred models are tried again despite their probe failures.
 
-Ordinary run failures can advance to the next model. OpenCode runs with error-level logs on stderr. An exhausted quota ("Free usage limit reached", `insufficient_quota`) or rate-limit retries that OpenCode itself gave up on end the attempt at once, with `quota: true` and the provider's message, instead of waiting for the timeout. The same applies to a request larger than the provider tier allows per minute. Attempts and edit results carry `limitKind` (`quota`, `rate_limit` or `request_too_large`). A single 429 is left to OpenCode's own retry. Pass fallback IDs in `models` so such a failure moves to another provider. A guard trip or local preparation refusal stops the chain immediately. Fatal CLI events, nonzero exits, timeouts and output overflows cannot succeed on partial answer text. A recovered tool error can remain in the guard's diagnostic history without making the final answer fail. A `low` model variant is used only when the catalog advertises it.
+Ordinary run failures can advance to the next model. OpenCode runs with error-level logs on stderr. An exhausted quota ("Free usage limit reached", `insufficient_quota`) or rate-limit retries that OpenCode itself gave up on end the attempt at once, with `quota: true` and the provider's message, instead of waiting for the timeout. The same applies to a request larger than the provider tier allows per minute. Attempts and edit results carry `limitKind` (`quota`, `rate_limit` or `request_too_large`). A single 429 is left to OpenCode's own retry. Pass fallback IDs in `models` so such a failure moves to another provider. A loop trip (`loop_detected`) moves to the next model with a fresh loop window; the tool-call and input-token budgets stay shared. A budget trip, a stopped process that could not be confirmed dead, or a local preparation refusal stops the chain immediately. Known limit: after a loop trip the process is stopped at once, so token records OpenCode writes after that point are not counted; the input-token count can be low, and a fallback model can then exceed the real input budget. Fatal CLI events, nonzero exits, timeouts and output overflows cannot succeed on partial answer text. A recovered tool error can remain in the guard's diagnostic history without making the final answer fail. Real runs use each model's default reasoning variant; health probes use `low` when the catalog advertises it, to stay cheap.
 
 Typical call to `analyze_code` (replace the directory and sample model with your project and a current catalog ID):
 
@@ -171,8 +171,8 @@ verification: {
 }
 usage: {inputTokens, uncachedInputTokens, cacheReadTokens, cacheWriteTokens,
         outputTokens, reasoningTokens, cost, steps}
-guard: {window, totalToolCalls, totalInputTokens, lastErrors, filesTouched,
-        observation, kind?, tool?, target?, count?, lastAssistantText?}
+guard: {window, totalToolCalls, totalInputTokens, budgetInputTokens, lastErrors,
+        filesTouched, observation, kind?, tool?, target?, count?, lastAssistantText?}
 evidence: {snapshotDirectory?, identity?, identityError?, restore?,
            recoveryError?, cleanupError?}
 error?, message?
@@ -191,9 +191,9 @@ Both work tools accept a partial `guard` object:
 | `maxToolCalls` | 150 | 10-1,000 |
 | `maxInputTokens` | 1,500,000 | 10,000-20,000,000 |
 
-Repeated failures use tool name plus normalized target: file paths, patch paths, commands, or an input hash. The failure window includes successful and unrelated calls. Trips report `loop_detected` or `budget_exceeded`, counts, recent redacted errors, successfully touched edit paths and the latest observed assistant-text excerpt. A trip terminates the known child process tree and prevents fallback or repair.
+Repeated failures use tool name plus normalized target: file paths, patch paths, commands, or an input hash. The failure window includes successful and unrelated calls. Trips report `loop_detected` or `budget_exceeded`, counts, recent redacted errors, successfully touched edit paths and the latest observed assistant-text excerpt. A trip terminates the known child process tree; in analysis a `loop_detected` trip moves to the next model while a `budget_exceeded` trip stops without fallback, and in edits any trip stops without repair.
 
-Input-token budgets sum uncached input, cache reads and cache writes once per unique reported step. Usage also keeps output, reasoning, cost and step counts separately. These are CLI-reported observations, not estimates of unreported work; missing usage is unknown rather than proof of zero consumption.
+Input-token budgets (`budgetInputTokens`) sum uncached input and cache writes once per unique reported step (falling back to reported `inputTokens` when uncached input is absent); cache reads stay in `totalInputTokens` and `usage.inputTokens` for reporting without spending `maxInputTokens`. Usage also keeps output, reasoning, cost and step counts separately. These are CLI-reported observations, not estimates of unreported work; missing usage is unknown rather than proof of zero consumption.
 
 The guard sees terminal tool results and per-step usage, not tool starts or every generated token. It can overshoot while a tool or model step is active. The wall-clock timeout is separate from those event-driven limits.
 

@@ -109,11 +109,20 @@ test("successful calls occupy the sliding window; token/tool budgets and bash ex
   assert.equal(guardSchema.safeParse({ window: 3, maxRepeatedFailures: 4 }).success, false);
 });
 
-test("streaming guard kills immediately before close; reports trip without fallback", async () => {
+test("streaming guard kills immediately before close; loop trip falls back and reports trip when models are exhausted", async () => {
   const calls = [], killed = [];
-  const runner = createOpenCodeRunner({ env: {}, spawnImpl: scripted([json([tool("1"), tool("2"), tool("3"), text("later", "must not succeed")])], { calls }), killProcessTreeImpl: c => { killed.push(c.pid); c.emit("close", null); } });
+  const spawnImpl = (executable, args, options) => {
+    const index = calls.length;
+    calls.push({ executable, args, options });
+    const c = child();
+    const sid = `ses_test_${index}`;
+    const events = [tool("1"), tool("2"), tool("3"), text("later", "must not succeed")].map(e => ({ ...e, sessionID: sid }));
+    setImmediate(() => { c.stdout.emit("data", json(events)); c.emit("close", 0); });
+    return c;
+  };
+  const runner = createOpenCodeRunner({ env: {}, spawnImpl, killProcessTreeImpl: c => { killed.push(c.pid); c.emit("close", null); } });
   const out = await runAnalysis({ directory: "C:\\sample", prompt: "q", models: [{ id: "m/a" }, { id: "m/b" }], runner });
-  assert.equal(calls.length, 1); assert.deepEqual(killed, [42]); assert.equal(out.guard.kind, "loop_detected"); assert.equal(out.text, undefined);
+  assert.equal(calls.length, 2); assert.deepEqual(killed, [42, 42]); assert.equal(out.guard.kind, "loop_detected"); assert.equal(out.text, undefined);
   assert.doesNotMatch(formatAnalysisResult(out), /Call list_free_models/);
 });
 
@@ -125,7 +134,7 @@ test("guard and usage remain cumulative across distinct model attempts", async (
   };
   const runner = createOpenCodeRunner({ env: {}, spawnImpl, killProcessTreeImpl: c => c.emit("close", null) });
   const out = await runAnalysis({ directory: "C:\\sample", prompt: "q", guard: { maxInputTokens: 10000 }, models: [{ id: "m/a" }, { id: "m/b" }, { id: "m/c" }], runner });
-  assert.equal(calls.length, 2); assert.equal(out.guard.kind, "budget_exceeded"); assert.equal(out.guard.totalInputTokens, 12046); assert.equal(out.usage.inputTokens, 12046);
+  assert.equal(calls.length, 2); assert.equal(out.guard.kind, "budget_exceeded"); assert.equal(out.guard.totalInputTokens, 12046); assert.equal(out.guard.budgetInputTokens, 12006); assert.equal(out.usage.inputTokens, 12046);
 });
 
 test("runner keeps recoverable tool diagnostics but fatal/process errors cannot succeed", async () => {

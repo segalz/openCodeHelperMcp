@@ -86,7 +86,7 @@ function validTimeout(value, fallback) {
 const modelIdSchema = z.string().min(3).max(200).regex(/^[A-Za-z0-9][\w.:@\/-]*$/, "Model ids look like provider/model.");
 
 export const analysisInputSchema = Object.freeze({
-  guard: guardSchema.optional().describe("Cumulative loop/tool/input-token budgets across all attempts; a trip stops without fallback."),
+  guard: guardSchema.optional().describe("Loop and cumulative tool/input-token guard across attempts; a loop trip moves to the next model, while a budget trip stops without fallback."),
   codeMap: z.boolean().optional().describe("Bounded map of current tracked source contents (default true)."),
   directory: z.string().min(1).describe("Absolute workspace path under an allowed root."),
   prompt: z.string().min(1).max(12_000).describe("The focused code-analysis question."),
@@ -374,7 +374,15 @@ export function createOpenCodeRunner({
     const remaining = effectiveTimeoutMs - (nowImpl() - started);
     if (remaining <= 0) return { status: "timeout", codeMapSource: "none", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
     let verdict, streamFatal, quotaError, stderrLine = "";
-    const parser = createEventStream({ onEvent: event => { verdict ??= detector.observe(event); return !verdict; }, onFatal: detail => { streamFatal = detail; } });
+    const parser = createEventStream({
+      onEvent: event => {
+        const observed = detector.observe(event);
+        if (observed) verdict = observed;
+        if (!verdict) return true;
+        return verdict.kind === "loop_detected" ? "usage_only" : false;
+      },
+      onFatal: detail => { streamFatal = detail; },
+    });
     const result = await runBoundedProcess({ executable, args, cwd: directory, env: effectiveEnv, timeoutMs: remaining,
       spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl, collectStdout: false, signal,
       onStdout: chunk => { parser.write(chunk); return verdict?.kind ?? (streamFatal ? "event_error" : undefined); },
@@ -483,8 +491,8 @@ export function isUsableFreeModel(model) {
   return Boolean(model?.free) && model.toolcall !== false && model.status !== "deprecated";
 }
 
-export function variantFor(model) {
-  return Array.isArray(model?.variants) && model.variants.includes(PREFERRED_VARIANT) ? PREFERRED_VARIANT : undefined;
+export function variantFor(model, { purpose } = {}) {
+  return purpose === "probe" && Array.isArray(model?.variants) && model.variants.includes(PREFERRED_VARIANT) ? PREFERRED_VARIANT : undefined;
 }
 
 async function mapWithConcurrency(items, limit, fn) {
@@ -561,7 +569,7 @@ export function createModelCatalog({
     await mapWithConcurrency(targets, probeConcurrency, async (model) => {
       let outcome;
       try {
-        outcome = await runner({ directory: probeDirectory, prompt: PROBE_PROMPT, model: model.id, variant: variantFor(model), timeoutMs: probeTimeoutMs, raw: true });
+        outcome = await runner({ directory: probeDirectory, prompt: PROBE_PROMPT, model: model.id, variant: variantFor(model, { purpose: "probe" }), timeoutMs: probeTimeoutMs, raw: true });
       } catch (error) {
         outcome = { status: "failed", error: redactSecrets(error?.message ?? String(error)) };
       }
@@ -625,7 +633,8 @@ export function allocateAttemptTimeoutMs({ remainingMs, attemptsLeft, attemptCap
 export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runner, models, guard, codeMap = true, signal, deadline: outerDeadline, nowImpl = Date.now, attemptCapMs = DEFAULT_ATTEMPT_TIMEOUT_MS }) {
   const budget = clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, DEFAULT_BUDGET_MS);
   const deadline = outerDeadline ?? nowImpl() + budget;
-  const guardState = createGuard(guard);
+  const guardLimits = guardSchema.parse(guard ?? {});
+  const guardState = createGuard(guardLimits);
   const usage = { inputTokens: 0, uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, cost: 0, steps: 0 };
   let sessionID, codeMapSource = "none";
   const attempts = [];
@@ -650,14 +659,62 @@ export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runne
     if (result?.usage) for (const key of Object.keys(usage)) usage[key] += result.usage[key] ?? 0;
     sessionID = result?.sessionID ?? sessionID;
     codeMapSource = result?.codeMapSource ?? "none";
-    if (signal?.aborted || result?.guard?.kind || guardState.snapshot().kind || result?.localFailure) {
-      const error = signal?.aborted ? "OpenCode analysis cancelled." : result?.error ?? result?.guard?.kind ?? guardState.snapshot().kind ?? "Local preparation failed.";
+    const killFields = result?.killConfirmed === false
+      ? { killConfirmed: false, ...(result.stillAlive ? { stillAlive: result.stillAlive } : {}), ...(result.killUnverified ? { killUnverified: true } : {}) }
+      : {};
+    const snapshot = guardState.snapshot();
+    const tripKind = snapshot.kind === "budget_exceeded" || result?.guard?.kind === "budget_exceeded"
+      ? "budget_exceeded"
+      : (result?.guard?.kind ?? snapshot.kind);
+    const budgetExhausted = snapshot.totalToolCalls >= guardLimits.maxToolCalls
+      || snapshot.budgetInputTokens >= guardLimits.maxInputTokens
+      || (Number.isFinite(result?.guard?.totalToolCalls) && result.guard.totalToolCalls >= guardLimits.maxToolCalls)
+      || (Number.isFinite(result?.guard?.budgetInputTokens) && result.guard.budgetInputTokens >= guardLimits.maxInputTokens);
+    if (signal?.aborted) {
+      const error = "OpenCode analysis cancelled.";
       attempts.push({ model: model.id, status: "failed", elapsedMs, timeoutMs, reason: error });
-      return { error, message: error, attempts, budgetMs: budget, guard: result.guard ?? guardState.snapshot(), usage, sessionID, codeMapSource };
+      return { error, message: error, cancelled: true, ...killFields, attempts, budgetMs: budget, guard: result?.guard ?? snapshot, usage, sessionID, codeMapSource };
+    }
+    if (result?.killConfirmed === false && !result?.text) {
+      const baseError = result?.error ?? tripKind ?? "OpenCode run failed.";
+      const message = `${baseError} A process from the stopped run may still be running; stopped without trying another model.`;
+      attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: message });
+      return { error: result?.error ?? tripKind ?? "process_still_running", message, ...killFields, attempts, budgetMs: budget, guard: result?.guard ?? snapshot, usage, sessionID, codeMapSource };
+    }
+    if (!result?.localFailure && tripKind === "loop_detected" && index + 1 < queue.length) {
+      if (budgetExhausted) {
+        const error = "budget_exceeded";
+        const guardReport = { ...(result?.guard ?? snapshot), kind: "budget_exceeded" };
+        attempts.push({ model: model.id, status: "failed", elapsedMs, timeoutMs, reason: error });
+        return { error, message: error, attempts, budgetMs: budget, guard: guardReport, usage, sessionID, codeMapSource };
+      }
+      const reason = result?.error && /loop_detected/.test(String(result.error))
+        ? result.error
+        : (result?.error ? `loop_detected: ${result.error}` : "loop_detected");
+      attempts.push({ model: model.id, status: "failed", elapsedMs, timeoutMs, reason });
+      guardState.resetLoop();
+      continue;
+    }
+    if (tripKind || result?.localFailure) {
+      const guardReport = tripKind === "budget_exceeded"
+        ? (snapshot.kind === "budget_exceeded" ? snapshot : { ...(result?.guard ?? snapshot), kind: "budget_exceeded" })
+        : (result?.guard ?? snapshot);
+      const error = tripKind === "budget_exceeded"
+        ? "budget_exceeded"
+        : (result?.error ?? tripKind ?? "Local preparation failed.");
+      attempts.push({ model: model.id, status: "failed", elapsedMs, timeoutMs, reason: error });
+      return { error, message: error, attempts, budgetMs: budget, guard: guardReport, usage, sessionID, codeMapSource };
     }
     if (result?.text) {
       attempts.push({ model: model.id, status: "ok", elapsedMs, timeoutMs, reason: result.warning });
-      return { text: result.text, model: model.id, elapsedMs, attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID, codeMapSource };
+      return { text: result.text, model: model.id, elapsedMs, ...killFields, attempts, budgetMs: budget, guard: snapshot, usage, sessionID, codeMapSource };
+    }
+    if (budgetExhausted && index + 1 < queue.length) {
+      const error = "budget_exceeded";
+      const guardReport = { ...snapshot, kind: "budget_exceeded" };
+      attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: result?.error ?? "no answer",
+        ...(result?.limitKind ? { limitKind: result.limitKind } : {}) });
+      return { error, message: error, attempts, budgetMs: budget, guard: guardReport, usage, sessionID, codeMapSource };
     }
     attempts.push({ model: model.id, status: result?.status === "timeout" ? "timeout" : "failed", elapsedMs, timeoutMs, reason: result?.error ?? "no answer",
       ...(result?.limitKind ? { limitKind: result.limitKind } : {}) });
@@ -672,6 +729,8 @@ export function formatAnalysisResult(result) {
   if (result?.guard) lines.push(`- Guard: ${JSON.stringify(result.guard)}`);
   if (result?.usage) lines.push(`- Usage: ${JSON.stringify(result.usage)}`);
   if (result?.sessionID) lines.push(`- Session: ${result.sessionID}`);
+  // Cleanup status is shown with every outcome, also next to a cancel or a finished answer.
+  if (result?.killConfirmed === false) lines.push(`- Cleanup: a process from a stopped run may still be running${result.stillAlive?.length ? ` (PIDs ${result.stillAlive.join(", ")})` : ""}${result.killUnverified ? " (the process list could not be read)" : ""}.`);
   lines.push("- Attempts:");
   const attempts = Array.isArray(result?.attempts) ? result.attempts : [];
   if (attempts.length === 0) lines.push("  - none");
@@ -683,7 +742,11 @@ export function formatAnalysisResult(result) {
   });
   const header = lines.join("\n");
   if (result?.error) {
-    if (result.guard?.kind) return `${header}\n\nStopped by guard: ${result.guard.kind}; no fallback was attempted after the trip.`;
+    const isCancelled = Boolean(result.cancelled) || /^OpenCode (?:analysis|preparation|run) cancelled\b/i.test(String(result.error));
+    if (isCancelled) return `${header}\n\n${redactSecrets(result.message ?? result.error)}`;
+    if (result.killConfirmed === false) return `${header}\n\n${redactSecrets(result.message ?? "A process from the stopped run may still be running; stopped without trying another model.")}`;
+    if (result.guard?.kind === "loop_detected") return `${header}\n\nStopped by guard: loop_detected; a loop trip moves to the next model, and no fallback models remained.`;
+    if (result.guard?.kind) return `${header}\n\nStopped by guard: ${result.guard.kind}; budget trips stop without fallback.`;
     const why = result.message ? `\n\n${redactSecrets(result.message)}` : "";
     return `${header}${why}\n\nAll CodeHelper attempts failed. Call list_free_models with probe=true and pass a working model.`;
   }
@@ -722,7 +785,7 @@ export const ANALYZE_DESCRIPTION = [
   "Read-only code analysis through OpenCode (plan agent, no edits) using FREE models only.",
   "Recommended flow: first call list_free_models (probe=true when unsure which models are healthy right now), then pick the model yourself and pass it as `model`, optionally with an ordered fallback list in `models`.",
   "Both fields are optional: without them the helper auto-orders the currently listed free models (preferring DeepSeek V4.1 Flash, GLM 5.3 Flash, MiMo V2.6 Flash when listed) and skips models that failed a recent probe.",
-  "Explicit read/search permissions, cumulative guard budgets and optional bounded code map; guard trips stop without fallback.",
+  "Explicit read/search permissions, cumulative guard budgets and optional bounded code map; a loop trip moves to the next model, while a budget trip stops without fallback.",
   "Only ids from the current free list are accepted. Each model is called at most once; budgetMs is shared across attempts. The result header lists the model used and every attempt with its status and real (redacted) error.",
 ].join(" ");
 

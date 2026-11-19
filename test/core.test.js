@@ -123,8 +123,9 @@ test("verbose model listing is parsed, keeps no secrets, and filters free models
     "opencode/big-pickle", "opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free",
     "opencode/nemotron-3-ultra-free", "nvidia/z-ai/glm-5.3-flash",
   ]);
-  assert.equal(variantFor(FREE[1]), "low");
-  assert.equal(variantFor(FREE[0]), undefined);
+  assert.equal(variantFor(FREE[1]), undefined);
+  assert.equal(variantFor(FREE[1], { purpose: "probe" }), "low");
+  assert.equal(variantFor(FREE[0], { purpose: "probe" }), undefined);
 });
 
 test("models without cost metadata fall back to the naming rule", () => {
@@ -251,7 +252,7 @@ test("budget is shared across attempts without duplicate calls and never exceede
   // First try gets half the budget, later tries the cap or what is left after their reserve.
   assert.deepEqual(calls.map((c) => c.timeoutMs), [150_000, 120_000, 30_000]);
   assert.ok(calls.every((c) => c.timeoutMs >= Math.min(DEFAULT_ATTEMPT_TIMEOUT_MS, 30_000)));
-  assert.equal(calls[0].variant, "low");
+  assert.equal(calls[0].variant, undefined);
   const text = formatAnalysisResult(result);
   assert.match(text, /1\. opencode\/deepseek-v4\.1-flash-free — timeout/);
   assert.match(text, /All CodeHelper attempts failed/);

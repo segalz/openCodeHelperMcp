@@ -9,12 +9,31 @@ export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxL
   const decoder = new StringDecoder("utf8"), tools = new Set(), steps = new Set();
   let pending = "", sessionID, messageID, legacyText, fatal, eventCount = 0, ended = false, lastStepReason;
   const messages = new Set(), messageOrder = new Map(), toolMessages = new Set();
-  let halted = false;
-  const emit = event => { if (onEvent(event) === false) halted = true; };
+  let mode = "open";
+  // After a loop trip an oversized partial line is dropped up to its newline, so its tail is never parsed.
+  let discarding = false;
+  const emit = event => {
+    const next = onEvent(event);
+    if (next === false) mode = "halted";
+    else if (next === "usage_only" && mode === "open") mode = "usage_only";
+  };
   const texts = new Map(), usage = emptyUsage(), toolErrors = [];
   const fail = detail => { if (!fatal) { fatal = detail; onFatal(detail); } };
   function accept(event) {
-    if (!event || typeof event !== "object" || Array.isArray(event) || fatal) return;
+    if (!event || typeof event !== "object" || Array.isArray(event) || fatal || mode === "halted") return;
+    if (mode === "usage_only") {
+      if (event.type !== "step_finish" || event.part?.type !== "step-finish") return;
+      if (event.sessionID && sessionID && sessionID !== event.sessionID) return;
+      const part = event.part;
+      if (!part.id || steps.has(part.id)) return;
+      steps.add(part.id);
+      if (!part.tokens) return;
+      const tokens = part.tokens;
+      const delta = { inputTokens: number(tokens.input) + number(tokens.cache?.read) + number(tokens.cache?.write), uncachedInputTokens: number(tokens.input), cacheReadTokens: number(tokens.cache?.read), cacheWriteTokens: number(tokens.cache?.write), outputTokens: number(tokens.output), reasoningTokens: number(tokens.reasoning), cost: number(part.cost), steps: 1 };
+      for (const key of Object.keys(usage)) usage[key] += delta[key];
+      emit({ type: "usage", id: part.id, sessionID: event.sessionID ?? sessionID, usage: delta });
+      return;
+    }
     eventCount++;
     if (event.sessionID) {
       if (sessionID && sessionID !== event.sessionID) return fail("OpenCode changed session ID within a run.");
@@ -58,20 +77,27 @@ export function createEventStream({ onEvent = () => {}, onFatal = () => {}, maxL
     }
   }
   function line(raw) {
-    if (Buffer.byteLength(raw) > maxLineBytes) return fail("OpenCode event line exceeded the size limit.");
+    // After a loop trip only usage is still read: an oversized line is skipped so later usage still counts.
+    if (Buffer.byteLength(raw) > maxLineBytes) return mode === "usage_only" ? undefined : fail("OpenCode event line exceeded the size limit.");
     if (!raw.trim()) return;
-    try { accept(JSON.parse(raw)); } catch { if (/^\s*[\[{]/.test(raw)) fail("Malformed OpenCode JSON event."); }
+    try { accept(JSON.parse(raw)); } catch { if (mode === "open" && /^\s*[\[{]/.test(raw)) fail("Malformed OpenCode JSON event."); }
   }
   function feed(text) {
+    if (discarding) {
+      const newline = text.indexOf("\n");
+      if (newline < 0) return;
+      text = text.slice(newline + 1);
+      discarding = false;
+    }
     pending += text;
     let pos;
-    while (!fatal && !halted && (pos = pending.indexOf("\n")) >= 0) { const raw = pending.slice(0, pos); pending = pending.slice(pos + 1); line(raw); }
-    if (Buffer.byteLength(pending) > maxLineBytes) fail("OpenCode event line exceeded the size limit.");
-    if (fatal || halted) pending = "";
+    while (!fatal && mode !== "halted" && (pos = pending.indexOf("\n")) >= 0) { const raw = pending.slice(0, pos); pending = pending.slice(pos + 1); line(raw); }
+    if (Buffer.byteLength(pending) > maxLineBytes) { if (mode === "usage_only") { pending = ""; discarding = true; } else fail("OpenCode event line exceeded the size limit."); }
+    if (fatal || mode === "halted") pending = "";
   }
   return {
-    write(chunk) { if (!ended && !fatal && !halted) feed(typeof chunk === "string" ? chunk : decoder.write(chunk)); },
-    end() { if (!ended) { ended = true; feed(decoder.end()); if (pending && !fatal) line(pending); pending = ""; } return this.snapshot(); },
+    write(chunk) { if (!ended && !fatal && mode !== "halted") feed(typeof chunk === "string" ? chunk : decoder.write(chunk)); },
+    end() { if (!ended) { ended = true; feed(decoder.end()); if (pending && !fatal && mode !== "halted") line(pending); pending = ""; } return this.snapshot(); },
     snapshot() {
       const text = texts.size ? [...texts.values()].join("\n\n") : legacyText;
       let textIsFinal = Boolean(text && !fatal);

@@ -25,18 +25,31 @@ export function extractTarget(tool, input = {}) {
 /** Cline's sliding-window policy over normalized OpenCode terminal events. */
 export function createGuard(options = {}) {
   const limits = guardSchema.parse(options), window = [], files = new Set(), errors = [], seen = new Set();
-  let totalToolCalls = 0, totalInputTokens = 0, lastAssistantText, trip;
-  const snapshot = () => ({ ...trip, window: limits.window, totalToolCalls, totalInputTokens, lastErrors: [...errors], filesTouched: [...files], ...(lastAssistantText ? { lastAssistantText } : {}), observation: "Terminal tool results and per-step usage; limits can overshoot by an active tool/step." });
+  let totalToolCalls = 0, totalInputTokens = 0, budgetInputTokens = 0, lastAssistantText, trip;
+  const snapshot = () => ({ ...trip, window: limits.window, totalToolCalls, totalInputTokens, budgetInputTokens, lastErrors: [...errors], filesTouched: [...files], ...(lastAssistantText ? { lastAssistantText } : {}), observation: "Terminal tool results and per-step usage; limits can overshoot by an active tool/step." });
   const stop = (kind, data = {}) => { trip = { kind, ...data }; return snapshot(); };
   return {
     snapshot,
+    resetLoop() {
+      if (trip && trip.kind !== "loop_detected") return;
+      trip = undefined;
+      window.length = 0;
+      errors.length = 0;
+    },
     observe(event) {
-      if (trip) return snapshot();
+      if (trip && !(trip.kind === "loop_detected" && event.type === "usage")) return snapshot();
       if (event.type === "text") { lastAssistantText = redactSecrets(event.text).slice(-400); return null; }
-      if (event.id) { const key = `${event.sessionID ?? ""}:${event.type}:${event.id}`; if (seen.has(key)) return null; seen.add(key); }
+      if (event.id) { const key = `${event.sessionID ?? ""}:${event.type}:${event.id}`; if (seen.has(key)) return trip ? snapshot() : null; seen.add(key); }
       if (event.type === "usage") {
-        totalInputTokens += event.usage.inputTokens;
-        return totalInputTokens > limits.maxInputTokens ? stop("budget_exceeded") : null;
+        const u = event.usage ?? {};
+        const full = Number.isFinite(u.inputTokens) ? u.inputTokens : 0;
+        const budget = Number.isFinite(u.uncachedInputTokens)
+          ? u.uncachedInputTokens + (Number.isFinite(u.cacheWriteTokens) ? u.cacheWriteTokens : 0)
+          : full;
+        totalInputTokens += full;
+        budgetInputTokens += budget;
+        if (budgetInputTokens > limits.maxInputTokens) return stop("budget_exceeded");
+        return trip ? snapshot() : null;
       }
       if (event.type !== "tool") return null;
       const tool = String(event.tool ?? "tool").toLowerCase(), { target, paths } = extractTarget(tool, event.input);
