@@ -121,6 +121,17 @@ async function deadHolder(file) {
     catch { /* An incomplete or unreadable lock is busy, never stale by age alone. */ }
     return false;
 }
+/** Removes the lock only if it still holds the exact metadata that was found dead. The death check awaits a process
+ * launch, so the holder may release meanwhile and a new writer may create a fresh lock at the same path; that lock
+ * must never be unlinked. The re-read and the unlink run with no await in between. */
+async function unlinkIfStillDead(file) {
+    let text;
+    try { text = readFileSync(file, "utf8"); } catch { return false; }
+    try { if (!await holderIsDead(JSON.parse(text))) return false; } catch { return false; }
+    try { if (readFileSync(file, "utf8") !== text) return false; } catch { return false; }
+    unlinkSync(file);
+    return true;
+}
 function createHolder(file, token) {
     const fd = openSync(file, "wx", 0o600);
     try {
@@ -203,9 +214,8 @@ export async function acquire(checkoutRoot, options = {}) {
                         throw new CheckoutBusyError(root);
                     throw err;
                 }
-                if (!await deadHolder(file))
+                if (!await unlinkIfStillDead(file))
                     throw new CheckoutBusyError(root);
-                unlinkSync(file);
                 try {
                     create();
                 }
