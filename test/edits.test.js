@@ -354,3 +354,24 @@ test("S8: an edit run's limit is remembered by the shared catalog, and a passing
   assert.equal(JSON.parse(passed.content[0].text).verification.passed, true);
   assert.deepEqual(calls, [["success", "opencode/test-free"]]);
 });
+
+// Plan S10 (B10): the first run also keeps time for its final check.
+test("S10: with an 80 s budget and a 60 s check, the first run gets at most 20 s", async t => {
+  const f = await repository(t), timeouts = [];
+  const out = await runEdits({ ...input(f.root), budgetMs: 80_000, verify: { ...verify, timeoutSeconds: 60 } }, { ...f.options,
+    verifyImpl: async () => passedCheck(),
+    runner: async call => { timeouts.push(call.timeoutMs); await writeFile(path.join(f.root, "main.js"), "fixed"); return response(); } });
+  assert.equal(out.verification.passed, true);
+  assert.equal(timeouts.length, 1);
+  // 80 s - (60 s check + 10 s margin) = at most 10 s, minus setup time.
+  assert.ok(timeouts[0] >= 5_000 && timeouts[0] <= 10_000, `first run got ${timeouts[0]} ms`);
+});
+
+test("S10: a budget too small for the check refuses before any run and leaves the files as they were", async t => {
+  const f = await repository(t), before = await readFile(path.join(f.root, "main.js"), "utf8");
+  const out = await runEdits({ ...input(f.root), budgetMs: 60_000, verify: { ...verify, timeoutSeconds: 60 } }, { ...f.options,
+    verifyImpl: async () => passedCheck(), runner: () => assert.fail("must not launch a run that cannot be checked") });
+  assert.equal(out.error, "budget_exceeded");
+  assert.match(out.message, /check/i);
+  assert.equal(await readFile(path.join(f.root, "main.js"), "utf8"), before);
+});

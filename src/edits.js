@@ -192,12 +192,13 @@ export async function runEdits(rawInput, {
       // Keep time for the final check (and restore) so a run that finishes late is still verified.
       const reserveMs = verification.required ? (input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS : 0;
       const runMs = deadline - nowImpl() - reserveMs;
+      if (!run && runMs < 1_000) throw failure("budget_exceeded", "Not enough budget for a run and its final check.");
       if (run && runMs < MIN_FIX_RUN_MS) throw failure("budget_exceeded", "Not enough budget left for another repair run and its check.");
       if (run) verification.fixRuns++;
       let response;
       try { response = await runner({ directory: workDir, checkoutRoot: root, prompt, model: input.model, variant, mode: "edits", codeMap: input.codeMap ?? true,
         guardState, sessionID, ignoredPaths, signal: controller.signal,
-        timeoutMs: Math.max(1, runMs >= MIN_FIX_RUN_MS ? runMs : deadline - nowImpl()) }); }
+        timeoutMs: runMs }); }
       catch (error) { response = { error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard }; }
       result.codeMapSource = response?.codeMapSource ?? "none";
       if (response?.usage) for (const key of Object.keys(usage)) usage[key] += Number.isFinite(response.usage[key]) ? response.usage[key] : 0;
