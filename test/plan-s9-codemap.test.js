@@ -48,10 +48,11 @@ test("S9 B7: a tracked file deleted from the working tree is skipped; the rest o
 });
 
 test("S9 B7: a tracked path that became a folder is skipped too", async (t) => {
-  const f = await fixture(t, { tracked: ["main.js", "now-a-dir.js/inner.js"] });
+  const f = await fixture(t, { tracked: ["main.js", "now-a-dir.js/inner.js", "other.js"] });
   await writeFile(path.join(f.root, "now-a-dir.js"), "a file where Git expects a folder\n");
   const map = await buildCodeMap(f.root, f.options);
   assert.match(map ?? "", /main\.js/);
+  assert.match(map ?? "", /other\.js/, "files after the bad path are still scanned");
 });
 
 const envelope = (map) => ({ schemaVersion: 2, command: "map", referencesAreCandidates: true, truncated: false, anchors: [], map });
@@ -62,6 +63,13 @@ test("S9 B8: a 5,990-char structural map in a longer JSON envelope fits a 6,000 
   const f = await fixture(t, { tracked: ["main.js"], script: `console.log(${JSON.stringify(reply)})` });
   const map = await buildCodeMap(f.root, f.options);
   assert.equal(map?.length, 5_990);
+  assert.deepEqual(f.sources, ["codeindex"]);
+});
+
+test("S9 review: a structural map of exactly the budget (6,000 chars) is kept", async (t) => {
+  const f = await fixture(t, { tracked: ["main.js"], script: `console.log(${JSON.stringify(JSON.stringify(envelope("x".repeat(6_000))))})` });
+  const map = await buildCodeMap(f.root, f.options);
+  assert.equal(map?.length, 6_000);
   assert.deepEqual(f.sources, ["codeindex"]);
 });
 
