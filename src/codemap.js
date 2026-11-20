@@ -120,8 +120,7 @@ async function buildRegexMap(root, options = {}) {
     let timer;
     const abort = () => controller.abort();
     try {
-        if (options.signal?.aborted)
-            return undefined;
+        options.signal?.throwIfAborted();
         const maxChars = Math.min(6000, options.maxChars ?? 6000);
         if (!Number.isFinite(maxChars) || maxChars <= 0)
             return undefined;
@@ -201,11 +200,11 @@ async function buildRegexMap(root, options = {}) {
                 throw error;
             }
         }
-        if (options.signal?.aborted)
-            return undefined;
+        options.signal?.throwIfAborted();
         return formatMap(entries, files.length - scanned, fits);
     }
     catch {
+        options.signal?.throwIfAborted();
         return undefined;
     }
     finally {
@@ -217,11 +216,11 @@ async function buildRegexMap(root, options = {}) {
 
 /** String API retained; onSource reports the context actually selected for launch. */
 export async function buildCodeMap(root, options = {}) {
+    options.signal?.throwIfAborted();
     const started = performance.now();
     const cli = (options.env ?? process.env).CODEINDEX_CLI;
     let map;
     if (cli) {
-        options.signal?.throwIfAborted();
         const commandLimit = WINDOWS_COMMAND_LINE_LIMIT - 1_000;
         const headroom = options.commandLineLength ? commandLimit - options.commandLineLength("") : Infinity;
         // A UTF-16 unit may require two units after Windows argument escaping.
@@ -241,7 +240,7 @@ export async function buildCodeMap(root, options = {}) {
     }
     const remaining = (options.timeBudgetMs ?? Infinity) - (performance.now() - started);
     map = remaining > 0 ? await buildRegexMap(root, { ...options, timeBudgetMs: Math.min(TIME_BUDGET_MS, remaining) }) : undefined;
-    if (cli) options.signal?.throwIfAborted();
+    options.signal?.throwIfAborted();
     options.onSource?.(map ? "regex" : "none");
     return map;
 }

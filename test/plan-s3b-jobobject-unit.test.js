@@ -51,30 +51,89 @@ test("a failed build can be retried once after cooldown and a fast owner failure
   await runNode(process.execPath, ["--input-type=module", "-e", `
     import assert from "node:assert/strict";
     import childProcess from "node:child_process";
+    import { EventEmitter } from "node:events";
+    import { writeFileSync } from "node:fs";
     import { syncBuiltinESMExports } from "node:module";
     import path from "node:path";
+    import { PassThrough } from "node:stream";
     import { createWindowsJob } from ${JSON.stringify(moduleUrl)};
 
+    let now = 1_000_000;
+    Date.now = () => now;
+    const timers = new Map();
+    let nextId = 1;
+    globalThis.setTimeout = (fn, ms = 0, ...args) => {
+      const id = nextId++;
+      timers.set(id, { at: now + Math.max(0, ms), fn: () => fn(...args) });
+      return { id, unref() { return this; } };
+    };
+    globalThis.clearTimeout = (handle) => { if (handle?.id) timers.delete(handle.id); };
+    const tick = (ms) => {
+      const target = now + ms;
+      while (true) {
+        let next;
+        for (const [id, t] of timers) if (t.at <= target && (!next || t.at < next.at)) next = { id, ...t };
+        if (!next) break;
+        timers.delete(next.id);
+        now = next.at;
+        next.fn();
+      }
+      now = target;
+    };
+    function fakeChild(start) {
+      const child = new EventEmitter();
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      let exited = false;
+      const exit = (code = 0) => {
+        if (exited) return;
+        exited = true;
+        child.stdout.end();
+        child.emit("exit", code, null);
+      };
+      child.kill = () => { exit(1); return true; };
+      child.unref = () => child;
+      start(child, exit);
+      return child;
+    }
+
     const realSpawn = childProcess.spawn;
-    let builds = 0, owners = 0;
+    let builds = 0, owners = 0, onFirstOwnerFailed;
+    const firstOwnerFailed = new Promise(resolve => { onFirstOwnerFailed = resolve; });
     childProcess.spawn = (file, args, options) => {
-      if (path.basename(file) === "csc.exe") builds++;
-      if (path.basename(file) === "owner.exe" && ++owners === 1) {
-        return realSpawn(process.execPath, ["-e", "process.exit(1)"], options);
+      if (path.basename(file) === "csc.exe") {
+        builds++;
+        const out = args.find(arg => arg.startsWith("/out:")).slice(5);
+        return fakeChild((_child, exit) => {
+          queueMicrotask(() => { writeFileSync(out, ""); exit(0); });
+        });
+      }
+      if (path.basename(file) === "owner.exe") {
+        const n = ++owners;
+        return fakeChild((child, exit) => {
+          if (n === 1) {
+            queueMicrotask(() => { exit(1); queueMicrotask(onFirstOwnerFailed); });
+          } else {
+            child.stdin.on("finish", () => exit(0));
+            queueMicrotask(() => child.stdout.write("ready\\n"));
+          }
+        });
       }
       return realSpawn(file, args, options);
     };
     syncBuiltinESMExports();
-    const clock = Date.now;
     process.env.TEMP = process.env.TMP = path.join(process.cwd(), "blocked");
     assert.equal(await createWindowsJob(15000), undefined);
 
     process.env.TEMP = process.env.TMP = process.cwd();
-    Date.now = () => clock() + 1000;
+    tick(1000);
     assert.equal(await createWindowsJob(15000), undefined);
     assert.equal(builds, 0);
-    Date.now = () => clock() + 61000;
-    const jobs = await Promise.all([createWindowsJob(15000), createWindowsJob(15000)]);
+    tick(60_000);
+    const pending = Promise.all([createWindowsJob(15000), createWindowsJob(15000)]);
+    await firstOwnerFailed;
+    tick(175);
+    const jobs = await pending;
     try {
       assert.ok(jobs.every(job => job?.alive));
       assert.equal(builds, 1, "concurrent requests share the build");

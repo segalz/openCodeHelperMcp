@@ -8,6 +8,7 @@ import { createGuard, guardSchema } from "./guard.js";
 import { emptyUsage } from "./events.js";
 import { redactSecrets } from "./safety.js";
 import { analysisInputSchema, DEFAULT_BUDGET_MS, resolveRequestedModels, variantFor } from "./core.js";
+import { withProgressHeartbeat } from "./progress.js";
 
 const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
   + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
@@ -274,7 +275,7 @@ export function registerEditTools(server, { runner, catalog, resolveAllowedPath,
   server.registerTool("apply_opencode_edits", {
     title: "Apply verified OpenCode edits", inputSchema: editsInputSchema,
     description: "Edit one Git checkout using one explicit free model and build agent; shell/delegates/web denied. Required final check, up to two same-session repairs, shared Cline writer lock, one recovery snapshot, cumulative guard/deadline. Restores failed edits unless keepOnFailure=true; identity changes retain recovery evidence. Synchronous; no fallback.",
-  }, async (raw, extra = {}) => {
+  }, async (raw, extra = {}) => withProgressHeartbeat(extra, async () => {
     const deadline = nowImpl() + (raw?.budgetMs ?? DEFAULT_BUDGET_MS);
     // `controller` stops preparation on a client cancel or the deadline. Only a real client cancel
     // reaches runEdits as `signal`; runEdits owns the deadline, so an exhausted budget is reported as
@@ -313,7 +314,11 @@ export function registerEditTools(server, { runner, catalog, resolveAllowedPath,
         else if (result.verification?.passed) catalog.recordSuccess?.(model);
         return respond(result);
       } finally { activeEditCalls.delete(call); }
-    } catch (error) { return respond({ error: "edits_refused", message: redactSecrets(error?.message ?? String(error)) }); }
+    } catch (error) {
+      // A stop during preparation is the caller cancel or the spent budget, not a refused request (plan S15 review).
+      const kind = user.signal.aborted ? "cancelled" : controller.signal.aborted ? "budget_exceeded" : "edits_refused";
+      return respond({ error: kind, message: redactSecrets(error?.message ?? String(error)) });
+    }
     finally { clearTimeout(timer); extra.signal?.removeEventListener("abort", userAbort); }
-  });
+  }));
 }

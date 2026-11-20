@@ -171,7 +171,7 @@ test("code map uses current files, excludes secrets/vendor/binary, clamps and to
     assert.match(map, /current checkout contents/); assert.match(map, /current:1/); assert.doesNotMatch(map, /SECRET|credentials|vendor|binary|lock.lock/);
     assert.equal(await buildCodeMap(root, { spawnImpl, commandLineLength: () => 31999 }), undefined);
     assert.equal(await buildCodeMap(root, { spawnImpl: scripted([], { code: 128 }) }), undefined);
-    const controller = new AbortController(); controller.abort(); assert.equal(await buildCodeMap(root, { signal: controller.signal }), undefined);
+    const controller = new AbortController(); controller.abort(); await assert.rejects(buildCodeMap(root, { signal: controller.signal }), (error) => error?.name === "AbortError");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

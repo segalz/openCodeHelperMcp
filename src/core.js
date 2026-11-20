@@ -14,6 +14,7 @@ import { WORKING_RULES, buildEnvironmentLine } from "./rules.js";
 import { windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT } from "./process-utils.js";
 import { confirmTreeDead } from "./proctree.js";
 import { createWindowsJob } from "./jobobject.js";
+import { withProgressHeartbeat } from "./progress.js";
 
 // ---------------------------------------------------------------------------
 // Limits and defaults
@@ -582,7 +583,7 @@ const RETRY_UNIT_MS = Object.freeze({
 
 export function parseRetryAfterMs(text) {
   if (typeof text !== "string") return undefined;
-  const label = /\b(?:try\s+again\s+in|retry[-\s]+after)\b\s*(?:\\*["'])?\s*[:=]?\s*(?:\\*["'])?\s*(?=\d)/i.exec(text);
+  const label = /\b(?:try\s+again\s+in|retry[-\s]+after|soonest\s+reset)\b\s*(?:\\*["'])?\s*[:=]?\s*(?:\\*["'])?\s*~?\s*(?=\d)/i.exec(text);
   if (!label) return undefined;
 
   const value = text.slice(label.index + label[0].length);
@@ -980,7 +981,7 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
     return textResult(JSON.stringify(payload, null, 2));
   });
 
-  server.registerTool("analyze_code", { title: "Analyze code with a free OpenCode model", description: ANALYZE_DESCRIPTION, inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs, model, models, guard, codeMap = true }, extra = {}) => {
+  server.registerTool("analyze_code", { title: "Analyze code with a free OpenCode model", description: ANALYZE_DESCRIPTION, inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs, model, models, guard, codeMap = true }, extra = {}) => withProgressHeartbeat(extra, async () => {
     const deadline = nowImpl() + clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, DEFAULT_BUDGET_MS);
     const guardValidation = guardSchema.safeParse(guard ?? {});
     if (!guardValidation.success) return textResult("Invalid guard options.", true);
@@ -1004,5 +1005,5 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
     }
     result.selection = requested.auto ? `auto (${chain.map((m) => m.id).join(" → ")})` : "caller";
     return textResult(formatAnalysisResult(result), Boolean(result.error));
-  });
+  }));
 }

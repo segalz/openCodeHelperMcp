@@ -59,16 +59,39 @@ test("a stat-only index refresh keeps the checkout identity; staging a change do
 
 test("an exhausted edit deadline is reported as budget_exceeded, never as cancelled", async (t) => {
   const r = await gitRepo(t);
-  const result = await runEdits(
-    { directory: r.root, prompt: "Fix", model: "opencode/test-free", verify: { none: true, reason: "deadline regression test" }, codeMap: false },
-    {
-      lockDirectory: path.join(r.base, "locks"), snapshotOptions: { snapshotBase: path.join(r.base, "snapshots") },
-      deadline: Date.now() + 1500,
-      runner: async ({ signal }) => new Promise((resolve) => {
-        signal.addEventListener("abort", () => resolve({ error: "OpenCode run cancelled." }), { once: true });
-      }),
-    },
-  );
+  let now = 0;
+  const deadline = 60_000;
+  let fireDeadline;
+  let runnerAborted = false;
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...args) => {
+    if (!fireDeadline && ms === deadline) { fireDeadline = () => fn(...args); return undefined; }
+    return realSetTimeout(fn, ms, ...args);
+  };
+  let pending;
+  try {
+    pending = runEdits(
+      { directory: r.root, prompt: "Fix", model: "opencode/test-free", verify: { none: true, reason: "deadline regression test" }, codeMap: false },
+      {
+        lockDirectory: path.join(r.base, "locks"), snapshotOptions: { snapshotBase: path.join(r.base, "snapshots") },
+        nowImpl: () => now,
+        deadline,
+        runner: async ({ signal }) => new Promise((resolve) => {
+          signal.addEventListener("abort", () => {
+            runnerAborted = true;
+            resolve({ error: "OpenCode run cancelled." });
+          }, { once: true });
+          now = deadline;
+          fireDeadline();
+        }),
+      },
+    );
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  assert.ok(fireDeadline, "runEdits must arm a deadline timer");
+  const result = await pending;
+  assert.equal(runnerAborted, true);
   assert.equal(result.error, "budget_exceeded");
   assert.equal(result.verification.restored, true);
 });

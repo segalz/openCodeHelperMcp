@@ -2,7 +2,7 @@
 
 A local stdio MCP server for read-only code analysis and checked edits through the installed OpenCode CLI. It discovers models advertised as free, runs bounded tool-enabled requests, and reports model usage, guard counters and session IDs. Edit requests add verification and recovery of the checkout's pre-run files.
 
-The three tools are synchronous: each call returns its final result. There are no asynchronous task-management tools. Analysis uses the OpenCode `plan` agent; edits use `build`. Both run with explicit permission profiles and without `--auto`.
+The three tools are synchronous: each call returns its final result. There are no asynchronous task-management tools. When a client supplies a progress token, `analyze_code` and `apply_opencode_edits` send periodic `notifications/progress` heartbeats while running. Analysis uses the OpenCode `plan` agent; edits use `build`. Both run with explicit permission profiles and without `--auto`.
 
 ## Typical use
 
