@@ -2,10 +2,21 @@ const TYPE_VALUE = /^(?:string|number|boolean|bigint|symbol|object|unknown|any|n
 const GIT_SHA = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 
 const SECRET_PATTERNS = [
+  // Quoted value after a secret name (also `DB_PASSWORD`, `"db_password"`, `=>`, `:=`, triple quotes). A quoted type
+  // literal (`token: "string"`) is not a secret, and a bare `key` (JSX `key="row-1"`, `{ key: "asc" }`) hides only a
+  // value that looks like a credential (plan S20 review).
+  [/((["']?)\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|token|access(?:[_-]?token)?|refresh(?:[_-]?token)?|auth[_-]?token|secret|password|passwd|client[_-]?secret|session[_-]?id|authorization)|key)\2\s*(?::=|=>|[:=])\s*)([a-z]{1,2})?("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*')/gi,
+    (match, prefix, _keyQuote, name, stringPrefix, value) => {
+      const quote = value.startsWith('"""') || value.startsWith("'''") ? value.slice(0, 3) : value[0];
+      const inner = value.slice(quote.length, value.length - quote.length);
+      // `token: "string"` is a TypeScript literal type; `password: f"string"` is a Python string that may hold a secret.
+      if (!stringPrefix && TYPE_VALUE.test(inner)) return match;
+      if (/^key$/i.test(name) && !(inner.length >= 16 && /[0-9]/.test(inner) && /[A-Za-z]/.test(inner))) return match;
+      return prefix + quote + "[REDACTED]" + quote;
+    }],
   [/(authorization\s*[:=]\s*)(?:bearer|basic|token)?\s*[^\s"',;]+/gi, "$1[REDACTED]"],
   [/\bbearer\s+[A-Za-z0-9._~+\/=-]{8,}/gi, "Bearer [REDACTED]"],
-  [/("(?:api[_-]?key|apikey|key|token|access(?:_token)?|refresh(?:_token)?|secret|password|client_secret|authorization)"\s*:\s*)"(?:[^"\\]|\\.)*"/gi, '$1"[REDACTED]"'],
-  [/\b((?:api[_-]?key|apikey|api[_-]?token|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|secret|password|client[_-]?secret|key)\s*([=:])\s*)([^\s"',;&]+)/gi,
+  [/\b((?:(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|api[_-]?token|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|secret|password|passwd|client[_-]?secret)|key)\s*(:=|=>|[=:])\s*)([^\s"',;&]+)/gi,
     (match, prefix, sep, value) => (sep === ":" && TYPE_VALUE.test(value) ? match : `${prefix}[REDACTED]`)],
   [/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, "[REDACTED]"],
   [/\b(?:nvapi|gsk|ghp|gho|ghu|ghs|ghr|github_pat|xox[abpr]|hf|cf)[-_][A-Za-z0-9_-]{8,}/g, "[REDACTED]"],
@@ -20,7 +31,8 @@ const SECRET_PATTERNS = [
       let i = offset - 1;
       for (;;) {
         while (i >= 0 && /[\s"'`(\[{\\]/.test(full[i])) i--;
-        if (i >= 1 && /[rbfu]/i.test(full[i]) && !/[A-Za-z0-9_]/.test(full[i - 1])) { i--; continue; }
+        const prefix = /(?:^|\W)([rbfu]{1,2})$/i.exec(full.slice(Math.max(0, i - 2), i + 1));
+        if (prefix) { i -= prefix[1].length; continue; }
         break;
       }
       if (i < 0) return match;

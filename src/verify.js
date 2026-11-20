@@ -25,7 +25,7 @@ export async function resolveVerificationCommand(command, args = [], cwd = proce
   if (/[\\/]$/.test(command)) {
     throw new VerificationError("verification_refused", "Verification command must be a file, not a directory.");
   }
-  const hasDirectory = command.includes("/") || command.includes("\\");
+  const hasDirectory = command.includes("/") || command.includes("\\") || /^[A-Za-z]:/.test(command);
   const ext = path.extname(command);
   const bare = !hasDirectory && !ext;
   if (process.platform !== "win32") {
@@ -35,11 +35,16 @@ export async function resolveVerificationCommand(command, args = [], cwd = proce
     if (!found) throw new VerificationError("verification_launch_failed", "Verification executable was not found on PATH.");
     return { command, args };
   }
-  const npm = /^(npm|npx)(?:\.cmd)?$/i.exec(path.basename(command));
+  // A bare npm/npx resolves to the installed npm. An explicit path names one install: it resolves through that
+  // install's own CLI script only when the path exists; a missing one is refused below (plan S20 review).
+  const npmName = /^(npm|npx)(?:\.cmd)?$/i.exec(hasDirectory ? path.basename(command) : command);
+  const explicit = hasDirectory ? path.resolve(cwd, command) : undefined;
+  const npm = npmName && (!explicit || await isFile(explicit) || await isFile(explicit + ".cmd")) ? npmName : null;
   if (npm) {
     const script = npm[1].toLowerCase() + "-cli.js";
-    const candidates = [path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", script),
-      ...(process.env.APPDATA ? [path.join(process.env.APPDATA, "npm", "node_modules", "npm", "bin", script)] : [])];
+    const candidates = explicit ? [path.join(path.dirname(explicit), "node_modules", "npm", "bin", script)]
+      : [path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", script),
+        ...(process.env.APPDATA ? [path.join(process.env.APPDATA, "npm", "node_modules", "npm", "bin", script)] : [])];
     for (const candidate of candidates) {
       if (await isFile(candidate)) return { command: process.execPath, args: [candidate, ...args] };
     }
@@ -222,7 +227,7 @@ export async function runVerification(spec, cwd, signal, {
         const confirmKill = () => confirmTreeDeadOption(pid, {
             killRoot: () => killImpl(pid), isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt
         }).catch(() => ({ confirmed: false, alive: [pid], unverified: true }));
-        const destroyPipes = () => { child.stdout.destroy(); child.stderr.destroy(); };
+        const destroyPipes = () => { child.stdout?.destroy?.(); child.stderr?.destroy?.(); };
         const stop = () => {
             if (done || stopped) return;
             stopped = true;
@@ -273,6 +278,12 @@ export async function runVerification(spec, cwd, signal, {
         child.once("error", () => {
             if (done)
                 return;
+            if (stopped && (confirm || pid)) {
+                finish(null, "SIGKILL");
+                if (confirm) confirm.then(destroyPipes);
+                else destroyPipes();
+                return;
+            }
             done = true;
             cleanup();
             const fail = () => reject(new VerificationError("verification_launch_failed", "Could not launch verification executable."));

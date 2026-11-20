@@ -15,18 +15,22 @@ export class SnapshotError extends Error {
     }
 }
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
-async function hashFile(file, signal) {
+async function hashFile(file, signal, maxBytes = SPECIAL_PLACEHOLDER_HASH_CAP) {
     const abortError = () => Object.assign(new Error("The operation was aborted"), { name: "AbortError", code: "ABORT_ERR" });
     if (signal?.aborted) throw abortError();
     const digest = createHash("sha256");
     const stream = createReadStream(file, { highWaterMark: 64 * 1024 });
     const abort = () => stream.destroy(abortError());
     signal?.addEventListener("abort", abort, { once: true });
+    let bytes = 0;
     try {
         for await (const chunk of stream) {
             if (signal?.aborted) throw abortError();
+            bytes += chunk.length;
+            if (bytes > maxBytes) return null;
             digest.update(chunk);
         }
+        if (signal?.aborted) throw abortError();
         return digest.digest("hex");
     } finally {
         signal?.removeEventListener("abort", abort);
@@ -82,7 +86,12 @@ async function git(root, args, signal, input, allowedCodes = [0]) {
         child.stdout.on("data", (chunk) => collect(chunk, true));
         child.stderr.on("data", (chunk) => collect(chunk, false));
         const cleanup = () => { clearTimeout(timer); clearTimeout(killDeadline); signal?.removeEventListener("abort", abort); };
-        child.on("error", () => { cleanup(); reject(new SnapshotError("snapshot_git_failed", "Could not launch Git.")); });
+        child.on("error", () => {
+            cleanup();
+            reject(failure ?? (signal?.aborted
+                ? new SnapshotError("cancelled", "Snapshot Git call cancelled.")
+                : new SnapshotError("snapshot_git_failed", "Could not launch Git.")));
+        });
         child.on("close", code => {
             cleanup();
             if (failure)
@@ -172,6 +181,7 @@ function isSpecialPath(file, specialEntries) {
     return false;
 }
 const SPECIAL_PLACEHOLDER_LIMIT = 1024 * 1024;
+const SPECIAL_PLACEHOLDER_HASH_CAP = 64 * 1024 * 1024;
 async function specialEntryState(root, entry, signal, { baseline = false } = {}) {
     const { absolute, missingAncestor } = await safeAncestors(root, entry.path);
     if (missingAncestor)
@@ -195,8 +205,16 @@ async function specialEntryState(root, entry, signal, { baseline = false } = {})
             const resolved = await realpath(absolute);
             if (path.resolve(resolved).toLowerCase() !== path.resolve(absolute).toLowerCase())
                 return "other";
-            if (stat.size > SPECIAL_PLACEHOLDER_LIMIT)
-                return `file:${await hashFile(absolute, signal)}`;
+            if (stat.size > SPECIAL_PLACEHOLDER_HASH_CAP)
+                return `file-size:${stat.size}`;
+            if (stat.size > SPECIAL_PLACEHOLDER_LIMIT) {
+                const hashed = await hashFile(absolute, signal, SPECIAL_PLACEHOLDER_HASH_CAP);
+                if (hashed === null) {
+                    const current = await statOrMissing(absolute);
+                    return current?.isFile() ? `file-size:${current.size}` : "other";
+                }
+                return `file:${hashed}`;
+            }
             return `file:${hash(await readFile(absolute, { signal }))}`;
         }
         return "other";
