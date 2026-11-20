@@ -105,7 +105,7 @@ export async function subfolderOf(root, directory) {
   const [realRoot, realDirectory] = await Promise.all([realpath(root).catch(() => path.resolve(root)),
     realpath(directory).catch(() => path.resolve(directory))]);
   const inside = path.relative(realRoot, realDirectory);
-  if (inside.startsWith("..") || path.isAbsolute(inside)) return undefined;
+  if (inside === ".." || inside.startsWith(".." + path.sep) || path.isAbsolute(inside)) return undefined;
   return inside ? path.join(root, inside) : root;
 }
 
@@ -156,7 +156,10 @@ export async function runEdits(rawInput, {
       const current = await identityImpl(root, active ? controller.signal : undefined);
       if (current.head === identity.head && current.indexHash === identity.indexHash) return;
       result.evidence.identity = { before: identity, after: current };
-    } catch (error) { result.evidence.identityError = redactSecrets(String(error)); }
+    } catch (error) {
+      if (active && (signal?.aborted || controller.signal.aborted)) check();
+      result.evidence.identityError = redactSecrets(String(error));
+    }
     throw failure("identity_changed", "HEAD/index changed or could not be inspected; restoration refused and recovery snapshot retained.");
   };
   const discard = async (reportCreated = false) => {
@@ -260,7 +263,15 @@ export async function runEdits(rawInput, {
     }
     await discard(true); result.status = "done";
   } catch (error) {
-    result.error = error?.kind ?? "edits_failed"; result.message = redactSecrets(error?.message ?? String(error));
+    const aborted = error?.kind === "cancelled" || error?.name === "AbortError" || error?.code === "ABORT_ERR"
+      || (error?.kind === "snapshot_git_failed" && (signal?.aborted || controller.signal.aborted));
+    if (aborted && signal?.aborted) {
+      result.error = "cancelled"; result.message = "Edit lifecycle cancelled.";
+    } else if (aborted && controller.signal.aborted) {
+      result.error = "budget_exceeded"; result.message = "Overall edit deadline exhausted.";
+    } else {
+      result.error = error?.kind ?? "edits_failed"; result.message = redactSecrets(error?.message ?? String(error));
+    }
     if (snapshot && !completed) {
       try {
         try { await editScope.close(); } catch (closeError) {

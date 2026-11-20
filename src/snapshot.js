@@ -1,6 +1,7 @@
 // Ported from ClineMcp; preserve recovery/lock compatibility.
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,9 +15,30 @@ export class SnapshotError extends Error {
     }
 }
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+async function hashFile(file, signal) {
+    const abortError = () => Object.assign(new Error("The operation was aborted"), { name: "AbortError", code: "ABORT_ERR" });
+    if (signal?.aborted) throw abortError();
+    const digest = createHash("sha256");
+    const stream = createReadStream(file, { highWaterMark: 64 * 1024 });
+    const abort = () => stream.destroy(abortError());
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+        for await (const chunk of stream) {
+            if (signal?.aborted) throw abortError();
+            digest.update(chunk);
+        }
+        return digest.digest("hex");
+    } finally {
+        signal?.removeEventListener("abort", abort);
+        stream.destroy();
+    }
+}
 const missing = (err) => err.code === "ENOENT";
 /** All Git operations are read-only, bounded in time and aggregate output, and do not refresh the index. */
 async function git(root, args, signal, input, allowedCodes = [0]) {
+    if (signal?.aborted) {
+        throw new SnapshotError("cancelled", "Snapshot Git call cancelled.");
+    }
     return new Promise((resolve, reject) => {
         const child = spawn(process.platform === "win32" ? "git.exe" : "git", ["-C", root, ...args], {
             shell: false, windowsHide: true, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
@@ -26,10 +48,12 @@ async function git(root, args, signal, input, allowedCodes = [0]) {
         let bytes = 0;
         let failure;
         let killDeadline;
-        const stop = () => {
+        const stop = (cancelled = false) => {
             if (failure)
                 return;
-            failure = new SnapshotError("snapshot_git_failed", "Snapshot Git call cancelled or exceeded its time/output bound.");
+            failure = cancelled
+                ? new SnapshotError("cancelled", "Snapshot Git call cancelled.")
+                : new SnapshotError("snapshot_git_failed", "Snapshot Git call exceeded its time/output bound.");
             if (child.pid)
                 defaultKillTree(child.pid);
             // Killing trees may be denied by the host. Do not leave a Git call or inherited pipe unbounded.
@@ -41,17 +65,17 @@ async function git(root, args, signal, input, allowedCodes = [0]) {
                 reject(failure);
             }, 5000);
         };
-        const timer = setTimeout(stop, 10_000);
-        const abort = () => stop();
+        const timer = setTimeout(() => stop(false), 10_000);
+        const abort = () => stop(true);
         signal?.addEventListener("abort", abort, { once: true });
         if (signal?.aborted)
-            stop();
+            stop(true);
         child.stdin.on("error", () => { });
         child.stdin.end(input);
         const collect = (chunk, stdout) => {
             bytes += chunk.length;
             if (bytes > 16 * 1024 * 1024)
-                stop();
+                stop(false);
             else if (stdout)
                 chunks.push(chunk);
         };
@@ -172,7 +196,7 @@ async function specialEntryState(root, entry, signal, { baseline = false } = {})
             if (path.resolve(resolved).toLowerCase() !== path.resolve(absolute).toLowerCase())
                 return "other";
             if (stat.size > SPECIAL_PLACEHOLDER_LIMIT)
-                return `file-large:${stat.size}`;
+                return `file:${await hashFile(absolute, signal)}`;
             return `file:${hash(await readFile(absolute, { signal }))}`;
         }
         return "other";

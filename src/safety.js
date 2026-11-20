@@ -1,4 +1,4 @@
-const TYPE_VALUE = /^(?:string|number|boolean|bigint|symbol|object|unknown|any|never|void|undefined|null|true|false)(?:\[\])?$/;
+const TYPE_VALUE = /^(?:string|number|boolean|bigint|symbol|object|unknown|any|never|void|undefined|null|true|false)(?:\[\])?[),;}>\]]*$/;
 const GIT_SHA = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 
 const SECRET_PATTERNS = [

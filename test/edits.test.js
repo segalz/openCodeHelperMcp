@@ -361,15 +361,16 @@ test("S8: an edit run's limit is remembered by the shared catalog, and a passing
 });
 
 // Plan S10 (B10): the first run also keeps time for its final check.
-test("S10: with an 80 s budget and a 60 s check, the first run gets at most 20 s", async t => {
+test("S10: with an 80 s budget and a 60 s check, the first run gets exactly the 10 s left after the reserve", async t => {
   const f = await repository(t), timeouts = [];
   const out = await runEdits({ ...input(f.root), budgetMs: 80_000, verify: { ...verify, timeoutSeconds: 60 } }, { ...f.options,
+    nowImpl: () => 1_000,
     verifyImpl: async () => passedCheck(),
     runner: async call => { timeouts.push(call.timeoutMs); await writeFile(path.join(f.root, "main.js"), "fixed"); return response(); } });
   assert.equal(out.verification.passed, true);
   assert.equal(timeouts.length, 1);
-  // 80 s - (60 s check + 10 s margin) = at most 10 s, minus setup time.
-  assert.ok(timeouts[0] >= 5_000 && timeouts[0] <= 10_000, `first run got ${timeouts[0]} ms`);
+  // 80 s - (60 s check + 10 s margin) = 10 s with deterministic clock.
+  assert.equal(timeouts[0], 10_000, `first run got ${timeouts[0]} ms`);
 });
 
 test("S10: a budget too small for the check refuses before any run and leaves the files as they were", async t => {

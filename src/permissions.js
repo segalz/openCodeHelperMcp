@@ -32,7 +32,7 @@ export function permissionEnvironment(env, mode = "analysis", ignoredPaths = [],
     const denied = {};
     // workDir relative to the checkout root as a "packages/app/" prefix; empty when they are the same folder.
     const within = directory && workDir ? path.relative(directory, workDir).replaceAll("\\", "/") : "";
-    const subfolder = within && !within.startsWith("..") && !path.isAbsolute(within) ? within + "/" : "";
+    const subfolder = within && within !== ".." && !within.startsWith("../") && !path.isAbsolute(within) ? within + "/" : "";
     for (const raw of ignoredPaths) {
       const file = raw.replaceAll("\\", "/");
       if (/[\x00-\x1f*?]/.test(file) || file.startsWith("/") || file.split("/").includes("..")) throw new Error("Unsupported ignored permission path.");

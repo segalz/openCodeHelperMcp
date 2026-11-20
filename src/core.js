@@ -674,24 +674,34 @@ const RETRY_UNIT_MS = Object.freeze({
   d: 86_400_000, day: 86_400_000, days: 86_400_000,
 });
 
-export function parseRetryAfterMs(text) {
+const HTTP_DATE_PATTERN = String.raw`(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+(?:GMT|UTC)|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+\d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2}\s+\d{2}:\d{2}:\d{2}\s+GMT|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\b`;
+const RETRY_AFTER_DATE_RE = new RegExp(String.raw`\bretry[-\s]+after\b\s*(?:\\*["'])?\s*[:=]?\s*(?:\\*["'])?\s*(${HTTP_DATE_PATTERN})`, "i");
+
+export function parseRetryAfterMs(text, { now = Date.now() } = {}) {
   if (typeof text !== "string") return undefined;
   const label = /\b(?:try\s+again\s+in|retry[-\s]+after|soonest\s+reset)\b\s*(?:\\*["'])?\s*[:=]?\s*(?:\\*["'])?\s*~?\s*(?=\d)/i.exec(text);
-  if (!label) return undefined;
-
-  const value = text.slice(label.index + label[0].length);
-  // Sticky matching keeps unrelated numbers later in the error out of the delay.
-  const parts = /\s*(?:,\s*)?(?:and\s+)?(\d+(?:\.\d+)?)\s*(milliseconds?|ms|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/giy;
-  let delayMs;
-  for (const [, amount, unit] of value.matchAll(parts)) {
-    delayMs = (delayMs ?? 0) + Number(amount) * RETRY_UNIT_MS[unit.toLowerCase()];
+  if (label) {
+    const value = text.slice(label.index + label[0].length);
+    // Sticky matching keeps unrelated numbers later in the error out of the delay.
+    const parts = /\s*(?:,\s*)?(?:and\s+)?(\d+(?:\.\d+)?)\s*(milliseconds?|ms|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/giy;
+    let delayMs;
+    for (const [, amount, unit] of value.matchAll(parts)) {
+      delayMs = (delayMs ?? 0) + Number(amount) * RETRY_UNIT_MS[unit.toLowerCase()];
+    }
+    if (delayMs === undefined) {
+      // Only treat a unitless number as seconds; an unknown unit word (e.g. "2 weeks") returns undefined.
+      const seconds = /^\d+(?:\.\d+)?\b(?![ \t]*\p{L})/iu.exec(value);
+      if (seconds) delayMs = Number(seconds[0]) * 1_000;
+    }
+    return Number.isFinite(delayMs) ? delayMs : undefined;
   }
-  if (delayMs === undefined) {
-    // Only treat a unitless number as seconds; an unknown unit word (e.g. "2 weeks") returns undefined.
-    const seconds = /^\d+(?:\.\d+)?\b(?![ \t]*\p{L})/iu.exec(value);
-    if (seconds) delayMs = Number(seconds[0]) * 1_000;
-  }
-  return Number.isFinite(delayMs) ? delayMs : undefined;
+  const dateMatch = RETRY_AFTER_DATE_RE.exec(text);
+  if (!dateMatch) return undefined;
+  const raw = /(?:GMT|UTC)$/i.test(dateMatch[1]) ? dateMatch[1] : `${dateMatch[1]} GMT`;
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return undefined;
+  const delta = at - now;
+  return delta > 0 ? delta : undefined;
 }
 
 /**
@@ -723,7 +733,7 @@ export function createModelCatalog({
     const strikes = (recent ? previous.limit.strikes : 0) + (collapsed ? 0 : 1);
     const fallbackMs = providerWide ? QUOTA_COOLDOWN_MS : RATE_LIMIT_LADDER_MS[Math.min(strikes, RATE_LIMIT_LADDER_MS.length) - 1];
     const clampedFallbackMs = clampNumber(fallbackMs, MIN_COOLDOWN_MS, MAX_COOLDOWN_MS, MIN_COOLDOWN_MS);
-    const until = now + clampNumber(parseRetryAfterMs(message) ?? clampedFallbackMs, MIN_COOLDOWN_MS, MAX_COOLDOWN_MS, clampedFallbackMs);
+    const until = now + clampNumber(parseRetryAfterMs(message, { now }) ?? clampedFallbackMs, MIN_COOLDOWN_MS, MAX_COOLDOWN_MS, clampedFallbackMs);
     const limit = {
       kind, scope: providerWide ? "provider" : "model", strikes, message,
       until: collapsed ? Math.max(previous.limit.until, until) : until,
@@ -743,31 +753,48 @@ export function createModelCatalog({
     providerQuotas.delete(model.provider);
   };
 
-  const runModelsCommand = (extraArgs) => runBoundedProcess({
-    executable: resolveOpenCodeExecutable({ env, platform }), args: ["models", ...extraArgs], cwd: probeDirectory, env: childEnv(env, execPath),
-    timeoutMs: listTimeoutMs, maxStdoutBytes: OPENCODE_MAX_LIST_STDOUT_BYTES, spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, nowImpl,
-  });
+  const runModelsCommand = (extraArgs, signal) => {
+    if (analysisShutDown || signal?.aborted) {
+      return Promise.resolve({ exitCode: null, stdout: "", stderr: "", stoppedReason: "cancelled", elapsedMs: 0 });
+    }
+    return runBoundedProcess({
+      executable: resolveOpenCodeExecutable({ env, platform }), args: ["models", ...extraArgs], cwd: probeDirectory, env: childEnv(env, execPath),
+      timeoutMs: listTimeoutMs, maxStdoutBytes: OPENCODE_MAX_LIST_STDOUT_BYTES, spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, nowImpl, signal,
+    });
+  };
 
   const loadList = async () => {
-    const verbose = await runModelsCommand(["--verbose"]);
-    let all = []; let source = "opencode models --verbose";
-    if (verbose.exitCode === 0 && !verbose.timedOut && !verbose.overflowed) all = parseVerboseModels(verbose.stdout);
-    let failure = all.length === 0 ? describeProcessFailure(verbose, { label: "opencode models --verbose" }) : null;
-    if (all.length === 0) {
-      const plain = await runModelsCommand([]);
-      if (plain.exitCode === 0 && !plain.timedOut) all = parsePlainModels(plain.stdout);
-      source = "opencode models (name rule)";
+    if (analysisShutDown) return { error: "OpenCode run cancelled." };
+    const controller = new AbortController();
+    let resolveDone;
+    const entry = { controller, done: new Promise((resolve) => { resolveDone = resolve; }) };
+    activeRunnerCalls.add(entry);
+    try {
+      const verbose = await runModelsCommand(["--verbose"], controller.signal);
+      if (analysisShutDown || controller.signal.aborted) return { error: "OpenCode run cancelled." };
+      let all = []; let source = "opencode models --verbose";
+      if (verbose.exitCode === 0 && !verbose.timedOut && !verbose.overflowed) all = parseVerboseModels(verbose.stdout);
+      let failure = all.length === 0 ? describeProcessFailure(verbose, { label: "opencode models --verbose" }) : null;
       if (all.length === 0) {
-        const plainFailure = describeProcessFailure(plain, { label: "opencode models" });
-        return { error: [failure?.error, plainFailure.error].filter(Boolean).join("\n") || "opencode models returned no models." };
+        const plain = await runModelsCommand([], controller.signal);
+        if (analysisShutDown || controller.signal.aborted) return { error: "OpenCode run cancelled." };
+        if (plain.exitCode === 0 && !plain.timedOut) all = parsePlainModels(plain.stdout);
+        source = "opencode models (name rule)";
+        if (all.length === 0) {
+          const plainFailure = describeProcessFailure(plain, { label: "opencode models" });
+          return { error: [failure?.error, plainFailure.error].filter(Boolean).join("\n") || "opencode models returned no models." };
+        }
+        failure = null;
       }
-      failure = null;
+      // Owner-declared free tiers (providers with no billing method) count as free despite catalog prices.
+      const freeProviders = new Set(String(env.OPENCODE_HELPER_FREE_PROVIDERS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
+      for (const model of all) if (!model.free && freeProviders.has(model.provider)) { model.free = true; model.freeBasis = "provider"; }
+      const usable = all.filter(isUsableFreeModel);
+      return { at: nowImpl(), source, models: usable, excluded: { paid: all.filter((m) => !m.free).length, freeWithoutToolsOrDeprecated: all.filter((m) => m.free && !isUsableFreeModel(m)).length }, total: all.length };
+    } finally {
+      activeRunnerCalls.delete(entry);
+      resolveDone();
     }
-    // Owner-declared free tiers (providers with no billing method) count as free despite catalog prices.
-    const freeProviders = new Set(String(env.OPENCODE_HELPER_FREE_PROVIDERS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
-    for (const model of all) if (!model.free && freeProviders.has(model.provider)) { model.free = true; model.freeBasis = "provider"; }
-    const usable = all.filter(isUsableFreeModel);
-    return { at: nowImpl(), source, models: usable, excluded: { paid: all.filter((m) => !m.free).length, freeWithoutToolsOrDeprecated: all.filter((m) => m.free && !isUsableFreeModel(m)).length }, total: all.length };
   };
 
   const list = async ({ refresh = false } = {}) => {
@@ -1007,7 +1034,7 @@ export async function resolvePathWithinAllowedRoots(directory, roots, { realpath
       continue;
     }
     const relative = pathImpl.relative(rootReal, targetReal);
-    if (relative === "" || (!relative.startsWith("..") && !pathImpl.isAbsolute(relative))) return targetReal;
+    if (relative === "" || (relative !== ".." && !relative.startsWith(".." + pathImpl.sep) && !pathImpl.isAbsolute(relative))) return targetReal;
   }
   return null;
 }

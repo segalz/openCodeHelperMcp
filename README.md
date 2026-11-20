@@ -101,7 +101,7 @@ The response is Markdown headed `## CodeHelper`: selected model, selection mode,
 
 ## `apply_opencode_edits`
 
-Edits a Git checkout using one explicitly selected current free model. A Git repository with a readable HEAD is required; the checkout root must also be inside the allowed roots. Work runs at the checkout root, including when `directory` names a subdirectory.
+Edits a Git checkout using one explicitly selected current free model. A Git repository with a readable HEAD is required; the checkout root must also be inside the allowed roots. The lock, identity check and recovery snapshot stay at the checkout root, while OpenCode and the final check run in the requested `directory` (`workDir`, for example a monorepo package).
 
 The `build` permission profile allows file edits with read/edit path restrictions, including enumerated ignored paths. Bash, delegated tasks, web tools and external-directory access remain denied. The bridge executes the caller's verification command separately. There is no model fallback and no blanket permission approval.
 
@@ -116,7 +116,7 @@ The `build` permission profile allows file edits with read/edit path restriction
 | `codeMap` | `true` | Rebuild the optional current-content map for each launch. |
 | `guard` | Shared defaults | Cumulative counters and failure window across the initial run and repairs. |
 
-A verification command is `{command, args?, timeoutSeconds?}`. Arguments are literal strings; command and args cannot contain NUL. The command runs from the checkout root with closed stdin and `shell:false`. The default timeout is 60 seconds, integer range 1-300. On Windows, `npm`, `npx`, `npm.cmd` and `npx.cmd` resolve through Node and installed npm CLI scripts; other `.cmd`/`.bat` commands are refused. A pass requires exit zero without a signal, timeout or cancellation.
+A verification command is `{command, args?, timeoutSeconds?}`. Arguments are literal strings; command and args cannot contain NUL. The command runs in the requested `directory` (`workDir`) with closed stdin and `shell:false`. The default timeout is 60 seconds, integer range 1-300. On Windows, `npm`, `npx`, `npm.cmd`, `npx.cmd`, global `pnpm`/`yarn` (and corepack) shims, and `node_modules/.bin` tools (bare name or explicit `node_modules/.bin/<tool>` path) resolve directly to Node or their wrapped `.exe` without a shell; arbitrary `.cmd`/`.bat` files are refused. A pass requires exit zero without a signal, timeout or cancellation.
 
 Typical call to `apply_opencode_edits`:
 
@@ -237,7 +237,7 @@ The helper supplies `OPENCODE_PERMISSION` and an explicit selected-agent profile
 
 With `run --attach`, OpenCode loads permissions in the **server process**. The helper starts each server with the cold run's environment and working directory and matches the executable, mode, directory and full environment before reuse. It keeps up to two analysis servers, evicts the least recently used idle server and stops each after 120 idle seconds. A checked edit owns its server through same-session repairs and stops it after a passing edit commits or before restoring/keeping on failure. Each server requires its own random basic-auth password (`OPENCODE_SERVER_PASSWORD`, passed only through the environment to the server and its attached runs), because `opencode serve` is otherwise open to any local process.
 
-When both analysis servers are busy, additional runs start cold. A server that fails to announce its listening port within 15 seconds is replaced by a cold run. A server that dies before its attached run printed any JSON event triggers one cold retry within the original attempt budget. A client that exits by itself, an observed JSON event, a provider limit or a guard stop is never replayed, and a quiet run is never stopped for being quiet (OpenCode waits through provider retries without events), so no request reaches the model twice. If the helper cannot confirm the server tree stopped, it skips the retry and retains any edit recovery snapshot.
+When both analysis servers are busy, additional runs start cold. A server that fails to announce its listening port within 15 seconds is replaced by a cold run. A server that dies before its attached run printed any JSON event triggers one cold retry within the original attempt budget. A client that exits by itself, an observed JSON event, a provider limit or a guard stop is never replayed, and a quiet run is never stopped for being quiet (OpenCode waits through provider retries without events); however, if the server dies after the provider already accepted the request but before the first JSON event arrives, that one cold retry still resends the request. If the helper cannot confirm the server tree stopped, it skips the retry and retains any edit recovery snapshot.
 
 ## Tests
 
