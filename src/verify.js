@@ -119,6 +119,39 @@ async function resolveCmdShim(file, args, depth) {
   return viaNode ? { command: process.execPath, args: [target, ...args] } : { command: target, args };
 }
 
+function createWindow() {
+    return { chunks: [], head: 0, bytes: 0 };
+}
+function pushRolling(window, chunk) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    if (!buf.length)
+        return;
+    if (buf.length >= OUTPUT_LIMIT) {
+        window.chunks = [Buffer.from(buf.subarray(buf.length - OUTPUT_LIMIT))];
+        window.head = 0;
+        window.bytes = OUTPUT_LIMIT;
+        return;
+    }
+    window.chunks.push(buf);
+    window.bytes += buf.length;
+    while (window.bytes > OUTPUT_LIMIT && window.head < window.chunks.length) {
+        const overflow = window.bytes - OUTPUT_LIMIT;
+        const first = window.chunks[window.head];
+        if (first.length <= overflow) {
+            window.chunks[window.head] = undefined;
+            window.head++;
+            window.bytes -= first.length;
+        }
+        else {
+            window.chunks[window.head] = first.subarray(overflow);
+            window.bytes -= overflow;
+        }
+    }
+    if (window.head > 0 && window.head * 2 >= window.chunks.length) {
+        window.chunks = window.chunks.slice(window.head);
+        window.head = 0;
+    }
+}
 function tail(chunks) {
     const redacted = Buffer.from(redactSecrets(Buffer.concat(chunks).toString("utf8")), "utf8");
     let start = Math.max(0, redacted.length - TAIL_LIMIT);
@@ -150,8 +183,8 @@ export async function runVerification(spec, cwd, signal, { spawnImpl = spawn, re
         }); } catch { reject(new VerificationError("verification_launch_failed", "Could not launch verification executable.")); return; }
         job?.assign(child);
         const pid = child.pid;
-        const stdout = [], stderr = [];
-        let bytes = 0, timedOut = false, killedForOutput = false, cancelled = false, done = false, stopped = false;
+        const stdout = createWindow(), stderr = createWindow();
+        let timedOut = false, cancelled = false, done = false, stopped = false;
         let killDeadline, exitGrace, confirm, exitedAt;
         // A real verify process tree must be confirmed dead before the result returns: a restore follows.
         const realChild = child instanceof ChildProcess && Number.isInteger(pid) && pid > 0;
@@ -187,24 +220,18 @@ export async function runVerification(spec, cwd, signal, { spawnImpl = spawn, re
                 return;
             done = true;
             cleanup();
-            const settle = (kill) => resolve({ passed: exitCode === 0 && !timedOut && !killedForOutput && !cancelled && !exitSignal && (!kill || kill.confirmed),
-                exitCode, signal: exitSignal ?? (cancelled ? "SIGKILL" : null), timedOut, killedForOutput,
-                durationMs: performance.now() - started, stdoutTail: tail(stdout), stderrTail: tail(stderr),
+            const settle = (kill) => resolve({ passed: exitCode === 0 && !timedOut && !cancelled && !exitSignal && (!kill || kill.confirmed),
+                exitCode, signal: exitSignal ?? (cancelled ? "SIGKILL" : null), timedOut, killedForOutput: false,
+                durationMs: performance.now() - started, stdoutTail: tail(stdout.chunks.slice(stdout.head)), stderrTail: tail(stderr.chunks.slice(stderr.head)),
                 ...(kill && !kill.confirmed ? { killConfirmed: false, stillAlive: kill.alive, ...(kill.unverified ? { killUnverified: true } : {}) } : {}) });
             if (confirm) confirm.then(settle);
             else settle();
         };
-        const collect = (chunk, chunks) => {
-            if (done || killedForOutput)
+        const collect = (chunk, window) => {
+            if (done)
                 return;
-            // Keep a bounded redaction context before cutting the final 8 KiB tails.
-            const remaining = Math.max(0, OUTPUT_LIMIT + 1 - bytes);
-            chunks.push(chunk.subarray(0, remaining));
-            bytes += chunk.length;
-            if (bytes > OUTPUT_LIMIT) {
-                killedForOutput = true;
-                stop();
-            }
+            // Keep a rolling 1 MiB redaction context per stream before cutting the final 8 KiB tails.
+            pushRolling(window, chunk);
         };
         child.stdout.on("data", (chunk) => collect(chunk, stdout));
         child.stderr.on("data", (chunk) => collect(chunk, stderr));

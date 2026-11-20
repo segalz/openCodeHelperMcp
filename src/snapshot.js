@@ -1,7 +1,7 @@
 // Ported from ClineMcp; preserve recovery/lock compatibility.
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { defaultKillTree } from "./process-utils.js";
@@ -113,13 +113,130 @@ async function safeFile(root, file) {
             throw new SnapshotError("snapshot_unsupported", `Non-directory ancestor: ${file}`);
     }
 }
-async function files(root, signal) {
-    const stages = (await git(root, ["ls-files", "--stage", "-z"], signal)).toString("utf8").split("\0");
-    if (stages.some(line => line.startsWith("160000 ") || line.startsWith("120000 "))) {
-        throw new SnapshotError("snapshot_unsupported", "Submodules and tracked symlinks are refused.");
+/** Verify every ancestor of `file` is a real directory (no symlink, reparse point, or nested repo). */
+async function safeAncestors(root, file) {
+    const absolute = relativePath(root, file);
+    const parts = file.split("/");
+    let current = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+        current = path.join(current, parts[i]);
+        const stat = await statOrMissing(current);
+        if (!stat)
+            return { absolute, missingAncestor: true };
+        if (stat.isSymbolicLink())
+            throw new SnapshotError("snapshot_unsupported", `Symlink/reparse point refused: ${file}`);
+        const resolved = await realpath(current);
+        if (path.resolve(resolved).toLowerCase() !== path.resolve(current).toLowerCase()) {
+            throw new SnapshotError("snapshot_unsupported", `Reparse point refused: ${file}`);
+        }
+        if (stat.isDirectory() && await statOrMissing(path.join(current, ".git"))) {
+            throw new SnapshotError("snapshot_unsupported", `Nested repository refused: ${file}`);
+        }
+        if (!stat.isDirectory())
+            throw new SnapshotError("snapshot_unsupported", `Non-directory ancestor: ${file}`);
     }
-    return [...new Set((await git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], signal))
-            .toString("utf8").split("\0").filter(Boolean))].sort();
+    return { absolute, missingAncestor: false };
+}
+function isSpecialPath(file, specialEntries) {
+    if (!specialEntries?.length)
+        return false;
+    const normalized = file.endsWith("/") ? file.slice(0, -1) : file;
+    for (const entry of specialEntries) {
+        if (normalized === entry.path || normalized.startsWith(entry.path + "/"))
+            return true;
+    }
+    return false;
+}
+const SPECIAL_PLACEHOLDER_LIMIT = 1024 * 1024;
+async function specialEntryState(root, entry, signal, { baseline = false } = {}) {
+    const { absolute, missingAncestor } = await safeAncestors(root, entry.path);
+    if (missingAncestor)
+        return "missing";
+    const stat = await statOrMissing(absolute);
+    if (!stat)
+        return "missing";
+    if (entry.kind === "symlink") {
+        if (stat.isSymbolicLink()) {
+            const target = await readlink(absolute);
+            if (baseline) {
+                const resolvedTarget = path.resolve(path.dirname(absolute), target);
+                const rel = path.relative(root, resolvedTarget);
+                if (rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
+                    throw new SnapshotError("snapshot_unsupported", `Tracked symlink points outside the checkout: ${entry.path}`);
+                }
+            }
+            return `link:${target}`;
+        }
+        if (stat.isFile()) {
+            const resolved = await realpath(absolute);
+            if (path.resolve(resolved).toLowerCase() !== path.resolve(absolute).toLowerCase())
+                return "other";
+            if (stat.size > SPECIAL_PLACEHOLDER_LIMIT)
+                return `file-large:${stat.size}`;
+            return `file:${hash(await readFile(absolute, { signal }))}`;
+        }
+        return "other";
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory())
+        return "other";
+    const resolved = await realpath(absolute);
+    if (path.resolve(resolved).toLowerCase() !== path.resolve(absolute).toLowerCase())
+        return "other";
+    if (await statOrMissing(path.join(absolute, ".git"))) {
+        const [headBuf, status] = await Promise.all([
+            git(absolute, ["rev-parse", "HEAD"], signal),
+            git(absolute, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], signal)
+        ]);
+        if (baseline && status.length > 0)
+            throw new SnapshotError("snapshot_unsupported", `Dirty submodule baseline refused: ${entry.path}`);
+        return `repo:${headBuf.toString("utf8").trim()}:${hash(status)}`;
+    }
+    const names = (await readdir(absolute)).sort();
+    if (baseline && names.length > 0)
+        throw new SnapshotError("snapshot_unsupported", `Non-empty uninitialized submodule refused: ${entry.path}`);
+    return `dir:${JSON.stringify(names)}`;
+}
+async function files(root, signal) {
+    const [stageBuf, allBuf] = await Promise.all([
+        git(root, ["ls-files", "--stage", "-z"], signal),
+        git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], signal)
+    ]);
+    const stages = stageBuf.toString("utf8").split("\0");
+    const specialMap = new Map();
+    const regularPaths = new Set();
+    const conflicts = new Set();
+    for (const line of stages) {
+        if (!line)
+            continue;
+        const tab = line.indexOf("\t");
+        if (tab === -1)
+            continue;
+        const file = line.slice(tab + 1);
+        if (!file)
+            continue;
+        const [mode, , stage] = line.slice(0, tab).split(" ");
+        if (mode === "120000" || mode === "160000") {
+            const kind = mode === "120000" ? "symlink" : "submodule";
+            if (stage !== "0")
+                conflicts.add(file);
+            if (specialMap.has(file) && specialMap.get(file) !== kind)
+                conflicts.add(file);
+            specialMap.set(file, kind);
+        }
+        else {
+            regularPaths.add(file);
+        }
+    }
+    for (const file of specialMap.keys()) {
+        if (regularPaths.has(file))
+            conflicts.add(file);
+    }
+    const special = [...specialMap.entries()]
+        .map(([file, kind]) => ({ path: file, kind }))
+        .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const all = [...new Set(allBuf.toString("utf8").split("\0").filter(Boolean))].sort();
+    const regular = special.length ? all.filter(file => !isSpecialPath(file, special)) : all;
+    return { regular, special, conflicts: [...conflicts] };
 }
 /** Ignored paths, with ignored folders collapsed to one "dir/" entry (cheap even with node_modules). */
 async function ignoredEntries(root, signal) {
@@ -164,7 +281,33 @@ export async function takeSnapshot(checkoutRoot, opts = {}) {
     if (!relative || (!relative.startsWith(".." + path.sep) && relative !== ".." && !path.isAbsolute(relative))) {
         throw new SnapshotError("snapshot_invalid", "Snapshot storage must be outside the checkout.");
     }
-    const candidates = await files(root, opts.signal);
+    const { regular: candidates, special, conflicts } = await files(root, opts.signal);
+    if (conflicts.length) {
+        throw new SnapshotError("snapshot_unsupported", `Conflicted tracked symlink/submodule refused: ${conflicts[0]}`);
+    }
+    if (special.length) {
+        const specialLower = new Map();
+        for (const entry of special) {
+            const lower = entry.path.toLowerCase();
+            if (specialLower.has(lower))
+                throw new SnapshotError("snapshot_unsupported", `Case-colliding special path refused: ${entry.path}`);
+            specialLower.set(lower, entry.path);
+        }
+        for (const file of candidates) {
+            const normalized = file.endsWith("/") ? file.slice(0, -1) : file;
+            let prefix = "";
+            for (const part of normalized.split("/")) {
+                prefix = prefix ? `${prefix}/${part}` : part;
+                const matched = specialLower.get(prefix.toLowerCase());
+                if (matched !== undefined && prefix !== matched)
+                    throw new SnapshotError("snapshot_unsupported", `Case-colliding path refused: ${file}`);
+            }
+        }
+    }
+    const specialEntries = [];
+    for (const entry of special) {
+        specialEntries.push({ ...entry, state: await specialEntryState(root, entry, opts.signal, { baseline: true }) });
+    }
     const entries = [];
     let total = 0;
     for (const file of candidates) {
@@ -193,8 +336,10 @@ export async function takeSnapshot(checkoutRoot, opts = {}) {
         content.push(bytes);
     }
     const directory = path.join(resolvedBase, randomUUID());
+    const [ignored, exclude] = await Promise.all([ignoredEntries(root, opts.signal), excludeFile(root, opts.signal)]);
     const handle = { checkoutRoot: root, directory, manifest: entries.map((entry, i) => ({ path: entry.path, size: content[i].length, sha256: hash(content[i]) })),
-        ignoredEntries: await ignoredEntries(root, opts.signal), excludeFile: await excludeFile(root, opts.signal) };
+        ...(specialEntries.length ? { specialEntries } : {}),
+        ignoredEntries: ignored, excludeFile: exclude };
     try {
         await mkdir(directory, { recursive: true, mode: 0o700 });
         for (let i = 0; i < content.length; i++)
@@ -238,6 +383,7 @@ export async function restoreSnapshot(handle) {
     const root = await checkout(handle.checkoutRoot);
     const report = { restored: [], removed: [], failed: [] };
     const baseline = new Set(handle.manifest.map(entry => entry.path));
+    const special = handle.specialEntries ?? [];
     const prune = async (dir) => {
         while (dir !== root) {
             try { await rmdir(dir); }
@@ -263,6 +409,7 @@ export async function restoreSnapshot(handle) {
     const ignoreDone = new Set();
     for (let i = 0; i < handle.manifest.length; i++) {
         if (!isIgnoreFile(handle.manifest[i].path)) continue;
+        if (isSpecialPath(handle.manifest[i].path, special)) continue;
         ignoreDone.add(i);
         try { if (await restoreEntry(root, handle, i)) report.restored.push(handle.manifest[i].path); }
         catch (err) { report.failed.push({ path: handle.manifest[i].path, error: err.message }); }
@@ -272,11 +419,12 @@ export async function restoreSnapshot(handle) {
         // ignored entries that did not exist at snapshot time. Repeat for nested ones, a bounded number of times.
         const known = new Set(handle.ignoredEntries);
         for (let round = 0; round < 5; round++) {
-            const candidates = new Set((await files(root)).filter(file => isIgnoreFile(file) && !baseline.has(file)));
+            const { regular } = await files(root);
+            const candidates = new Set(regular.filter(file => isIgnoreFile(file) && !baseline.has(file) && !isSpecialPath(file, special)));
             for (const entry of await ignoredEntries(root)) {
                 if (known.has(entry)) continue;
                 const file = entry.endsWith("/") ? `${entry}.gitignore` : entry;
-                if (isIgnoreFile(file) && !baseline.has(file) && await statOrMissing(relativePath(root, file)).catch(() => undefined)) candidates.add(file);
+                if (isIgnoreFile(file) && !baseline.has(file) && !isSpecialPath(file, special) && await statOrMissing(relativePath(root, file)).catch(() => undefined)) candidates.add(file);
             }
             if (!candidates.size) break;
             const before = report.removed.length;
@@ -296,17 +444,27 @@ export async function restoreSnapshot(handle) {
         }
         catch (err) { report.failed.push({ path: "info/exclude", error: err.message }); }
     }
-    const current = await files(root);
+    const { regular: current } = await files(root);
     // check-ignore respects tracked files. A newly ignored baseline path must not be overwritten.
     const ignored = new Set(handle.manifest.length ? (await git(root, ["check-ignore", "-z", "--stdin"], undefined, handle.manifest.map(entry => entry.path).join("\0") + "\0", [0, 1])).toString("utf8").split("\0") : []);
-    for (const file of current.filter(file => !baseline.has(file))) await remove(file);
+    for (const file of current.filter(file => !baseline.has(file) && !isSpecialPath(file, special))) await remove(file);
     for (let i = 0; i < handle.manifest.length; i++) {
         if (ignoreDone.has(i)) continue;
         const entry = handle.manifest[i];
+        if (isSpecialPath(entry.path, special)) continue;
         try {
             if (ignored.has(entry.path))
                 throw new SnapshotError("snapshot_unsupported", "Baseline path is now ignored; left untouched.");
             if (await restoreEntry(root, handle, i)) report.restored.push(entry.path);
+        }
+        catch (err) { report.failed.push({ path: entry.path, error: err.message }); }
+    }
+    for (const entry of special) {
+        try {
+            const now = await specialEntryState(root, entry);
+            if (now !== entry.state) {
+                report.failed.push({ path: entry.path, error: `Tracked ${entry.kind} changed during the run; it was left as is.` });
+            }
         }
         catch (err) { report.failed.push({ path: entry.path, error: err.message }); }
     }
@@ -315,10 +473,12 @@ export async function restoreSnapshot(handle) {
 /** Files that exist now but not in the baseline (ignored files excluded, so build caches do not show up). */
 export async function createdFiles(handle) {
     const baseline = new Set(handle.manifest.map(entry => entry.path));
+    const special = handle.specialEntries ?? [];
     const root = await checkout(handle.checkoutRoot);
     const created = [];
+    const { regular } = await files(root);
     // A tracked file deleted before the run is listed by Git but absent: only files that exist now count.
-    for (const file of (await files(root)).filter(file => !baseline.has(file))) {
+    for (const file of regular.filter(file => !baseline.has(file) && !isSpecialPath(file, special))) {
         try { if (await statOrMissing(relativePath(root, file.endsWith("/") ? file.slice(0, -1) : file))) created.push(file); }
         catch { created.push(file); }
     }

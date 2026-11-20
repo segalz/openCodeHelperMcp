@@ -252,7 +252,9 @@ test("MCP preparation cancellation never launches edits", async () => {
   assert.equal(out.isError, true); assert.match(JSON.parse(out.content[0].text).message, /cancelled/);
 });
 
-test("verification injected timeout/output limits kill the child and cannot pass", async () => {
+// Output volume no longer kills the check (plan S14 C6); overflow=true now checks that 1 MiB+1 does not stop it
+// and the injected timeout still does.
+test("verification injected timeout kills the child and cannot pass, whatever the output volume", async () => {
   for (const overflow of [false, true]) {
     const c = new EventEmitter(), timers = [], kills = []; c.pid = 123; c.stdout = new EventEmitter(); c.stderr = new EventEmitter();
     c.stdout.destroy = c.stderr.destroy = () => {}; c.kill = () => {};
@@ -260,8 +262,9 @@ test("verification injected timeout/output limits kill the child and cannot pass
       resolveImpl: async () => ({ command: "node", args: [] }), spawnImpl: (_exe, _args, options) => { assert.equal(options.shell, false); return c; },
       killImpl: pid => { kills.push(pid); c.emit("close", 0, null); }, setTimeoutImpl: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeoutImpl: () => {} });
     await new Promise(resolve => setImmediate(resolve));
-    if (overflow) c.stdout.emit("data", Buffer.alloc(1024 * 1024 + 1, 65)); else timers[0].fn();
-    const out = await pending; assert.equal(out.passed, false); assert.deepEqual(kills, [123]); assert.equal(out.killedForOutput, overflow); assert.equal(out.timedOut, !overflow); assert.ok(Buffer.byteLength(out.stdoutTail) <= 8192);
+    if (overflow) { c.stdout.emit("data", Buffer.alloc(1024 * 1024 + 1, 65)); assert.deepEqual(kills, []); }
+    timers[0].fn();
+    const out = await pending; assert.equal(out.passed, false); assert.deepEqual(kills, [123]); assert.equal(out.killedForOutput, false); assert.equal(out.timedOut, true); assert.ok(Buffer.byteLength(out.stdoutTail) <= 8192);
   }
 });
 
