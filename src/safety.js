@@ -14,9 +14,19 @@ const SECRET_PATTERNS = [
   [/\b(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{32,}\b/g,
     (match, offset, full) => {
       if (!GIT_SHA.test(match)) return "[REDACTED]";
+      // A Git SHA in prose (`commit <sha>`, `(<sha>)`) stays readable. Walk back over spaces and opening wrappers
+      // (quotes, backticks, brackets, a string prefix such as r"..."): a value of an assignment, a mapping, a
+      // redacted key or a secret-named flag is a credential (plan S18 review).
       let i = offset - 1;
-      while (i >= 0 && /\s/.test(full[i])) i--;
-      return i >= 0 && (full[i] === "=" || full[i] === ":") ? "[REDACTED]" : match;
+      for (;;) {
+        while (i >= 0 && /[\s"'`(\[{\\]/.test(full[i])) i--;
+        if (i >= 1 && /[rbfu]/i.test(full[i]) && !/[A-Za-z0-9_]/.test(full[i - 1])) { i--; continue; }
+        break;
+      }
+      if (i < 0) return match;
+      if (full[i] === "=" || full[i] === ":" || full[i] === ">") return "[REDACTED]";
+      const before = full.slice(Math.max(0, i - 80), i + 1);
+      return /(?:\[REDACTED\]|(?:token|key|secret|password|passwd|session|auth|credential|cookie)[\w-]*)$/i.test(before) ? "[REDACTED]" : match;
     }],
 ];
 

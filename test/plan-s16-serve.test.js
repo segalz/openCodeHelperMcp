@@ -240,8 +240,17 @@ test("S16 edit and same-session repair share a private server that exits before 
       restoreSnapshotImpl: async () => { recoveryCalls.push("restore"); return { failed: [] }; },
       discardSnapshotImpl: async () => { recoveryCalls.push("discard"); },
     });
-    assert.equal(uncertain.error, identityChanges ? "identity_changed" : "server_stop_unconfirmed");
-    assert.equal(uncertain.verification.kept, false);
+    if (identityChanges) {
+      assert.equal(uncertain.error, "identity_changed");
+      assert.equal(uncertain.verification.kept, true);
+    } else {
+      assert.equal(uncertain.status, "done");
+      assert.equal(uncertain.error, undefined);
+      assert.equal(uncertain.verification.passed, true);
+      assert.equal(uncertain.verification.restored, false);
+      assert.ok(uncertain.warnings?.some(w => /still be running/i.test(w)));
+    }
+    assert.deepEqual(uncertain.evidence.processesStillAlive, []);
     assert.equal(uncertain.evidence.snapshotDirectory, "fixture");
     assert.deepEqual(recoveryCalls, []);
   }

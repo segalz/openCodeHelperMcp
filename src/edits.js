@@ -48,6 +48,9 @@ function cleanQuestionRest(raw) {
 
 function isNoQuestionRest(rest) {
   if (!rest) return true;
+  // A question mark means a real question, even after "No ..." (plan S18, A4). Otherwise the S2 prefix rule
+  // stays: models end with free text such as "None at this time." or "No, all done.".
+  if (rest.includes("?")) return false;
   return /^(?:not applicable|none|nothing|n\/a|na|nil|no)(?!\w)/i.test(rest);
 }
 
@@ -66,6 +69,8 @@ const isInputRequired = text => {
   if (!parsed) return false;
   return parsed.isQuestion;
 };
+/** Exported for tests only. */
+export const isInputRequiredForTest = isInputRequired;
 
 function hasEarlierQuestion(text) {
   if (typeof text !== "string") return false;
@@ -124,16 +129,22 @@ export async function runEdits(rawInput, {
   const verification = { required: !("none" in input.verify), passed: null, command: "none" in input.verify ? null : input.verify,
     ...("none" in input.verify ? { reason: input.verify.reason } : {}), attempts: [], fixRuns: 0, restored: false, kept: false };
   const result = { status: "failed", model: input.model, codeMapSource: "none", verification, usage, evidence: {} };
-  // A stopped run or verify whose processes were not confirmed dead: the restore may be overwritten later.
-  const warnIfStillRunning = (outcome) => {
-    if (outcome?.killConfirmed !== false) return;
-    const warning = "A process from the stopped run may still be running; files may change after the restore.";
-    result.warnings ??= [];
-    if (!result.warnings.includes(warning)) result.warnings.push(warning);
-  };
+  let unconfirmedKill = false;
   // root: the checkout (lock, identity, snapshot). workDir: the requested folder, maybe a monorepo package, where
   // OpenCode and the final check run.
   let root, workDir, release, snapshot, identity, completed = false, sessionID;
+  // A stopped run, verify, or server whose processes were not confirmed dead: retain the recovery snapshot.
+  const warnIfStillRunning = (outcome) => {
+    if (outcome?.killConfirmed !== false) return;
+    unconfirmedKill = true;
+    const warning = completed
+      ? "A process from the stopped edit server may still be running; files may change."
+      : "A process from the stopped run may still be running; files may change after the restore.";
+    result.warnings ??= [];
+    if (!result.warnings.includes(warning)) result.warnings.push(warning);
+    const alive = Array.isArray(outcome.stillAlive) ? outcome.stillAlive : [];
+    result.evidence.processesStillAlive = [...new Set([...(result.evidence.processesStillAlive ?? []), ...alive])];
+  };
   const check = () => {
     if (signal?.aborted) throw failure("cancelled", "Edit lifecycle cancelled.");
     if (controller.signal.aborted || nowImpl() >= deadline) throw failure("budget_exceeded", "Overall edit deadline exhausted.");
@@ -159,6 +170,7 @@ export async function runEdits(rawInput, {
         }
       } catch { /* report-only */ }
     }
+    if (unconfirmedKill) return;
     try { await discardSnapshotImpl(snapshot); snapshot = undefined; delete result.evidence.snapshotDirectory; }
     catch (error) { result.evidence.cleanupError = redactSecrets(String(error)); }
   };
@@ -201,7 +213,12 @@ export async function runEdits(rawInput, {
       try { response = await runner({ directory: workDir, checkoutRoot: root, prompt, model: input.model, variant, mode: "edits", codeMap: input.codeMap ?? true,
         guardState, sessionID, ignoredPaths, editScope, signal: controller.signal,
         timeoutMs: runMs }); }
-      catch (error) { response = { error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard }; }
+      catch (error) {
+        response = {
+          error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard,
+          ...(error?.killConfirmed === false ? { killConfirmed: false, stillAlive: error.stillAlive } : {}),
+        };
+      }
       result.codeMapSource = response?.codeMapSource ?? "none";
       if (response?.usage) for (const key of Object.keys(usage)) usage[key] += Number.isFinite(response.usage[key]) ? response.usage[key] : 0;
       if (response?.guard?.kind) result.guard = response.guard;
@@ -212,6 +229,7 @@ export async function runEdits(rawInput, {
       if (sessionID && returnedSession !== sessionID && (returnedSession || !response?.error)) throw failure("session_mismatch", "OpenCode repair did not continue the expected session.");
       sessionID = returnedSession ?? sessionID; result.sessionID = sessionID;
       if (response?.error || response?.guard?.kind || guardState.snapshot().kind) throw failure(response?.guard?.kind ?? guardState.snapshot().kind ?? "opencode_error", response?.error ?? "Guard stopped edits.");
+      if (response?.killConfirmed === false) throw failure("process_still_running", "A process from the stopped edit run may still be running.");
       if (isInputRequired(response?.text)) throw failure("input_required", "OpenCode returned no final answer or requested caller input.");
       result.text = response.text;
       if (hasEarlierQuestion(response?.text)) {
@@ -227,21 +245,28 @@ export async function runEdits(rawInput, {
         attempt = { passed: false, exitCode: null, signal: null, timedOut: false, killedForOutput: false, durationMs: 0, stdoutTail: "", stderrTail: redactSecrets(error.message), error: error.kind };
       }
       warnIfStillRunning(attempt);
-      attempt = { ...attempt, run: run + 1, stdoutTail: redactSecrets(attempt.stdoutTail ?? ""), stderrTail: redactSecrets(attempt.stderrTail ?? "") };
+      const passed = Boolean(attempt.passed) && attempt.killConfirmed !== false;
+      attempt = { ...attempt, passed, run: run + 1, stdoutTail: redactSecrets(attempt.stdoutTail ?? ""), stderrTail: redactSecrets(attempt.stderrTail ?? "") };
       verification.attempts.push(attempt); verification.passed = attempt.passed;
       await unchanged(false); check();
       if (attempt.passed) break;
-      if (attempt.error || run >= (input.maxFixRuns ?? 2)) throw failure("verify_failed", "Final verification failed; no further automatic repairs are allowed.");
+      if (attempt.error || attempt.killConfirmed === false || run >= (input.maxFixRuns ?? 2)) throw failure("verify_failed", "Final verification failed; no further automatic repairs are allowed.");
       prompt = buildFixPrompt(input.prompt, input.verify, attempt, workDir);
     }
-    await editScope.close();
-    await unchanged(false); check(); completed = true;
+    completed = true;
+    try { await editScope.close(); } catch (closeError) {
+      if (closeError?.kind === "server_stop_unconfirmed") warnIfStillRunning(closeError);
+      else (result.warnings ??= []).push(`Could not stop the OpenCode edit server cleanly: ${redactSecrets(closeError?.message ?? String(closeError))}`);
+    }
     await discard(true); result.status = "done";
   } catch (error) {
     result.error = error?.kind ?? "edits_failed"; result.message = redactSecrets(error?.message ?? String(error));
     if (snapshot && !completed) {
       try {
-        await editScope.close();
+        try { await editScope.close(); } catch (closeError) {
+          if (closeError?.kind !== "server_stop_unconfirmed") throw closeError;
+          warnIfStillRunning(closeError);
+        }
         await unchanged(false);
         if (input.keepOnFailure) { verification.kept = true; await discard(true); }
         else {

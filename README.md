@@ -150,11 +150,11 @@ An exemption reports `required:false`, `passed:null`, the reason, and no verific
 3. On a failed check, launch up to `maxFixRuns` repairs using `--session <captured-id>`, the same model/variant/profile and the remaining budgets. Each repair includes the original objective, exact check, exit/timeout/output-limit status and redacted tails, with instructions never to weaken the check. Verify again after each repair.
 4. On success, dispose of the snapshot. On failure, restore the pre-run files by default; `keepOnFailure:true` keeps the current changes. Release the lock before returning.
 
-A guard trip, deadline, cancellation, model error or request for caller input does not start an automatic repair. A missing/refused verification executable spends no repair runs. A repair requires the captured session ID; missing or mismatched continuation fails explicitly. The helper never uses `--continue` or `--fork`.
+A guard trip, deadline, cancellation, model error, unconfirmed kill or request for caller input does not start an automatic repair. A missing/refused verification executable spends no repair runs. A repair requires the captured session ID; missing or mismatched continuation fails explicitly. The helper never uses `--continue` or `--fork`.
 
 The snapshot contains tracked working-tree files and untracked non-ignored files, including dirty and binary bytes; tracked deletions remain absent in the baseline. Restoration returns to those bytes rather than HEAD, restores deleted baseline files, and removes newly created non-ignored files. Existing staging is protected by unchanged index identity; the index itself is not backed up or restored. Untracked ignored files and external files are outside snapshot recovery.
 
-HEAD/index identity is checked around launches, after verification and before restoration. Changed or unreadable identity refuses restoration and retains the snapshot. Incomplete restoration also retains recovery bytes. Inspect `evidence` for identity details, restore failures and `snapshotDirectory`. A cleanup error can leave a snapshot even after successful verification. The writer lock is released on terminal paths, including recovery refusal.
+HEAD/index identity is checked around launches, after verification and before restoration. Changed or unreadable identity refuses restoration and retains the snapshot. Incomplete restoration or an unconfirmed process-tree kill also retains recovery bytes; `evidence` reports `processesStillAlive` and `snapshotDirectory` alongside a warning. A passing check (after identity and deadline checks) commits the edit before stopping its edit server; an unconfirmed server stop or caller cancel after that warns without failing or restoring. A cleanup error can leave a snapshot even after successful verification. The writer lock is released on terminal paths, including recovery refusal.
 
 The lock uses the same canonical-path SHA-256 filename and holder format as the Cline bridge, under `~/.cline-mcp/locks`. This excludes cooperating Cline and OpenCode writers on the same checkout. Dead-PID holders can be reclaimed; age alone does not make a lock stale. The lock does not block other editors or Git clients, so use the checkout exclusively during an edit call.
 
@@ -177,7 +177,7 @@ usage: {inputTokens, uncachedInputTokens, cacheReadTokens, cacheWriteTokens,
         outputTokens, reasoningTokens, cost, steps}
 guard: {window, totalToolCalls, totalInputTokens, budgetInputTokens, lastErrors,
         filesTouched, observation, kind?, tool?, target?, count?, lastAssistantText?}
-evidence: {snapshotDirectory?, identity?, identityError?, restore?,
+evidence: {snapshotDirectory?, processesStillAlive?, identity?, identityError?, restore?,
            recoveryError?, cleanupError?}
 error?, message?
 ```
@@ -235,7 +235,7 @@ Errors include available CLI exit/error details and bounded stderr tails, with c
 
 The helper supplies `OPENCODE_PERMISSION` and an explicit selected-agent profile through `OPENCODE_CONFIG_CONTENT` for each model launch; these are not caller-controlled permission escape switches. Invalid inline configuration is refused before launch. Permission and JSON-event integration depends on the installed OpenCode CLI's behavior.
 
-With `run --attach`, OpenCode loads permissions in the **server process**. The helper starts each server with the cold run's environment and working directory and matches the executable, mode, directory and full environment before reuse. It keeps up to two analysis servers, evicts the least recently used idle server and stops each after 120 idle seconds. A checked edit owns its server through same-session repairs and stops it before keeping or restoring files. Each server requires its own random basic-auth password (`OPENCODE_SERVER_PASSWORD`, passed only through the environment to the server and its attached runs), because `opencode serve` is otherwise open to any local process.
+With `run --attach`, OpenCode loads permissions in the **server process**. The helper starts each server with the cold run's environment and working directory and matches the executable, mode, directory and full environment before reuse. It keeps up to two analysis servers, evicts the least recently used idle server and stops each after 120 idle seconds. A checked edit owns its server through same-session repairs and stops it after a passing edit commits or before restoring/keeping on failure. Each server requires its own random basic-auth password (`OPENCODE_SERVER_PASSWORD`, passed only through the environment to the server and its attached runs), because `opencode serve` is otherwise open to any local process.
 
 When both analysis servers are busy, additional runs start cold. A server that fails to announce its listening port within 15 seconds is replaced by a cold run. A server that dies before its attached run printed any JSON event triggers one cold retry within the original attempt budget. A client that exits by itself, an observed JSON event, a provider limit or a guard stop is never replayed, and a quiet run is never stopped for being quiet (OpenCode waits through provider retries without events), so no request reaches the model twice. If the helper cannot confirm the server tree stopped, it skips the retry and retains any edit recovery snapshot.
 
