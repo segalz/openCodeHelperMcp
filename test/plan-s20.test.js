@@ -59,6 +59,24 @@ test("S20 review: an explicit path to the installed npm still resolves", { skip:
   }
 });
 
+test("Gate 6: prefixed *_KEY secrets, Basic/Bearer after assignments and unquoted session ids are redacted", () => {
+  for (const [text, secret] of [
+    ['PRIVATE_KEY="hunter2hunter2"', "hunter2hunter2"],
+    ['{"private_key": "hunter2hunter2"}', "hunter2hunter2"],
+    ['{"private-key": "hunter2hunter2"}', "hunter2hunter2"],
+    ["OPENAI_KEY=hunter2hunter2", "hunter2hunter2"],
+    ["token = Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"],
+    ['token = Bearer "hunter2hunter2"', "hunter2hunter2"],
+    ['Authorization: Bearer "hunter2hunter2"', "hunter2hunter2"],
+    ["session_id = hunter2hunter2", "hunter2hunter2"],
+  ]) {
+    assert.ok(!redactSecrets(text).includes(secret), `${text} -> ${redactSecrets(text)}`);
+  }
+  for (const text of ['sort_key: "name"', "primary_key=id", 'cache_key = "user:1"']) {
+    assert.equal(redactSecrets(text), text);
+  }
+});
+
 test("S20 (5): an explicit path to a missing npm is refused, not replaced by the installed npm", async () => {
   const missing = path.join(base, "missing", "path", "npm");
   await assert.rejects(resolveVerificationCommand(missing, ["test"], base), VerificationError);
