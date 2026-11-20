@@ -9,6 +9,7 @@ import { emptyUsage } from "./events.js";
 import { redactSecrets } from "./safety.js";
 import { analysisInputSchema, DEFAULT_BUDGET_MS, resolveRequestedModels, variantFor } from "./core.js";
 import { withProgressHeartbeat } from "./progress.js";
+import { createEditServerScope } from "./server-pool.js";
 
 const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
   + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
@@ -119,6 +120,7 @@ export async function runEdits(rawInput, {
   const abort = () => controller.abort(); signal?.addEventListener("abort", abort, { once: true }); if (signal?.aborted) abort();
   const timer = setTimeout(abort, Math.max(1, deadline - nowImpl()));
   const limits = guardSchema.parse(input.guard ?? {}), guardState = createGuard(limits), usage = emptyUsage();
+  const editScope = createEditServerScope();
   const verification = { required: !("none" in input.verify), passed: null, command: "none" in input.verify ? null : input.verify,
     ...("none" in input.verify ? { reason: input.verify.reason } : {}), attempts: [], fixRuns: 0, restored: false, kept: false };
   const result = { status: "failed", model: input.model, codeMapSource: "none", verification, usage, evidence: {} };
@@ -131,7 +133,7 @@ export async function runEdits(rawInput, {
   };
   // root: the checkout (lock, identity, snapshot). workDir: the requested folder, maybe a monorepo package, where
   // OpenCode and the final check run.
-  let root, workDir, release, snapshot, identity, identityRefused = false, completed = false, sessionID;
+  let root, workDir, release, snapshot, identity, completed = false, sessionID;
   const check = () => {
     if (signal?.aborted) throw failure("cancelled", "Edit lifecycle cancelled.");
     if (controller.signal.aborted || nowImpl() >= deadline) throw failure("budget_exceeded", "Overall edit deadline exhausted.");
@@ -144,7 +146,6 @@ export async function runEdits(rawInput, {
       if (current.head === identity.head && current.indexHash === identity.indexHash) return;
       result.evidence.identity = { before: identity, after: current };
     } catch (error) { result.evidence.identityError = redactSecrets(String(error)); }
-    identityRefused = true;
     throw failure("identity_changed", "HEAD/index changed or could not be inspected; restoration refused and recovery snapshot retained.");
   };
   const discard = async (reportCreated = false) => {
@@ -198,7 +199,7 @@ export async function runEdits(rawInput, {
       if (run) verification.fixRuns++;
       let response;
       try { response = await runner({ directory: workDir, checkoutRoot: root, prompt, model: input.model, variant, mode: "edits", codeMap: input.codeMap ?? true,
-        guardState, sessionID, ignoredPaths, signal: controller.signal,
+        guardState, sessionID, ignoredPaths, editScope, signal: controller.signal,
         timeoutMs: runMs }); }
       catch (error) { response = { error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard }; }
       result.codeMapSource = response?.codeMapSource ?? "none";
@@ -233,12 +234,14 @@ export async function runEdits(rawInput, {
       if (attempt.error || run >= (input.maxFixRuns ?? 2)) throw failure("verify_failed", "Final verification failed; no further automatic repairs are allowed.");
       prompt = buildFixPrompt(input.prompt, input.verify, attempt, workDir);
     }
+    await editScope.close();
     await unchanged(false); check(); completed = true;
     await discard(true); result.status = "done";
   } catch (error) {
     result.error = error?.kind ?? "edits_failed"; result.message = redactSecrets(error?.message ?? String(error));
     if (snapshot && !completed) {
       try {
+        await editScope.close();
         await unchanged(false);
         if (input.keepOnFailure) { verification.kept = true; await discard(true); }
         else {
@@ -246,9 +249,11 @@ export async function runEdits(rawInput, {
           if (report.failed.length) throw failure("restore_failed", "Restoration incomplete; recovery bytes retained.");
           verification.restored = true; await discard();
         }
-      } catch (recoveryError) { result.evidence.recoveryError = redactSecrets(String(recoveryError)); }
+      } catch (recoveryError) {
+        result.evidence.recoveryError = redactSecrets(String(recoveryError));
+        if (recoveryError?.kind === "identity_changed" && input.keepOnFailure) verification.kept = true;
+      }
     }
-    if (identityRefused && input.keepOnFailure) verification.kept = true;
   } finally {
     clearTimeout(timer); signal?.removeEventListener("abort", abort);
     release?.(); result.guard ??= guardState.snapshot(); result.elapsedMs = nowImpl() - started;

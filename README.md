@@ -231,8 +231,13 @@ Errors include available CLI exit/error details and bounded stderr tails, with c
 | `OPENCODE_HELPER_FREE_PROVIDERS` | Comma-separated OpenCode provider ids whose models count as free regardless of catalog price, for example `cloudflare-workers-ai`. List only providers whose account has no billing method, because this helper cannot tell a free tier from a billed one. Tool-call and deprecated filters still apply. Default: none. |
 | `OPENCODE_HELPER_ATTEMPT_TIMEOUT_MS` | Runner fallback timeout when no request timeout is supplied; default 120,000 ms. The MCP tools supply their own timeouts, so this does not override their documented budgets. |
 | `OPENCODE_HELPER_TIMEOUT_MS` | Legacy fallback, used only when `OPENCODE_HELPER_ATTEMPT_TIMEOUT_MS` is unset. |
+| `OPENCODE_HELPER_SERVE` | Warm loopback servers are enabled by default. Set to `0` to run every attempt cold. |
 
 The helper supplies `OPENCODE_PERMISSION` and an explicit selected-agent profile through `OPENCODE_CONFIG_CONTENT` for each model launch; these are not caller-controlled permission escape switches. Invalid inline configuration is refused before launch. Permission and JSON-event integration depends on the installed OpenCode CLI's behavior.
+
+With `run --attach`, OpenCode loads permissions in the **server process**. The helper starts each server with the cold run's environment and working directory and matches the executable, mode, directory and full environment before reuse. It keeps up to two analysis servers, evicts the least recently used idle server and stops each after 120 idle seconds. A checked edit owns its server through same-session repairs and stops it before keeping or restoring files. Each server requires its own random basic-auth password (`OPENCODE_SERVER_PASSWORD`, passed only through the environment to the server and its attached runs), because `opencode serve` is otherwise open to any local process.
+
+When both analysis servers are busy, additional runs start cold. A server that fails to announce its listening port within 15 seconds is replaced by a cold run. A server that dies before its attached run printed any JSON event triggers one cold retry within the original attempt budget. A client that exits by itself, an observed JSON event, a provider limit or a guard stop is never replayed, and a quiet run is never stopped for being quiet (OpenCode waits through provider retries without events), so no request reaches the model twice. If the helper cannot confirm the server tree stopped, it skips the retry and retains any edit recovery snapshot.
 
 ## Tests
 

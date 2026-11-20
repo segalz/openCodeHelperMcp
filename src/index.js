@@ -30,8 +30,8 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   await Promise.allSettled([
-    shutdownEdits(120_000).catch(() => {}),
-    shutdownAnalysis(30_000).catch(() => {}),
+    shutdownAnalysis(30_000), // Close admission and stop pooled servers before edit recovery.
+    shutdownEdits(120_000),
   ]);
   shutdownJobObjects();
   process.exit(0);

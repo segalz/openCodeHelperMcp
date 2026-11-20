@@ -14,6 +14,7 @@ import { WORKING_RULES, buildEnvironmentLine } from "./rules.js";
 import { windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT } from "./process-utils.js";
 import { confirmTreeDead } from "./proctree.js";
 import { createWindowsJob } from "./jobobject.js";
+import { createServerPool, shutdownServers } from "./server-pool.js";
 import { withProgressHeartbeat } from "./progress.js";
 
 // ---------------------------------------------------------------------------
@@ -181,7 +182,8 @@ function childEnv(env, execPath) {
 export async function runBoundedProcess({
   executable, args, cwd, env, timeoutMs, maxStdoutBytes = OPENCODE_MAX_STDOUT_BYTES, maxStderrBytes = OPENCODE_MAX_STDERR_BYTES,
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, terminate, graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
-  onStdout, onStderr, collectStdout = true, signal, input,
+  onStdout, onStderr, collectStdout = true, collectStderr = true, signal, input,
+  onSpawn, onExit, onStop, extraStderr, drainStdoutOnStop,
 }) {
   const started = nowImpl();
   const prepareStarted = performance.now();
@@ -216,6 +218,7 @@ export async function runBoundedProcess({
       clearTimeoutImpl(timeoutTimer);
       clearTimeoutImpl(graceTimer);
       signal?.removeEventListener("abort", abort);
+      extraStderr?.off("data", serverStderr);
       if (stoppedReason || reaping) {
         child.stdin?.destroy?.(); child.stdout.destroy?.(); child.stderr.destroy?.(); child.unref?.();
       }
@@ -229,6 +232,7 @@ export async function runBoundedProcess({
     const stop = reason => {
       if (settled || stoppedReason) return;
       stoppedReason = reason;
+      onStop?.(reason);
       // After exit the root PID may already belong to another process: never kill it by PID again.
       if (!realChild || rootAlive()) { try { terminate(child); } catch { /* retried below, or the grace deadline settles */ } }
       if (realChild && !reaping) {
@@ -239,7 +243,7 @@ export async function runBoundedProcess({
           isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt,
         }).then(result => result, () => ({ confirmed: false, alive: [child.pid], unverified: true }))
           .then((result) => { killResult = result; finish(); });
-      } else if (!realChild) graceTimer ??= setTimeoutImpl(finish, graceMs);
+      } else if (!realChild && !settled) graceTimer ??= setTimeoutImpl(finish, graceMs);
     };
     // The root exited but its pipes stayed open, so descendants still run. On Windows nothing else stops them
     // and the edit flow may restore next: reap them before resolving.
@@ -263,34 +267,41 @@ export async function runBoundedProcess({
       overflowed = true;
       stop("output_limit");
     };
-    timeoutTimer = setTimeoutImpl(() => {
-      timedOut = true;
-      stop("timeout");
-    }, Math.max(0, timeoutMs - setupMs));
+    if (Number.isFinite(timeoutMs)) {
+      timeoutTimer = setTimeoutImpl(() => {
+        timedOut = true;
+        stop("timeout");
+      }, Math.max(0, timeoutMs - setupMs));
+    }
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      if (settled || stoppedReason) return;
+      if (settled || overflowed || (stoppedReason && !drainStdoutOnStop?.(stoppedReason))) return;
       stdoutBytes += Buffer.byteLength(chunk, "utf8");
       if (stdoutBytes > maxStdoutBytes) return failForOverflow();
       if (collectStdout) stdout += chunk;
       try { const reason = onStdout?.(chunk); if (reason) stop(reason); } catch { stop("stream_error"); }
     });
-    child.stderr.on("data", (chunk) => {
+    const readStderr = (chunk, source) => {
       if (settled || overflowed) return;
       stderrBytes += Buffer.byteLength(chunk, "utf8");
       if (stderrBytes > maxStderrBytes) return failForOverflow();
-      stderr += chunk;
-      try { const reason = onStderr?.(chunk); if (reason) stop(reason); } catch { stop("stream_error"); }
-    });
+      if (collectStderr) stderr += chunk;
+      try { const reason = onStderr?.(chunk, source); if (reason) stop(reason); } catch { stop("stream_error"); }
+    };
+    const serverStderr = chunk => readStderr(chunk, "server");
+    child.stderr.on("data", chunk => readStderr(chunk, "client"));
+    extraStderr?.on("data", serverStderr);
     child.on("error", (error) => { spawnError = error?.code ?? error?.message ?? "spawn failed"; finish(); });
     child.on("exit", (code) => {
       exitCode = code; exitedAt = Date.now();
       if (job?.assigned) clearTimeoutImpl(timeoutTimer);
       void job?.close();
       graceTimer ??= setTimeoutImpl(afterExitGrace, graceMs);
+      onExit?.();
     });
     child.on("close", (code) => { exitCode = code; finish(); });
     signal?.addEventListener("abort", abort, { once: true });
+    onSpawn?.();
     if (hasInput && child.stdin) child.stdin.on?.("error", () => {});
     if (signal?.aborted) abort();
     else if (hasInput && child.stdin) {
@@ -358,19 +369,95 @@ export function buildEditPrompt(prompt, { directory, platform, map } = {}) {
 /** Runner calls in flight: shutdown aborts them and waits for each to settle. */
 const activeRunnerCalls = new Set();
 let analysisShutDown = false;
+const sharedServerPool = createServerPool();
 
 /** Abort every in-flight OpenCode runner call and wait for each to settle. */
 export async function shutdownAnalysis(waitMs = 30_000) {
   analysisShutDown = true;
   const calls = [...activeRunnerCalls];
+  const serversDone = shutdownServers();
   for (const call of calls) call.controller.abort();
-  if (calls.length === 0) return;
   let timer;
   await Promise.race([
-    Promise.allSettled(calls.map((call) => call.done)),
+    Promise.allSettled([serversDone, ...calls.map(call => call.done)]),
     new Promise((resolve) => { timer = setTimeout(resolve, waitMs); timer.unref?.(); }),
   ]);
   clearTimeout(timer);
+}
+
+/** An attached launch and its possible cold retry each get a fresh stream parser. The guard is shared. */
+async function runModelProcess(command, { runProcess, lease, signal, detector, timeoutMs, setTimeoutImpl, clearTimeoutImpl }) {
+  let verdict, streamFatal, quotaError, watchdog, result, parsed;
+  const stderrLines = { client: "", server: "" };
+  const parser = createEventStream({
+    onEvent: event => {
+      const observed = detector.observe(event);
+      if (observed) verdict = observed;
+      if (!verdict) return true;
+      return verdict.kind === "loop_detected" ? "usage_only" : false;
+    },
+    onFatal: detail => { streamFatal = detail; },
+  });
+  const disarm = () => {
+    if (watchdog !== undefined) clearTimeoutImpl(watchdog);
+    watchdog = undefined;
+  };
+  const readLimit = (chunk, source) => {
+    const lines = (stderrLines[source] + chunk).split(/\r?\n/);
+    stderrLines[source] = lines.pop().slice(-8192);
+    for (const line of lines) quotaError ??= providerLimitError(line);
+  };
+  // The server can report quota while the attached client is starting or flushing its last pipes.
+  const serverLog = chunk => {
+    readLimit(chunk, "server");
+    if (quotaError) lease.stop();
+  };
+  lease?.logs.on("data", serverLog);
+  try {
+    result = await runProcess({
+      ...command, args: lease ? [...command.args, "--attach", lease.url] : command.args,
+      env: lease ? { ...command.env, OPENCODE_SERVER_PASSWORD: lease.password } : command.env,
+      signal: lease ? AbortSignal.any([signal, lease.signal]) : signal, timeoutMs, collectStdout: false,
+      extraStderr: lease?.logs, onStop: lease?.stop,
+      // A client can flush an event while its lost server is being reaped. Count it before deciding on replay.
+      drainStdoutOnStop: lease && (reason => reason === "cancelled" && !signal.aborted),
+      // No "no event yet" watchdog (plan S16 review): OpenCode emits its first event only once the provider streams,
+      // and it waits through provider retries silently, so killing a quiet run could send the request twice.
+      onStdout: chunk => {
+        parser.write(chunk);
+        if (watchdog !== undefined && parser.snapshot().eventCount) disarm();
+        return verdict?.kind ?? (streamFatal ? "event_error" : undefined);
+      },
+      onStderr: (chunk, source) => {
+        if (source === "client") readLimit(chunk, source);
+        return quotaError ? "provider_limit" : undefined;
+      },
+    });
+    for (const tail of Object.values(stderrLines)) quotaError ??= providerLimitError(tail);
+    parsed = parser.end(); // The last JSON event may have no trailing newline.
+    if (result.stoppedReason === "cancelled" && lease && !signal.aborted) result.stoppedReason = "server_stopped";
+    if (result.exitCode !== 0 || result.stoppedReason || result.killConfirmed === false || parsed.error || quotaError) lease?.stop();
+  } catch (error) {
+    lease?.stop();
+    throw error;
+  } finally {
+    disarm();
+    const releasing = lease?.release();
+    const stopped = releasing ? await releasing : undefined;
+    lease?.logs.off("data", serverLog);
+    quotaError ??= providerLimitError(stderrLines.server);
+    if (result && stopped?.killConfirmed === false) {
+      result.killConfirmed = false;
+      result.stillAlive = [...new Set([...(result.stillAlive ?? []), ...(stopped.stillAlive ?? [])])];
+      if (stopped.killUnverified) result.killUnverified = true;
+    }
+  }
+  // Replay cold only when the SERVER died before any event. A client that exits by itself may already have sent
+  // the request to the provider (e.g. an unrecognised provider error), so that is reported, never replayed.
+  const retryCold = lease && !parsed.eventCount && !streamFatal && !verdict && !quotaError && !signal.aborted
+    && !result.timedOut && !result.overflowed && result.killConfirmed !== false
+    && result.stoppedReason === "server_stopped";
+  return { result, parsed, verdict, quotaError, retryCold };
 }
 
 /**
@@ -381,10 +468,14 @@ export function createOpenCodeRunner({
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout,
   killProcessTreeImpl, env = process.env, platform = process.platform, execPath = process.execPath,
   timeoutMs = Number(env.OPENCODE_HELPER_ATTEMPT_TIMEOUT_MS ?? env.OPENCODE_HELPER_TIMEOUT_MS ?? DEFAULT_ATTEMPT_TIMEOUT_MS), graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
-  codeMapBuilder = buildCodeMap,
+  codeMapBuilder = buildCodeMap, getFreePort,
+  // A custom run transport can inject its own loopback allocator or pool; keep standalone fake spawns socket-free.
+  serverPool = getFreePort ? createServerPool({ getFreePort, setTimeoutImpl, clearTimeoutImpl })
+    : spawnImpl === defaultSpawn ? sharedServerPool : undefined,
 } = {}) {
   const terminate = killProcessTreeImpl ?? ((child) => defaultKillProcessTree(child, { platform, spawnImpl }));
-  return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false, codeMap = true, guard, guardState, mode = "analysis", sessionID, signal, ignoredPaths = [], checkoutRoot }) => {
+  const runProcess = options => runBoundedProcess({ ...options, spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl });
+  return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false, codeMap = true, guard, guardState, mode = "analysis", sessionID, signal, ignoredPaths = [], checkoutRoot, editScope }) => {
     const started = nowImpl();
     if (analysisShutDown) {
       return { status: "failed", localFailure: true, cancelled: true, codeMapSource: "none", error: "OpenCode run cancelled.", elapsedMs: nowImpl() - started };
@@ -430,30 +521,28 @@ export function createOpenCodeRunner({
       codeMapSource = map ? (codeMapSource === "codeindex" ? "codeindex" : "regex") : "none";
       if (platform === "win32" && argsCommandLength() > WINDOWS_COMMAND_LINE_LIMIT - 1000) return { status: "failed", localFailure: true, codeMapSource: "none", error: "OpenCode arguments exceed the Windows command-line limit.", elapsedMs: nowImpl() - started };
       const input = render(map);
-      const remaining = effectiveTimeoutMs - (nowImpl() - started);
-      if (remaining <= 0) return { status: "timeout", codeMapSource: "none", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
-      let verdict, streamFatal, quotaError, stderrLine = "";
-      const parser = createEventStream({
-        onEvent: event => {
-          const observed = detector.observe(event);
-          if (observed) verdict = observed;
-          if (!verdict) return true;
-          return verdict.kind === "loop_detected" ? "usage_only" : false;
-        },
-        onFatal: detail => { streamFatal = detail; },
-      });
-      const result = await runBoundedProcess({ executable, args, cwd: directory, env: effectiveEnv, timeoutMs: remaining, input,
-        spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl, collectStdout: false, signal: runSignal,
-        onStdout: chunk => { parser.write(chunk); return verdict?.kind ?? (streamFatal ? "event_error" : undefined); },
-        onStderr: chunk => {
-          const lines = (stderrLine + chunk).split(/\r?\n/);
-          stderrLine = lines.pop().slice(-8192);
-          for (const line of lines) quotaError ??= providerLimitError(line);
-          return quotaError ? "provider_limit" : undefined;
-        },
-      });
-      quotaError ??= providerLimitError(stderrLine);
-      const parsed = parser.end(), elapsedMs = nowImpl() - started;
+      const command = { executable, args, cwd: directory, env: effectiveEnv, input };
+      const remainingMs = () => effectiveTimeoutMs - (nowImpl() - started);
+      let lease;
+      if (serverPool && env.OPENCODE_HELPER_SERVE !== "0") {
+        lease = await serverPool.acquire({ executable, cwd: directory, env: effectiveEnv, mode },
+          { editScope, signal: runSignal, remainingMs, runProcess });
+      }
+      let attempt;
+      do {
+        const remaining = remainingMs();
+        if (runSignal.aborted || remaining <= 0) {
+          await lease?.release();
+          if (runSignal.aborted) return cancelled();
+          // After a failed warm attempt this is not a preparation problem (plan S16 review): say what happened.
+          if (attempt) return { status: "timeout", codeMapSource, error: "The warm OpenCode server failed and no attempt budget was left for a cold retry.", elapsedMs: nowImpl() - started };
+          return { status: "timeout", codeMapSource: "none", error: "OpenCode preparation exhausted the attempt budget.", elapsedMs: nowImpl() - started };
+        }
+        attempt = await runModelProcess(command, { runProcess, lease, signal: runSignal, detector, timeoutMs: remaining, setTimeoutImpl, clearTimeoutImpl });
+        lease = undefined;
+      } while (attempt.retryCold);
+      const { result, parsed, verdict, quotaError } = attempt;
+      const elapsedMs = nowImpl() - started;
       const metrics = {
         elapsedMs, codeMapSource, sessionID: parsed.sessionID, usage: parsed.usage, usageReported: parsed.usageReported,
         guard: detector.snapshot(), toolErrors: parsed.toolErrors.map(e => redactSecrets(e)),
@@ -478,6 +567,10 @@ export function createOpenCodeRunner({
       }
       if (sessionID && !parsed.sessionID) return { ...metrics, status: "failed", error: "OpenCode continuation did not report a session ID." };
       return { ...metrics, text: parsed.text };
+    } catch (error) {
+      if (error?.kind !== "server_stop_unconfirmed") throw error;
+      return { status: "failed", localFailure: true, error: error.message, killConfirmed: false, stillAlive: error.stillAlive,
+        ...(error.killUnverified ? { killUnverified: true } : {}), elapsedMs: nowImpl() - started };
     } finally {
       signal?.removeEventListener("abort", onCallerAbort);
       activeRunnerCalls.delete(entry);
