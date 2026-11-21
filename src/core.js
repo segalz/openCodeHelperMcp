@@ -1050,6 +1050,7 @@ export const ANALYZE_DESCRIPTION = [
   "Automatic and caller-supplied chains try models on cooldown last. This process remembers quota per provider (default 1 hour) and rate limits per model (1/3/10/30 minutes on successive strikes). A provider retry delay overrides the default.",
   "Explicit read/search permissions, cumulative guard budgets and optional bounded code map; a loop trip moves to the next model, while a budget trip stops without fallback.",
   "Only ids from the current free list are accepted. Each model is called at most once; budgetMs is shared across attempts. The result header lists the model used and every attempt with its status and real (redacted) error.",
+  "It reads the folder as it is now, uncommitted work included. Repeated calls in the same folder reuse a warm OpenCode server (same read-only permissions) and start faster; the first call is not faster. With an MCP progressToken the call sends notifications/progress every 15 s.",
 ].join(" ");
 
 export const LIST_DESCRIPTION = [

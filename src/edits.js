@@ -315,7 +315,7 @@ export async function shutdownEdits(waitMs = 120_000) {
 export function registerEditTools(server, { runner, catalog, resolveAllowedPath, isAbsolute = path.isAbsolute, nowImpl = Date.now, lifecycleOptions = {} }) {
   server.registerTool("apply_opencode_edits", {
     title: "Apply verified OpenCode edits", inputSchema: editsInputSchema,
-    description: "Edit one Git checkout using one explicit free model and build agent; shell/delegates/web denied. Required final check, up to two same-session repairs, shared Cline writer lock, one recovery snapshot, cumulative guard/deadline. Restores failed edits unless keepOnFailure=true; identity changes retain recovery evidence. Synchronous; no fallback.",
+    description: "Edit one Git checkout using one explicit free model and build agent; shell/delegates/web denied. Required final check, up to two same-session repairs, shared Cline writer lock, one recovery snapshot, cumulative guard/deadline. Restores failed edits unless keepOnFailure=true; identity changes retain recovery evidence. Synchronous; no fallback. The check is verified before the run (a missing command is refused at once, with no model use) and runs in the requested directory (e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. If a stopped process may still be running, no repair runs and the recovery snapshot is kept (evidence.snapshotDirectory). With an MCP progressToken the call sends notifications/progress every 15 s.",
   }, async (raw, extra = {}) => withProgressHeartbeat(extra, async () => {
     const deadline = nowImpl() + (raw?.budgetMs ?? DEFAULT_BUDGET_MS);
     // `controller` stops preparation on a client cancel or the deadline. Only a real client cancel
