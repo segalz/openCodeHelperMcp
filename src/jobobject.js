@@ -5,6 +5,7 @@ import { access, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { KILL_SETTLE_MS, PROCESS_QUERY_TIMEOUT_MS } from "./waits.js";
 
 const source = String.raw`
 using System;
@@ -63,13 +64,18 @@ class JobOwner {
                 }
                 Console.WriteLine(assigned ? "assigned" : "skipped");
             }
+            bool confirmed = false;
             if (TerminateJobObject(job, 1)) {
                 Accounting info;
                 int started = Environment.TickCount;
-                while (unchecked(Environment.TickCount - started) < 2000
-                        && QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero)
-                        && info.ActiveProcesses != 0) Thread.Sleep(5);
+                while (QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero)) {
+                    if (info.ActiveProcesses == 0) { confirmed = true; break; }
+                    if (unchecked(Environment.TickCount - started) >= 2000) break;
+                    Thread.Sleep(5);
+                }
             }
+            Console.WriteLine(confirmed ? "drained" : "active");
+            Console.Out.Flush();
         } finally { CloseHandle(job); }
     }
 }`;
@@ -88,7 +94,7 @@ async function buildHelper() {
     await new Promise((resolve, reject) => {
       const child = spawn(compiler, ["/nologo", "/noconfig", "/target:exe", "/optimize+", "/out:" + staging + ".exe", staging + ".cs"],
         { cwd: directory, stdio: "ignore", windowsHide: true });
-      const timer = setTimeout(() => { try { child.kill(); } catch { /* already gone */ } }, 10_000).unref();
+      const timer = setTimeout(() => { try { child.kill(); } catch { /* already gone */ } }, PROCESS_QUERY_TIMEOUT_MS).unref();
       child.once("error", error => { clearTimeout(timer); reject(error); });
       child.once("exit", code => {
         clearTimeout(timer);
@@ -128,29 +134,64 @@ function startOwner(file) {
   let pending;
   const queued = [];
   let assigned = false;
+  let assignedCount = 0;
+  let missedAssignment = false;
+  let drained = false;
+  let confirmed = false;
   let closing = false;
+  let exited = false;
   let ended = false;
+  let repliesClosed = false;
   let timer;
-  const kill = () => { try { child.kill(); } catch { /* already gone */ } };
+  const canConfirm = () => drained && assignedCount > 0 && !missedAssignment && !pending && queued.length === 0;
+  const kill = () => {
+    try {
+      if (!ended && child.exitCode === null && child.signalCode === null) child.ref?.();
+      child.kill();
+    } catch {
+      try { child.unref?.(); } catch { /* already gone */ }
+    }
+  };
+  let closeSignal;
+  let closeDeadline = Infinity;
+  const forceClose = () => {
+    if (pending || queued.length > 0) missedAssignment = true;
+    closeSignal?.removeEventListener("abort", forceClose);
+    clearTimeout(timer);
+    kill();
+    confirmed = canConfirm();
+    finish(confirmed);
+  };
   const end = () => {
+    if (ended) return;
+    if (pending || queued.length > 0) missedAssignment = true;
+    exited = true;
     ended = true;
     assigned = false;
     pending = undefined;
     queued.length = 0;
     owners.delete(child);
+    closeSignal?.removeEventListener("abort", forceClose);
     clearTimeout(timer);
+    confirmed = canConfirm();
     ready(false);
-    finish();
+    finish(confirmed);
   };
   child.once("error", end);
-  child.once("exit", end);
+  // Mark exited immediately on `exit` so `alive` turns false for callers waiting on exit (e.g. broken stdout),
+  // while waiting for `replies` / `close` before `end()` so the final "drained"/"active" stdout line is always read first.
+  child.once("exit", () => { exited = true; assigned = false; owners.delete(child); if (!closing || repliesClosed) end(); });
+  child.once("close", end);
   child.stdin.on("error", kill);
   child.stdout.on("error", kill);
   const rootIsLive = (root) => root.exitCode === null && root.signalCode === null;
   const sendNext = () => {
     while (queued.length) {
       const root = queued.shift();
-      if (!rootIsLive(root)) continue;
+      if (!rootIsLive(root)) {
+        missedAssignment = true;
+        continue;
+      }
       pending = root;
       assigned = false;
       child.stdin.write(root.pid + "\n");
@@ -160,6 +201,7 @@ function startOwner(file) {
   };
   const replies = createInterface({ input: child.stdout });
   replies.on("error", kill);
+  replies.once("close", () => { repliesClosed = true; if (exited) end(); });
   replies.on("line", line => {
     if (ended) return;
     if (line === "ready") ready(true);
@@ -169,27 +211,61 @@ function startOwner(file) {
     }
     if (line === "assigned" || line === "skipped") {
       assigned = line === "assigned";
+      if (assigned) assignedCount++;
+      else missedAssignment = true;
       pending = undefined;
       sendNext();
+    }
+    if (line === "drained") {
+      drained = true;
+      confirmed = canConfirm();
     }
   });
   child.unref();
   child.stdin.unref?.();
   child.stdout.unref?.();
   const job = {
-    get alive() { return !ended && !closing; },
+    get alive() { return !ended && !exited && !closing; },
     get assigned() { return assigned; },
+    get confirmed() { return confirmed; },
     assign(root) {
-      if (!job.alive || !(root instanceof ChildProcess) || !root.pid || !rootIsLive(root)) return;
+      if (!(root instanceof ChildProcess) || !root.pid) return;
+      if (!job.alive || !rootIsLive(root)) {
+        if (!ended) missedAssignment = true;
+        return;
+      }
       queued.push(root);
       if (!pending) sendNext();
     },
-    close() {
-      if (!ended && !closing) {
-        closing = true;
-        // A wedged helper can be killed independently. Closing its last handle enforces the same limit.
-        timer = setTimeout(() => { kill(); timer = setTimeout(finish, 150); }, 850);
-        if (!pending) child.stdin.end();
+    close(budgetMs = KILL_SETTLE_MS, signal) {
+      if (!ended) {
+        const cap = Math.min(KILL_SETTLE_MS, budgetMs);
+        if (!closing) {
+          closing = true;
+          // A wedged helper can be killed independently. Closing its last handle enforces the same limit.
+          if (signal?.aborted || cap <= 0) forceClose();
+          else {
+            closeSignal = signal;
+            closeDeadline = performance.now() + cap;
+            signal?.addEventListener("abort", forceClose, { once: true });
+            timer = setTimeout(forceClose, cap);
+            if (!pending) sendNext();
+          }
+        } else if (signal?.aborted || cap <= 0) {
+          forceClose();
+        } else {
+          if (signal && signal !== closeSignal) {
+            closeSignal?.removeEventListener("abort", forceClose);
+            closeSignal = signal;
+            signal.addEventListener("abort", forceClose, { once: true });
+          }
+          const nextDeadline = performance.now() + cap;
+          if (nextDeadline < closeDeadline) {
+            closeDeadline = nextDeadline;
+            clearTimeout(timer);
+            timer = setTimeout(forceClose, cap);
+          }
+        }
       }
       return finished;
     },
@@ -205,7 +281,7 @@ export function createWindowsJob(budgetMs, signal) {
     let settled = false;
     let retry;
     const cancel = () => finish();
-    const timer = setTimeout(cancel, Math.min(4_000, budgetMs / 2));
+    const timer = setTimeout(cancel, Math.min(PROCESS_QUERY_TIMEOUT_MS, budgetMs / 2));
     signal?.addEventListener("abort", cancel, { once: true });
 
     function finish(winner) {

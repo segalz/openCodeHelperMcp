@@ -143,7 +143,7 @@ function serveFixture({ onRun, onTerminate, codeMapBuilder, listen = true } = {}
 
 // ---- Item 2: unconfirmed kills on edit run or check ----
 
-test("S18 (2): unconfirmed edit run kill (with text) skips verify/repairs, restores, retains snapshot and reports PIDs", async t => {
+test("S18 (2): unconfirmed edit run kill (with text) skips verify/repairs and auto-restore, retains snapshot and reports PIDs", async t => {
   const f = await realRepo(t);
   let runs = 0;
   const out = await runEdits(editInput(f.root, { maxFixRuns: 2 }), {
@@ -158,8 +158,8 @@ test("S18 (2): unconfirmed edit run kill (with text) skips verify/repairs, resto
   assert.equal(runs, 1);
   assert.equal(out.status, "failed");
   assert.equal(out.error, "process_still_running");
-  assert.equal(out.verification.restored, true);
-  assert.equal(await readFile(path.join(f.root, "main.js"), "utf8"), "broken\n");
+  assert.equal(out.verification.restored, false);
+  assert.equal(await readFile(path.join(f.root, "main.js"), "utf8"), "partial\n");
   assert.deepEqual(out.evidence.processesStillAlive, [7001]);
   assert.ok(out.evidence.snapshotDirectory && existsSync(out.evidence.snapshotDirectory));
   assert.ok(out.warnings?.some(w => /may still be running/i.test(w)));
@@ -200,7 +200,7 @@ test("S18 (2): unconfirmed check kill cannot pass even if verifyImpl returned pa
   });
   assert.equal(runs, 1);
   assert.equal(out.verification.passed, false);
-  assert.equal(out.verification.restored, true);
+  assert.equal(out.verification.restored, false);
   assert.deepEqual(out.evidence.processesStillAlive, [7003]);
   assert.ok(out.evidence.snapshotDirectory && existsSync(out.evidence.snapshotDirectory));
 });

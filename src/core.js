@@ -16,6 +16,7 @@ import { confirmTreeDead } from "./proctree.js";
 import { createWindowsJob } from "./jobobject.js";
 import { createServerPool, shutdownServers } from "./server-pool.js";
 import { withProgressHeartbeat } from "./progress.js";
+import { TREE_KILL_CONFIRM_MS, settlementBudget, untilAborted } from "./waits.js";
 
 // ---------------------------------------------------------------------------
 // Limits and defaults
@@ -183,133 +184,185 @@ export async function runBoundedProcess({
   spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, terminate, graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
   onStdout, onStderr, collectStdout = true, collectStderr = true, signal, input,
   onSpawn, onExit, onStop, extraStderr, drainStdoutOnStop,
+  platform = process.platform, settlementDeadlineMs,
+  createWindowsJob: createWindowsJobOption = createWindowsJob,
+  confirmTreeDead: confirmTreeDeadOption = confirmTreeDead,
 }) {
   const started = nowImpl();
-  const prepareStarted = performance.now();
-  const useJob = process.platform === "win32" && spawnImpl === defaultSpawn;
-  const job = useJob ? await createWindowsJob(timeoutMs, signal) : undefined;
-  const setupMs = useJob ? performance.now() - prepareStarted : 0;
-  const hasInput = typeof input === "string";
-  return new Promise((resolve) => {
-    if (signal?.aborted) { resolve({ exitCode: null, stdout: "", stderr: "", stoppedReason: "cancelled", elapsedMs: 0 }); return; }
-    let child;
-    let rootStartedMs = Date.now();
-    try {
-      rootStartedMs = Date.now();
-      child = spawnImpl(executable, args, { cwd, shell: false, windowsHide: true, stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"], detached: process.platform !== "win32", env });
-    } catch (error) {
-      resolve({ exitCode: null, stdout: "", stderr: "", timedOut: false, overflowed: false, spawnError: error?.code ?? error?.message ?? "spawn failed", elapsedMs: nowImpl() - started });
-      return;
+  const workMs = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : Infinity;
+  const budget = settlementBudget(workMs, signal, nowImpl);
+  let job;
+  try {
+    if (signal?.aborted) {
+      return { exitCode: null, stdout: "", stderr: "", stoppedReason: "cancelled", elapsedMs: 0 };
     }
-    let stdout = ""; let stderr = ""; let settled = false; let timedOut = false; let exitCode = null;
-    let stdoutBytes = 0; let stderrBytes = 0; let overflowed = false; let spawnError = null;
-    let timeoutTimer; let graceTimer; let stoppedReason;
-    // A real child's tree must be confirmed dead before a stopped run resolves: the edit flow restores the
-    // snapshot right after, and a living child could still write. Fake spawns (tests) keep the grace timer.
-    const realChild = child instanceof ChildProcess && Number.isInteger(child.pid) && child.pid > 0;
-    if (realChild) job?.assign(child);
-    let killResult; let exitedAt; let reaping = false;
-    const rootAlive = () => exitedAt === undefined && child.exitCode === null && child.signalCode === null;
-    const finish = () => {
-      if (settled) return;
-      if ((stoppedReason || reaping) && realChild && !killResult) return;
-      settled = true;
-      clearTimeoutImpl(timeoutTimer);
-      clearTimeoutImpl(graceTimer);
-      signal?.removeEventListener("abort", abort);
-      extraStderr?.off("data", serverStderr);
-      if (stoppedReason || reaping) {
-        child.stdin?.destroy?.(); child.stdout.destroy?.(); child.stderr.destroy?.(); child.unref?.();
-      }
-      resolve({
-        exitCode, stdout, stderr, timedOut, overflowed, spawnError, stoppedReason,
-        ...(killResult && !killResult.confirmed
-          ? { killConfirmed: false, stillAlive: killResult.alive, ...(killResult.unverified ? { killUnverified: true } : {}) } : {}),
-        elapsedMs: nowImpl() - started,
-      });
-    };
-    const stop = reason => {
-      if (settled || stoppedReason) return;
-      stoppedReason = reason;
-      onStop?.(reason);
-      // After exit the root PID may already belong to another process: never kill it by PID again.
-      if (!realChild || rootAlive()) { try { terminate(child); } catch { /* retried below, or the grace deadline settles */ } }
-      if (realChild && !reaping) {
-        // Give taskkill the live root first. Close the job on root exit or the first S3 retry.
-        if (!rootAlive()) void job?.close();
-        confirmTreeDead(child.pid, {
-          killRoot: () => { try { terminate(child); } finally { void job?.close(); } },
-          isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt,
-        }).then(result => result, () => ({ confirmed: false, alive: [child.pid], unverified: true }))
-          .then((result) => { killResult = result; finish(); });
-      } else if (!realChild && !settled) graceTimer ??= setTimeoutImpl(finish, graceMs);
-    };
-    // The root exited but its pipes stayed open, so descendants still run. On Windows nothing else stops them
-    // and the edit flow may restore next: reap them before resolving.
-    const afterExitGrace = () => {
-      if (settled || killResult) return;
-      if (realChild && process.platform !== "win32" && !stoppedReason) {
-        // The process group outlives its leader while members hold the pipes; stop them as Cline does.
-        try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already gone */ }
-      }
-      if (!realChild || process.platform !== "win32" || stoppedReason) { finish(); return; }
-      // The run already ended by itself: a deadline passing during the reap must not turn it into a timeout.
-      clearTimeoutImpl(timeoutTimer);
-      reaping = true;
-      confirmTreeDead(child.pid, { killRoot: () => {}, isRootAlive: () => false, rootStartedMs, rootExitedMs: () => exitedAt })
-        .then(result => result, () => ({ confirmed: false, alive: [child.pid], unverified: true }))
-        .then((result) => { killResult = result; finish(); });
-    };
-    const abort = () => stop("cancelled");
-    const failForOverflow = () => {
-      if (settled || overflowed) return;
-      overflowed = true;
-      stop("output_limit");
-    };
-    if (Number.isFinite(timeoutMs)) {
-      timeoutTimer = setTimeoutImpl(() => {
-        timedOut = true;
-        stop("timeout");
-      }, Math.max(0, timeoutMs - setupMs));
+    const prepareStarted = nowImpl();
+    const useJob = (platform === "win32" && spawnImpl === defaultSpawn) || createWindowsJobOption !== createWindowsJob;
+    job = useJob ? await createWindowsJobOption(workMs, signal) : undefined;
+    const setupMs = useJob ? Math.max(0, nowImpl() - prepareStarted) : 0;
+    if (signal?.aborted) {
+      return { exitCode: null, stdout: "", stderr: "", stoppedReason: "cancelled", elapsedMs: nowImpl() - started };
     }
-    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      if (settled || overflowed || (stoppedReason && !drainStdoutOnStop?.(stoppedReason))) return;
-      stdoutBytes += Buffer.byteLength(chunk, "utf8");
-      if (stdoutBytes > maxStdoutBytes) return failForOverflow();
-      if (collectStdout) stdout += chunk;
-      try { const reason = onStdout?.(chunk); if (reason) stop(reason); } catch { stop("stream_error"); }
-    });
-    const readStderr = (chunk, source) => {
-      if (settled || overflowed) return;
-      stderrBytes += Buffer.byteLength(chunk, "utf8");
-      if (stderrBytes > maxStderrBytes) return failForOverflow();
-      if (collectStderr) stderr += chunk;
-      try { const reason = onStderr?.(chunk, source); if (reason) stop(reason); } catch { stop("stream_error"); }
-    };
-    const serverStderr = chunk => readStderr(chunk, "server");
-    child.stderr.on("data", chunk => readStderr(chunk, "client"));
-    extraStderr?.on("data", serverStderr);
-    child.on("error", (error) => { spawnError = error?.code ?? error?.message ?? "spawn failed"; finish(); });
-    child.on("exit", (code) => {
-      exitCode = code; exitedAt = Date.now();
-      if (job?.assigned) clearTimeoutImpl(timeoutTimer);
-      void job?.close();
-      graceTimer ??= setTimeoutImpl(afterExitGrace, graceMs);
-      onExit?.();
-    });
-    child.on("close", (code) => { exitCode = code; finish(); });
-    signal?.addEventListener("abort", abort, { once: true });
-    onSpawn?.();
-    if (hasInput && child.stdin) child.stdin.on?.("error", () => {});
-    if (signal?.aborted) abort();
-    else if (hasInput && child.stdin) {
+    if (Number.isFinite(workMs) && workMs - setupMs <= 0) {
+      return { exitCode: null, stdout: "", stderr: "", timedOut: true, overflowed: false, spawnError: null, stoppedReason: "timeout", elapsedMs: nowImpl() - started };
+    }
+    const hasInput = typeof input === "string";
+    return await new Promise((resolve) => {
+      if (signal?.aborted) { resolve({ exitCode: null, stdout: "", stderr: "", stoppedReason: "cancelled", elapsedMs: nowImpl() - started }); return; }
+      let child;
+      let rootStartedMs = Date.now();
       try {
-        if (typeof child.stdin.write === "function") child.stdin.write(input);
-        child.stdin.end?.();
-      } catch { /* EPIPE/EOF handled */ }
-    }
-  }).finally(() => job?.close());
+        rootStartedMs = Date.now();
+        child = spawnImpl(executable, args, { cwd, shell: false, windowsHide: true, stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"], detached: platform !== "win32", env });
+      } catch (error) {
+        resolve({ exitCode: null, stdout: "", stderr: "", timedOut: false, overflowed: false, spawnError: error?.code ?? error?.message ?? "spawn failed", elapsedMs: nowImpl() - started });
+        return;
+      }
+      let stdout = ""; let stderr = ""; let settled = false; let timedOut = false; let exitCode = null;
+      let stdoutBytes = 0; let stderrBytes = 0; let overflowed = false; let spawnError = null;
+      let timeoutTimer; let graceTimer; let stoppedReason;
+      // A real child's tree must be confirmed dead before a stopped run resolves: the edit flow restores the
+      // snapshot right after, and a living child could still write. Fake spawns (tests) keep the grace timer.
+      const realChild = child instanceof ChildProcess && Number.isInteger(child.pid) && child.pid > 0;
+      if (realChild) job?.assign(child);
+      let killResult; let exitedAt; let reaping = false;
+      const rootAlive = () => exitedAt === undefined && child.exitCode === null && child.signalCode === null;
+      const runTableConfirm = ({ killRoot, isRootAlive }) => {
+        const confirmCap = Math.min(
+          settlementDeadlineMs !== undefined ? budget.remaining() : budget.confirmRemaining(),
+          settlementDeadlineMs ?? TREE_KILL_CONFIRM_MS,
+        );
+        const confirmSignal = settlementDeadlineMs !== undefined ? budget.signal : budget.confirmSignal;
+        return untilAborted(confirmTreeDeadOption(child.pid, {
+          capMs: confirmCap,
+          now: nowImpl,
+          signal: confirmSignal,
+          killRoot,
+          isRootAlive,
+          rootStartedMs,
+          rootExitedMs: () => exitedAt,
+          platform,
+        }), confirmSignal).catch(() => ({
+          confirmed: false,
+          alive: isRootAlive() ? [child.pid] : [],
+          unverified: true,
+        }));
+      };
+      const finish = () => {
+        if (settled) return;
+        if ((stoppedReason || reaping) && realChild && !killResult) return;
+        settled = true;
+        clearTimeoutImpl(timeoutTimer);
+        clearTimeoutImpl(graceTimer);
+        signal?.removeEventListener("abort", abort);
+        extraStderr?.off("data", serverStderr);
+        if (stoppedReason || reaping) {
+          child.stdin?.destroy?.(); child.stdout.destroy?.(); child.stderr.destroy?.(); child.unref?.();
+        }
+        resolve({
+          exitCode, stdout, stderr, timedOut, overflowed, spawnError, stoppedReason,
+          ...(killResult && !killResult.confirmed
+            ? { killConfirmed: false, stillAlive: killResult.alive, ...(killResult.unverified ? { killUnverified: true } : {}) } : {}),
+          elapsedMs: nowImpl() - started,
+        });
+      };
+      const stop = reason => {
+        if (settled || stoppedReason) return;
+        stoppedReason = reason;
+        onStop?.(reason);
+        // After exit the root PID may already belong to another process: never kill it by PID again.
+        if (!realChild || rootAlive()) { try { terminate(child); } catch { /* retried below, or the grace deadline settles */ } }
+        if (realChild && !reaping) {
+          // Terminate the job first, then still check the process table for children spawned before assignment.
+          // An unreadable table counts as confirmed only when the job drained (and pipes were not held open).
+          (async () => {
+            const jobDrained = job
+              ? (await job.close(budget.remaining(), budget.signal).catch(() => false)) === true || job.confirmed === true
+              : false;
+            const table = await runTableConfirm({
+              killRoot: () => { try { terminate(child); } finally { void job?.close(budget.remaining(), budget.signal); } },
+              isRootAlive: rootAlive,
+            });
+            if (table.confirmed) return table;
+            if (table.unverified && table.alive.length === 0 && jobDrained) {
+              return { confirmed: true, alive: [] };
+            }
+            return table;
+          })().then((result) => { killResult = result; finish(); });
+        } else if (!realChild && !settled) graceTimer ??= setTimeoutImpl(finish, Math.min(graceMs, budget.remaining()));
+      };
+      // The root exited but its pipes stayed open, so descendants still run. On Windows nothing else stops them
+      // and the edit flow may restore next: reap them before resolving.
+      const afterExitGrace = () => {
+        if (settled || killResult) return;
+        if (realChild && platform !== "win32" && !stoppedReason) {
+          // The process group outlives its leader while members hold the pipes; stop them as Cline does.
+          try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already gone */ }
+        }
+        if (!realChild || platform !== "win32" || stoppedReason) { finish(); return; }
+        // The run already ended by itself: a deadline passing during the reap must not turn it into a timeout.
+        clearTimeoutImpl(timeoutTimer);
+        reaping = true;
+        // Pipes stayed open after root exit (sign of a live descendant, possibly outside the job):
+        // close the job first, then require the process-table check; a drained job alone cannot confirm.
+        (async () => {
+          if (job) await job.close(budget.remaining(), budget.signal).catch(() => false);
+          return runTableConfirm({ killRoot: () => {}, isRootAlive: () => false });
+        })().then((result) => { killResult = result; finish(); });
+      };
+      const abort = () => stop("cancelled");
+      const failForOverflow = () => {
+        if (settled || overflowed) return;
+        overflowed = true;
+        stop("output_limit");
+      };
+      if (Number.isFinite(workMs)) {
+        timeoutTimer = setTimeoutImpl(() => {
+          timedOut = true;
+          stop("timeout");
+        }, Math.max(0, workMs - setupMs));
+      }
+      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        if (settled || overflowed || (stoppedReason && !drainStdoutOnStop?.(stoppedReason))) return;
+        stdoutBytes += Buffer.byteLength(chunk, "utf8");
+        if (stdoutBytes > maxStdoutBytes) return failForOverflow();
+        if (collectStdout) stdout += chunk;
+        try { const reason = onStdout?.(chunk); if (reason) stop(reason); } catch { stop("stream_error"); }
+      });
+      const readStderr = (chunk, source) => {
+        if (settled || overflowed) return;
+        stderrBytes += Buffer.byteLength(chunk, "utf8");
+        if (stderrBytes > maxStderrBytes) return failForOverflow();
+        if (collectStderr) stderr += chunk;
+        try { const reason = onStderr?.(chunk, source); if (reason) stop(reason); } catch { stop("stream_error"); }
+      };
+      const serverStderr = chunk => readStderr(chunk, "server");
+      child.stderr.on("data", chunk => readStderr(chunk, "client"));
+      extraStderr?.on("data", serverStderr);
+      child.on("error", (error) => { spawnError = error?.code ?? error?.message ?? "spawn failed"; finish(); });
+      child.on("exit", (code) => {
+        exitCode = code; exitedAt = Date.now();
+        if (job?.assigned) clearTimeoutImpl(timeoutTimer);
+        void job?.close(budget.remaining(), budget.signal);
+        graceTimer ??= setTimeoutImpl(afterExitGrace, Math.min(graceMs, budget.remaining()));
+        onExit?.();
+      });
+      child.on("close", (code) => { exitCode = code; finish(); });
+      signal?.addEventListener("abort", abort, { once: true });
+      onSpawn?.();
+      if (hasInput && child.stdin) child.stdin.on?.("error", () => {});
+      if (signal?.aborted) abort();
+      else if (hasInput && child.stdin) {
+        try {
+          if (typeof child.stdin.write === "function") child.stdin.write(input);
+          child.stdin.end?.();
+        } catch { /* EPIPE/EOF handled */ }
+      }
+    });
+  } finally {
+    try { await job?.close(budget.remaining(), budget.signal); } finally { budget.dispose(); }
+  }
 }
 
 /**
@@ -468,12 +521,18 @@ export function createOpenCodeRunner({
   killProcessTreeImpl, env = process.env, platform = process.platform, execPath = process.execPath,
   timeoutMs = Number(env.OPENCODE_HELPER_ATTEMPT_TIMEOUT_MS ?? env.OPENCODE_HELPER_TIMEOUT_MS ?? DEFAULT_ATTEMPT_TIMEOUT_MS), graceMs = EXIT_GRACE_MS, nowImpl = Date.now,
   codeMapBuilder = buildCodeMap, getFreePort,
+  createWindowsJob: createWindowsJobOption, confirmTreeDead: confirmTreeDeadOption, settlementDeadlineMs,
   // A custom run transport can inject its own loopback allocator or pool; keep standalone fake spawns socket-free.
   serverPool = getFreePort ? createServerPool({ getFreePort, setTimeoutImpl, clearTimeoutImpl })
     : spawnImpl === defaultSpawn ? sharedServerPool : undefined,
 } = {}) {
   const terminate = killProcessTreeImpl ?? ((child) => defaultKillProcessTree(child, { platform, spawnImpl }));
-  const runProcess = options => runBoundedProcess({ ...options, spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl });
+  const runProcess = options => runBoundedProcess({
+    ...options, spawnImpl, setTimeoutImpl, clearTimeoutImpl, terminate, graceMs, nowImpl, platform,
+    ...(createWindowsJobOption ? { createWindowsJob: createWindowsJobOption } : {}),
+    ...(confirmTreeDeadOption ? { confirmTreeDead: confirmTreeDeadOption } : {}),
+    ...(settlementDeadlineMs !== undefined ? { settlementDeadlineMs } : {}),
+  });
   return async ({ directory, prompt, model, variant, timeoutMs: requestTimeoutMs, maxWords, raw = false, codeMap = true, guard, guardState, mode = "analysis", sessionID, signal, ignoredPaths = [], checkoutRoot, editScope }) => {
     const started = nowImpl();
     if (analysisShutDown) {
@@ -901,6 +960,10 @@ export async function runAnalysis({ directory, prompt, maxWords, budgetMs, runne
   const seen = new Set();
   const queue = models.filter((model) => !seen.has(model.id) && seen.add(model.id));
   for (let index = 0; index < queue.length; index++) {
+    if (signal?.aborted) {
+      const error = "OpenCode analysis cancelled.";
+      return { error, message: error, cancelled: true, attempts, budgetMs: budget, guard: guardState.snapshot(), usage, sessionID, codeMapSource };
+    }
     const model = queue[index];
     const remainingMs = deadline - nowImpl();
     if (remainingMs <= 0) {
@@ -1102,12 +1165,26 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
   });
 
   server.registerTool("analyze_code", { title: "Analyze code with a free OpenCode model", description: ANALYZE_DESCRIPTION, inputSchema: analysisInputSchema }, async ({ directory, prompt, maxWords, budgetMs, model, models, guard, codeMap = true }, extra = {}) => withProgressHeartbeat(extra, async () => {
-    const deadline = nowImpl() + clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, DEFAULT_BUDGET_MS);
+    const budget = clampNumber(budgetMs, MIN_BUDGET_MS, MAX_BUDGET_MS, DEFAULT_BUDGET_MS);
+    const deadline = nowImpl() + budget;
+    const cancelledReply = () => textResult(formatAnalysisResult({
+      error: "OpenCode analysis cancelled.", message: "OpenCode analysis cancelled.", cancelled: true,
+      attempts: [], budgetMs: budget, codeMapSource: "none",
+    }), true);
+    if (extra.signal?.aborted) return cancelledReply();
     const guardValidation = guardSchema.safeParse(guard ?? {});
     if (!guardValidation.success) return textResult("Invalid guard options.", true);
-    const validated = await validate(directory);
-    if (validated.error) return textResult(validated.error, true);
-    const listed = await catalog.list();
+    const awaitOrCancel = (work) => extra.signal ? untilAborted(work, extra.signal) : work;
+    let validated, listed;
+    try {
+      validated = await awaitOrCancel(validate(directory));
+      if (validated.error) return textResult(validated.error, true);
+      listed = await awaitOrCancel(catalog.list());
+    } catch (error) {
+      if (extra.signal?.aborted) return cancelledReply();
+      throw error;
+    }
+    if (extra.signal?.aborted) return cancelledReply();
     if (listed.error) return textResult(`Could not list OpenCode free models.\n${redactSecrets(listed.error)}`, true);
     const requested = resolveRequestedModels({ model, models }, listed.models);
     if (requested.error) return textResult(requested.error, true);

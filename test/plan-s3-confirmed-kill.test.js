@@ -80,6 +80,8 @@ test("S3: a timed-out run resolves only after the whole tree is dead, even when 
     executable: process.execPath, args: [entryPath], cwd: dir, env: process.env, timeoutMs,
     // A short exit grace must not be what ends the wait for a live tree.
     graceMs: 100,
+    // Exercise the non-job process-tree retry path (Job Object confirmation is covered separately).
+    createWindowsJob: async () => undefined,
     // The first kill attempt does nothing (a child that survives it); later attempts are real.
     terminate: child => { if (killCalls++ === 0) return; defaultKillProcessTree(child); },
   });

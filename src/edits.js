@@ -10,6 +10,7 @@ import { redactSecrets } from "./safety.js";
 import { analysisInputSchema, DEFAULT_BUDGET_MS, resolveRequestedModels, variantFor } from "./core.js";
 import { withProgressHeartbeat } from "./progress.js";
 import { createEditServerScope } from "./server-pool.js";
+import { RESTORE_BUDGET_MS, boundedSignal, untilAborted } from "./waits.js";
 
 const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
   + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
@@ -83,7 +84,8 @@ function hasEarlierQuestion(text) {
   return false;
 }
 
-/** Time kept after a run for the final check: the check timeout plus this margin. */
+/** Time kept after a run for the final check: the check timeout plus this margin.
+ * `runVerification` settles within `verify.timeoutSeconds + SETTLE_MARGIN_MS` (4 s), fitting inside this 10 s reserve. */
 export const VERIFY_RESERVE_MARGIN_MS = 10_000;
 /** A repair run shorter than this is not launched. */
 export const MIN_FIX_RUN_MS = 30_000;
@@ -133,40 +135,45 @@ export async function runEdits(rawInput, {
   // root: the checkout (lock, identity, snapshot). workDir: the requested folder, maybe a monorepo package, where
   // OpenCode and the final check run.
   let root, workDir, release, snapshot, identity, completed = false, sessionID;
-  // A stopped run, verify, or server whose processes were not confirmed dead: retain the recovery snapshot.
+  // A stopped run, verify, or server whose processes were not confirmed dead: retain the recovery snapshot
+  // and never trigger an automatic restore while a surviving process may still write.
   const warnIfStillRunning = (outcome) => {
     if (outcome?.killConfirmed !== false) return;
     unconfirmedKill = true;
     const warning = completed
       ? "A process from the stopped edit server may still be running; files may change."
-      : "A process from the stopped run may still be running; files may change after the restore.";
+      : "A process from the stopped run may still be running; automatic restoration was skipped and the recovery snapshot was retained.";
     result.warnings ??= [];
     if (!result.warnings.includes(warning)) result.warnings.push(warning);
     const alive = Array.isArray(outcome.stillAlive) ? outcome.stillAlive : [];
     result.evidence.processesStillAlive = [...new Set([...(result.evidence.processesStillAlive ?? []), ...alive])];
+    if (outcome.killUnverified) result.evidence.killUnverified = true;
   };
   const check = () => {
     if (signal?.aborted) throw failure("cancelled", "Edit lifecycle cancelled.");
     if (controller.signal.aborted || nowImpl() >= deadline) throw failure("budget_exceeded", "Overall edit deadline exhausted.");
   };
-  // Recovery deliberately uses its own bounded Git calls after the active deadline.
-  const unchanged = async (active = true) => {
+  const unchanged = async (checkSignal = controller.signal) => {
     if (!identity) return;
     try {
-      const current = await identityImpl(root, active ? controller.signal : undefined);
+      const current = await identityImpl(root, checkSignal);
       if (current.head === identity.head && current.indexHash === identity.indexHash) return;
       result.evidence.identity = { before: identity, after: current };
     } catch (error) {
-      if (active && (signal?.aborted || controller.signal.aborted)) check();
+      if (checkSignal?.aborted) {
+        if (signal?.aborted) throw failure("cancelled", "Edit lifecycle cancelled.");
+        if (checkSignal === controller.signal) throw failure("budget_exceeded", "Overall edit deadline exhausted.");
+        throw error;
+      }
       result.evidence.identityError = redactSecrets(String(error));
     }
     throw failure("identity_changed", "HEAD/index changed or could not be inspected; restoration refused and recovery snapshot retained.");
   };
-  const discard = async (reportCreated = false) => {
+  const discard = async (reportCreated = false, cleanupSignal) => {
     // Report every new file the kept edit left behind (a stray debug script, too); report-only.
     if (reportCreated && Array.isArray(snapshot?.manifest)) {
       try {
-        const created = await createdFilesImpl(snapshot);
+        const created = await createdFilesImpl(snapshot, cleanupSignal);
         if (created.length) {
           result.createdFiles = created;
           (result.warnings ??= []).push(`The edit created ${created.length} new file(s): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
@@ -174,7 +181,7 @@ export async function runEdits(rawInput, {
       } catch { /* report-only */ }
     }
     if (unconfirmedKill) return;
-    try { await discardSnapshotImpl(snapshot); snapshot = undefined; delete result.evidence.snapshotDirectory; }
+    try { await discardSnapshotImpl(snapshot, cleanupSignal); snapshot = undefined; delete result.evidence.snapshotDirectory; }
     catch (error) { result.evidence.cleanupError = redactSecrets(String(error)); }
   };
   try {
@@ -183,22 +190,22 @@ export async function runEdits(rawInput, {
     if (workDir === undefined) throw failure("edits_refused", "The directory is not inside its Git checkout.");
     // A check that cannot even start makes the run pointless: refuse before the lock, the snapshot and any launch.
     if (verification.required && resolveVerifyImpl) {
-      try { await resolveVerifyImpl(input.verify.command, input.verify.args ?? [], workDir); }
+      try { await untilAborted(resolveVerifyImpl(input.verify.command, input.verify.args ?? [], workDir), controller.signal); }
       catch (error) {
         if (error instanceof VerificationError) throw failure(error.kind, error.message);
         throw error;
       }
       check();
     }
-    release = await acquire(root, { lockDirectory });
+    release = await acquire(root, { lockDirectory, signal: controller.signal });
     identity = await identityImpl(root, controller.signal); check();
     snapshot = await takeSnapshotImpl(root, { ...snapshotOptions, signal: controller.signal });
     result.evidence.snapshotDirectory = snapshot.directory;
-    check(); await unchanged();
+    check(); await unchanged(controller.signal);
     const ignoredPaths = await ignoredPathsImpl(root, controller.signal); check();
     let prompt = input.prompt;
     for (let run = 0; ; run++) {
-      check(); await unchanged(); check();
+      check(); await unchanged(controller.signal); check();
       if (run && !sessionID) throw failure("session_unavailable", "Cannot repair: OpenCode did not return a continuation session ID.");
       if (guardState.snapshot().kind) throw failure(guardState.snapshot().kind, "Guard stopped edits; no repair launch is allowed.");
       const counters = guardState.snapshot();
@@ -219,7 +226,7 @@ export async function runEdits(rawInput, {
       catch (error) {
         response = {
           error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard,
-          ...(error?.killConfirmed === false ? { killConfirmed: false, stillAlive: error.stillAlive } : {}),
+          ...(error?.killConfirmed === false ? { killConfirmed: false, stillAlive: error.stillAlive, ...(error.killUnverified ? { killUnverified: true } : {}) } : {}),
         };
       }
       result.codeMapSource = response?.codeMapSource ?? "none";
@@ -228,7 +235,7 @@ export async function runEdits(rawInput, {
       if (response?.limitKind) result.limitKind = response.limitKind;
       warnIfStillRunning(response);
       const returnedSession = response?.sessionID;
-      await unchanged(false); check();
+      await unchanged(boundedSignal(RESTORE_BUDGET_MS, signal)); check();
       if (sessionID && returnedSession !== sessionID && (returnedSession || !response?.error)) throw failure("session_mismatch", "OpenCode repair did not continue the expected session.");
       sessionID = returnedSession ?? sessionID; result.sessionID = sessionID;
       if (response?.error || response?.guard?.kind || guardState.snapshot().kind) throw failure(response?.guard?.kind ?? guardState.snapshot().kind ?? "opencode_error", response?.error ?? "Guard stopped edits.");
@@ -242,7 +249,7 @@ export async function runEdits(rawInput, {
       }
       if (!verification.required) break;
       let attempt;
-      try { attempt = await verifyImpl(input.verify, workDir, controller.signal); }
+      try { attempt = await verifyImpl(input.verify, workDir, controller.signal, { remainingMs: Math.max(0, deadline - nowImpl()) }); }
       catch (error) {
         if (!(error instanceof VerificationError)) throw error;
         attempt = { passed: false, exitCode: null, signal: null, timedOut: false, killedForOutput: false, durationMs: 0, stdoutTail: "", stderrTail: redactSecrets(error.message), error: error.kind };
@@ -251,7 +258,7 @@ export async function runEdits(rawInput, {
       const passed = Boolean(attempt.passed) && attempt.killConfirmed !== false;
       attempt = { ...attempt, passed, run: run + 1, stdoutTail: redactSecrets(attempt.stdoutTail ?? ""), stderrTail: redactSecrets(attempt.stderrTail ?? "") };
       verification.attempts.push(attempt); verification.passed = attempt.passed;
-      await unchanged(false); check();
+      await unchanged(boundedSignal(RESTORE_BUDGET_MS, signal)); check();
       if (attempt.passed) break;
       if (attempt.error || attempt.killConfirmed === false || run >= (input.maxFixRuns ?? 2)) throw failure("verify_failed", "Final verification failed; no further automatic repairs are allowed.");
       prompt = buildFixPrompt(input.prompt, input.verify, attempt, workDir);
@@ -261,10 +268,12 @@ export async function runEdits(rawInput, {
       if (closeError?.kind === "server_stop_unconfirmed") warnIfStillRunning(closeError);
       else (result.warnings ??= []).push(`Could not stop the OpenCode edit server cleanly: ${redactSecrets(closeError?.message ?? String(closeError))}`);
     }
-    await discard(true); result.status = "done";
+    await discard(true, boundedSignal(RESTORE_BUDGET_MS)); result.status = "done";
   } catch (error) {
     const aborted = error?.kind === "cancelled" || error?.name === "AbortError" || error?.code === "ABORT_ERR"
-      || (error?.kind === "snapshot_git_failed" && (signal?.aborted || controller.signal.aborted));
+      || (error?.kind === "snapshot_git_failed" && (signal?.aborted || controller.signal.aborted))
+      || (signal?.aborted && error === signal.reason)
+      || (controller.signal.aborted && error === controller.signal.reason);
     if (aborted && signal?.aborted) {
       result.error = "cancelled"; result.message = "Edit lifecycle cancelled.";
     } else if (aborted && controller.signal.aborted) {
@@ -273,17 +282,24 @@ export async function runEdits(rawInput, {
       result.error = error?.kind ?? "edits_failed"; result.message = redactSecrets(error?.message ?? String(error));
     }
     if (snapshot && !completed) {
+      const restoreSignal = boundedSignal(RESTORE_BUDGET_MS);
       try {
         try { await editScope.close(); } catch (closeError) {
           if (closeError?.kind !== "server_stop_unconfirmed") throw closeError;
           warnIfStillRunning(closeError);
         }
-        await unchanged(false);
-        if (input.keepOnFailure) { verification.kept = true; await discard(true); }
-        else {
-          const report = await restoreSnapshotImpl(snapshot); result.evidence.restore = report;
-          if (report.failed.length) throw failure("restore_failed", "Restoration incomplete; recovery bytes retained.");
-          verification.restored = true; await discard();
+        if (input.keepOnFailure) {
+          await unchanged(restoreSignal);
+          verification.kept = true;
+          await discard(true, restoreSignal);
+        } else if (!unconfirmedKill) {
+          await unchanged(restoreSignal);
+          const report = await restoreSnapshotImpl(snapshot, restoreSignal); result.evidence.restore = report;
+          if (report.failed.length) {
+            result.message = `${result.message} Baseline restoration is incomplete (recovery snapshot retained).`;
+            throw failure("restore_failed", "Restoration incomplete; recovery bytes retained.");
+          }
+          verification.restored = true; await discard(false, restoreSignal);
         }
       } catch (recoveryError) {
         result.evidence.recoveryError = redactSecrets(String(recoveryError));

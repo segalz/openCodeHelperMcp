@@ -5,6 +5,8 @@ import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rea
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PROCESS_QUERY_TIMEOUT_MS, boundedSignal } from "./waits.js";
+
 export class CheckoutBusyError extends Error {
     checkoutRoot;
     constructor(checkoutRoot) {
@@ -35,14 +37,29 @@ function pidIsGone(pid) {
     }
     return false;
 }
-function execFileText(command, args, timeout = 10_000) {
+function execFileText(command, args, timeout = PROCESS_QUERY_TIMEOUT_MS, signal) {
+    if (signal?.aborted || timeout <= 0)
+        return Promise.resolve({ ok: false, stdout: "" });
     return new Promise(resolve => {
-        execFile(command, args, { encoding: "utf8", windowsHide: true, timeout }, (error, stdout) => {
-            resolve({ ok: !error, stdout: stdout ?? "" });
+        let settled = false;
+        const finish = (result) => {
+            if (settled)
+                return;
+            settled = true;
+            signal?.removeEventListener("abort", onAbort);
+            resolve(result);
+        };
+        const child = execFile(command, args, { encoding: "utf8", windowsHide: true, timeout, signal }, (error, stdout) => {
+            finish({ ok: !error, stdout: stdout ?? "" });
         });
+        const onAbort = () => {
+            try { child.kill(); } catch { /* already gone */ }
+            finish({ ok: false, stdout: "" });
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
     });
 }
-async function readProcessStartMs(pid) {
+async function readProcessStartMs(pid, signal) {
     if (!Number.isSafeInteger(pid) || pid <= 0)
         return undefined;
     try {
@@ -52,7 +69,7 @@ async function readProcessStartMs(pid) {
                 `catch { $e = $_.Exception; while ($e) { ` +
                 `if (($e -is [System.ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 5) -or $e -is [System.UnauthorizedAccessException]) { Write-Output 'ACCESS_DENIED'; exit 0 }; ` +
                 `$e = $e.InnerException }; exit 1 }`;
-            const out = await execFileText("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], 10_000);
+            const out = await execFileText("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], PROCESS_QUERY_TIMEOUT_MS, signal);
             if (!out.ok)
                 return undefined;
             const text = out.stdout.trim();
@@ -64,7 +81,7 @@ async function readProcessStartMs(pid) {
         if (process.platform === "linux") {
             let stat;
             try {
-                stat = await readFile(`/proc/${pid}/stat`, "utf8");
+                stat = await readFile(`/proc/${pid}/stat`, { encoding: "utf8", signal });
             }
             catch (error) {
                 if (error.code === "EACCES" || error.code === "EPERM")
@@ -72,8 +89,8 @@ async function readProcessStartMs(pid) {
                 return undefined;
             }
             const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
-            const boot = Number(/^btime (\d+)$/m.exec(await readFile("/proc/stat", "utf8"))?.[1]);
-            const getconf = await execFileText("getconf", ["CLK_TCK"], 10_000);
+            const boot = Number(/^btime (\d+)$/m.exec(await readFile("/proc/stat", { encoding: "utf8", signal }))?.[1]);
+            const getconf = await execFileText("getconf", ["CLK_TCK"], 10_000, signal);
             const hz = (getconf.ok ? Number(getconf.stdout.trim()) : NaN) || 100;
             return Number.isFinite(ticks) && Number.isFinite(boot) ? boot * 1000 + (ticks / hz) * 1000 : undefined;
         }
@@ -91,7 +108,7 @@ const START_TOLERANCE_MS = 5_000;
 /** A holder is dead when its PID is gone or inaccessible (protected/other-user process), or when that PID now belongs
  * to a process started after the lock was written (PID reuse). An unreadable start time otherwise keeps the lock busy:
  * a live lock is never reclaimed by age. */
-export async function holderIsDead(holder, startMs) {
+export async function holderIsDead(holder, startMs, signal) {
     const pid = Number(holder?.pid);
     if (pidIsGone(pid))
         return true;
@@ -101,7 +118,8 @@ export async function holderIsDead(holder, startMs) {
     if (!Number.isFinite(written))
         return false;
     if (!startMs || startMs === processStartMs) {
-        const result = await readProcessStartMs(pid);
+        const result = await readProcessStartMs(pid, signal);
+        signal?.throwIfAborted();
         if (result === "denied")
             return true;
         return result !== undefined && result > written + START_TOLERANCE_MS;
@@ -114,21 +132,37 @@ export async function holderIsDead(holder, startMs) {
         return error?.code === "EACCES" || error?.code === "EPERM";
     }
 }
-async function deadHolder(file) {
+async function deadHolderText(text, signal) {
     try {
-        return await holderIsDead(JSON.parse(readFileSync(file, "utf8")));
+        return await holderIsDead(JSON.parse(text), undefined, signal);
     }
-    catch { /* An incomplete or unreadable lock is busy, never stale by age alone. */ }
+    catch {
+        signal?.throwIfAborted();
+        /* An incomplete or unreadable lock is busy, never stale by age alone. */
+    }
+    return false;
+}
+async function deadHolder(file, signal) {
+    try {
+        return await deadHolderText(readFileSync(file, "utf8"), signal);
+    }
+    catch {
+        signal?.throwIfAborted();
+        /* An incomplete or unreadable lock is busy, never stale by age alone. */
+    }
     return false;
 }
 /** Removes the lock only if it still holds the exact metadata that was found dead. The death check awaits a process
  * launch, so the holder may release meanwhile and a new writer may create a fresh lock at the same path; that lock
  * must never be unlinked. The re-read and the unlink run with no await in between. */
-async function unlinkIfStillDead(file) {
+async function unlinkIfStillDead(file, signal, knownDeadText) {
     let text;
     try { text = readFileSync(file, "utf8"); } catch { return false; }
-    try { if (!await holderIsDead(JSON.parse(text))) return false; } catch { return false; }
-    try { if (readFileSync(file, "utf8") !== text) return false; } catch { return false; }
+    if (text !== knownDeadText) {
+        try { if (!await holderIsDead(JSON.parse(text), undefined, signal)) return false; } catch { signal?.throwIfAborted(); return false; }
+        signal?.throwIfAborted();
+        try { if (readFileSync(file, "utf8") !== text) return false; } catch { return false; }
+    }
     unlinkSync(file);
     return true;
 }
@@ -146,7 +180,7 @@ function createHolder(file, token) {
 }
 /** Unique claims cannot be replaced while being inspected. Refuse if another live claimant exists.
  * Keeping our claim through the critical section prevents two stale-reaper recoverers from both entering. */
-async function claimReclamation(file, token, root) {
+async function claimReclamation(file, token, root, signal) {
     const directory = file + ".reap-claims";
     mkdirSync(directory, { recursive: true });
     const own = `${process.pid}-${token}.json`;
@@ -154,10 +188,11 @@ async function claimReclamation(file, token, root) {
     createHolder(claim, token);
     try {
         for (const name of readdirSync(directory)) {
+            signal?.throwIfAborted();
             if (name === own)
                 continue;
             const pid = /^(\d+)-[a-f0-9-]+\.json$/i.exec(name)?.[1];
-            if (!pid || !(pidIsGone(Number(pid)) || await deadHolder(path.join(directory, name))))
+            if (!pid || !(pidIsGone(Number(pid)) || await deadHolder(path.join(directory, name), signal)))
                 throw new CheckoutBusyError(root);
             // The pid is encoded before creation, so even a crash before writing metadata is recoverable.
             try {
@@ -175,8 +210,11 @@ async function claimReclamation(file, token, root) {
         throw error;
     }
 }
-/** Exclusive across this process and bridge processes. Callers pass the Git checkout root. */
+/** Exclusive across this process and bridge processes. Callers pass the Git checkout root.
+ * Stale-lock reclamation shares one bounded deadline (`deadlineMs`, default `PROCESS_QUERY_TIMEOUT_MS`) and respects `signal`. */
 export async function acquire(checkoutRoot, options = {}) {
+    const { signal } = options;
+    signal?.throwIfAborted();
     const root = canonicalCheckoutPath(checkoutRoot);
     if (held.has(root) || acquiring.has(root))
         throw new CheckoutBusyError(root);
@@ -192,47 +230,66 @@ export async function acquire(checkoutRoot, options = {}) {
         catch (error) {
             if (error.code !== "EEXIST")
                 throw error;
-            if (!await deadHolder(file))
-                throw new CheckoutBusyError(root);
-            // Serialize reclaimers: none may unlink a newly created live lock after another reclaimed it.
-            const reaper = file + ".reap";
-            const claim = await claimReclamation(file, token, root);
-            let reaperOwned = false;
+            const reclaimSignal = boundedSignal(options.deadlineMs ?? PROCESS_QUERY_TIMEOUT_MS, signal);
             try {
-                if (existsSync(reaper)) {
-                    if (!await deadHolder(reaper))
-                        throw new CheckoutBusyError(root);
-                    unlinkSync(reaper);
-                }
-                // Publish complete, closed metadata atomically; a crash cannot leave an empty .reap file.
-                try {
-                    linkSync(claim.file, reaper);
-                    reaperOwned = true;
-                }
-                catch (err) {
-                    if (err.code === "EEXIST")
-                        throw new CheckoutBusyError(root);
-                    throw err;
-                }
-                if (!await unlinkIfStillDead(file))
+                let initialText;
+                try { initialText = readFileSync(file, "utf8"); } catch { /* gone or unreadable */ }
+                if (initialText === undefined || !await deadHolderText(initialText, reclaimSignal)) {
+                    signal?.throwIfAborted();
                     throw new CheckoutBusyError(root);
-                try {
-                    create();
                 }
-                catch (err) {
-                    if (err.code === "EEXIST")
-                        throw new CheckoutBusyError(root);
-                    throw err;
-                }
-            }
-            finally {
+                // Serialize reclaimers: none may unlink a newly created live lock after another reclaimed it.
+                const reaper = file + ".reap";
+                const claim = await claimReclamation(file, token, root, reclaimSignal);
+                let reaperOwned = false;
                 try {
-                    if (reaperOwned)
+                    reclaimSignal.throwIfAborted();
+                    if (existsSync(reaper)) {
+                        if (!await deadHolder(reaper, reclaimSignal)) {
+                            signal?.throwIfAborted();
+                            throw new CheckoutBusyError(root);
+                        }
                         unlinkSync(reaper);
+                    }
+                    // Publish complete, closed metadata atomically; a crash cannot leave an empty .reap file.
+                    try {
+                        linkSync(claim.file, reaper);
+                        reaperOwned = true;
+                    }
+                    catch (err) {
+                        if (err.code === "EEXIST")
+                            throw new CheckoutBusyError(root);
+                        throw err;
+                    }
+                    if (!await unlinkIfStillDead(file, reclaimSignal, initialText)) {
+                        signal?.throwIfAborted();
+                        throw new CheckoutBusyError(root);
+                    }
+                    try {
+                        create();
+                    }
+                    catch (err) {
+                        if (err.code === "EEXIST")
+                            throw new CheckoutBusyError(root);
+                        throw err;
+                    }
                 }
                 finally {
-                    claim.release();
+                    try {
+                        if (reaperOwned)
+                            unlinkSync(reaper);
+                    }
+                    finally {
+                        claim.release();
+                    }
                 }
+            }
+            catch (reclaimError) {
+                if (signal?.aborted)
+                    throw signal.reason;
+                if (reclaimSignal.aborted)
+                    throw new CheckoutBusyError(root);
+                throw reclaimError;
             }
         }
         const release = Object.assign(() => {

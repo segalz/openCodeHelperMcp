@@ -15,8 +15,8 @@ export const CREATION_SLACK_MS = 100;
  * One snapshot of every process with its parent and creation time (Windows). Null when it cannot be read
  * (timeout, error, empty output) so callers never mistake "unknown" for "no descendants".
  */
-export function listProcessTable(timeoutMs = PROCESS_TABLE_TIMEOUT_MS) {
-  if (process.platform !== "win32") return Promise.resolve(null);
+export function listProcessTable(timeoutMs = PROCESS_TABLE_TIMEOUT_MS, signal) {
+  if (process.platform !== "win32" || timeoutMs <= 0 || signal?.aborted) return Promise.resolve(null);
   const script = "Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object { "
     + "$c = if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }; "
     + "[string]$_.ProcessId + ',' + [string]$_.ParentProcessId + ',' + [string]$c }";
@@ -33,6 +33,7 @@ export function listProcessTable(timeoutMs = PROCESS_TABLE_TIMEOUT_MS) {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
       if (!ok) { resolve(null); return; }
       const entries = out.split(/\r?\n/).flatMap((line) => {
         const [pid, parentPid, createdMs] = line.trim().split(",").map(Number);
@@ -41,7 +42,10 @@ export function listProcessTable(timeoutMs = PROCESS_TABLE_TIMEOUT_MS) {
       });
       resolve(entries.length > 0 ? entries : null);
     };
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } finish(false); }, timeoutMs);
+    const stop = () => { try { child.kill(); } catch { /* gone */ } child.stdout?.destroy(); finish(false); };
+    const timer = setTimeout(stop, Math.min(PROCESS_TABLE_TIMEOUT_MS, timeoutMs));
+    timer.unref?.();
+    signal?.addEventListener("abort", stop, { once: true });
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk) => { out += chunk; });
     child.on("error", () => finish(false));
@@ -94,65 +98,106 @@ function killOnePid(pid, platform) {
   } catch { /* gone */ }
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 /**
  * Wait until the root and its descendants are dead, retrying the kill every `pollMs`, bounded by `capMs`.
  * The caller sends the first kill. A descendant seen dead once is never killed again (its PID may be reused).
- * opts: { killRoot, isRootAlive, rootStartedMs, rootExitedMs?, firstPollMs?, capMs?, pollMs?, platform?, listTable?, isAlive?, killPid? }.
+ * opts: { killRoot, isRootAlive, rootStartedMs, rootExitedMs?, firstPollMs?, capMs?, now?, pollMs?, platform?, signal?, listTable?, isAlive?, killPid? }.
  * Resolves { confirmed, alive, unverified? }.
  */
 export async function confirmTreeDead(rootPid, opts) {
   const platform = opts.platform ?? process.platform;
-  const capMs = opts.capMs ?? TREE_KILL_CONFIRM_MS;
+  const capMs = Math.min(opts.capMs ?? TREE_KILL_CONFIRM_MS, TREE_KILL_CONFIRM_MS);
   const pollMs = opts.pollMs ?? 250;
   const isAlive = opts.isAlive ?? pidAlive;
   const killPid = opts.killPid ?? ((pid) => killOnePid(pid, platform));
-  const deadline = Date.now() + capMs;
-  const pause = () => sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+  const now = opts.now ?? (() => performance.now());
+  const deadline = now() + capMs;
+  const remaining = () => opts.signal?.aborted ? 0 : Math.max(0, deadline - now());
+  const pause = (ms = pollMs) => new Promise(resolve => {
+    const wait = Math.min(ms, remaining());
+    if (opts.signal?.aborted || wait <= 0) { resolve(); return; }
+    const wake = () => { clearTimeout(timer); opts.signal?.removeEventListener("abort", wake); resolve(); };
+    const timer = setTimeout(wake, wait);
+    opts.signal?.addEventListener("abort", wake, { once: true });
+  });
   const killRoot = () => { try { opts.killRoot(); } catch { /* retried next poll */ } };
 
   if (platform !== "win32") {
     // The process group outlives its leader while members live, and its ID is not reused meanwhile.
     const groupAlive = () => isAlive(-rootPid);
     // Let a SIGTERM sent by the caller take effect before escalating.
-    if (opts.firstPollMs) await sleep(Math.min(opts.firstPollMs, Math.max(1, deadline - Date.now())));
-    while (Date.now() < deadline) {
+    if (opts.firstPollMs && remaining() > 0) await pause(opts.firstPollMs);
+    while (remaining() > 0) {
       await pause();
       if (!opts.isRootAlive() && !groupAlive()) return { confirmed: true, alive: [] };
       killRoot();
     }
+    if (!opts.isRootAlive() && !groupAlive()) return { confirmed: true, alive: [] };
     return { confirmed: false, alive: [rootPid] };
   }
 
-  const listTable = opts.listTable ?? (() => listProcessTable());
+  const listTable = opts.listTable ?? listProcessTable;
   const known = new Set();
   let tableRead = false;
   let snapshotDone = false;
+  const pollReserve = Math.min(pollMs, capMs / 10);
+  const twoFullReads = capMs - pollReserve >= 2 * PROCESS_TABLE_TIMEOUT_MS;
   const readTable = async () => {
     for (let attempt = 0; attempt < 2 && !tableRead; attempt++) {
-      const table = await listTable().catch(() => null);
-      if (!table) continue;
-      tableRead = true;
-      for (const pid of treeDescendants(rootPid, table, { rootStartedMs: opts.rootStartedMs, rootExitedMs: opts.rootExitedMs?.() })) {
-        known.add(pid);
+      const available = Math.floor(remaining() - pollReserve);
+      if (available <= 0) break;
+      // Never split a cap smaller than two full reads into two halved reads: give the read everything left.
+      const readMs = Math.min(PROCESS_TABLE_TIMEOUT_MS, available);
+      const startedAt = now();
+      const table = await listTable(readMs, opts.signal).catch(() => null);
+      if (table) {
+        tableRead = true;
+        for (const pid of treeDescendants(rootPid, table, { rootStartedMs: opts.rootStartedMs, rootExitedMs: opts.rootExitedMs?.() })) {
+          known.add(pid);
+        }
+        break;
       }
+      // Without room for two full reads, retry only when the first read failed fast (not on timeout).
+      if (!twoFullReads && now() - startedAt >= readMs) break;
     }
     snapshotDone = true;
   };
   const snapshot = readTable();
+  const waitForSnapshot = () => new Promise(resolve => {
+    if (snapshotDone || remaining() <= 0) { resolve(); return; }
+    let done = false;
+    const wake = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", wake);
+      resolve();
+    };
+    const timer = setTimeout(wake, remaining());
+    opts.signal?.addEventListener("abort", wake, { once: true });
+    void snapshot.then(wake);
+  });
   const liveDescendants = () => {
     for (const pid of [...known]) if (!isAlive(pid)) known.delete(pid);
     return [...known];
   };
 
-  while (Date.now() < deadline) {
+  while (remaining() > 0) {
     await pause();
     const rootAlive = opts.isRootAlive();
     const alive = liveDescendants();
     if (!rootAlive && alive.length === 0) {
       if (snapshotDone) return tableRead ? { confirmed: true, alive: [] } : { confirmed: false, alive: [], unverified: true };
-      await Promise.race([snapshot, sleep(Math.max(1, deadline - Date.now()))]);
+      await waitForSnapshot();
+      const after = liveDescendants();
+      if (!opts.isRootAlive() && after.length === 0) {
+        if (snapshotDone) return tableRead ? { confirmed: true, alive: [] } : { confirmed: false, alive: [], unverified: true };
+        break;
+      }
+      if (remaining() > 0) {
+        if (opts.isRootAlive()) killRoot();
+        else for (const pid of after) killPid(pid);
+      }
       continue;
     }
     // While the root lives its /T kill covers the tree; killing descendants by PID at the same time could hit

@@ -38,11 +38,12 @@ function trackedFiles(root, signal, optionsSpawn) {
                 return;
             try {
                 if (process.platform === "win32" && child.pid)
-                    defaultKillTree(child.pid, "SIGKILL", "win32");
-                else
-                    child.kill();
+                    defaultKillTree(child.pid);
+                child.kill?.("SIGKILL");
             }
             catch { /* already exited */ }
+            child.stdout?.destroy?.();
+            child.stderr?.destroy?.();
             finish(new Error("Code map Git deadline or output limit exceeded"));
         };
         signal.addEventListener("abort", stop, { once: true });
@@ -119,6 +120,9 @@ function formatMap(entries, omitted, fits) {
 /** Best-effort, bounded map of tracked files. A scan-budget stop keeps completed entries; I/O failure omits the map. */
 async function buildRegexMap(root, options = {}) {
     const controller = new AbortController();
+    const now = options.now ?? (() => performance.now());
+    const schedule = options.setTimeout ?? setTimeout;
+    const unschedule = options.clearTimeout ?? clearTimeout;
     let timer;
     const abort = () => controller.abort();
     try {
@@ -131,9 +135,11 @@ async function buildRegexMap(root, options = {}) {
             return undefined;
         const fits = (text) => text.length <= maxChars &&
             (!options.commandLineLength || options.commandLineLength(text + "\n\n") <= commandLimit);
-        const timeBudget = Math.max(1, Math.min(TIME_BUDGET_MS, options.timeBudgetMs ?? TIME_BUDGET_MS));
-        const deadline = performance.now() + timeBudget;
-        timer = setTimeout(abort, timeBudget);
+        const timeBudget = Math.min(TIME_BUDGET_MS, options.timeBudgetMs ?? TIME_BUDGET_MS);
+        if (!(timeBudget > 0))
+            return undefined;
+        const deadline = now() + timeBudget;
+        timer = schedule(abort, timeBudget);
         options.signal?.addEventListener("abort", abort, { once: true });
         // Bound every I/O operation, including metadata calls which do not accept an AbortSignal.
         const bounded = (operation) => new Promise((resolve, reject) => {
@@ -151,7 +157,7 @@ async function buildRegexMap(root, options = {}) {
         const entries = [];
         let scanned = 0;
         for (; scanned < files.length; scanned++) {
-            if (scanned >= MAX_FILES || performance.now() >= deadline)
+            if (scanned >= MAX_FILES || now() >= deadline)
                 break;
             const file = files[scanned];
             try {
@@ -210,7 +216,7 @@ async function buildRegexMap(root, options = {}) {
         return undefined;
     }
     finally {
-        clearTimeout(timer);
+        if (timer !== undefined) unschedule(timer);
         options.signal?.removeEventListener("abort", abort);
         controller.abort();
     }
@@ -219,7 +225,8 @@ async function buildRegexMap(root, options = {}) {
 /** String API retained; onSource reports the context actually selected for launch. */
 export async function buildCodeMap(root, options = {}) {
     options.signal?.throwIfAborted();
-    const started = performance.now();
+    const now = options.now ?? (() => performance.now());
+    const started = now();
     const cli = (options.env ?? process.env).CODEINDEX_CLI;
     let map;
     if (cli) {
@@ -232,15 +239,16 @@ export async function buildCodeMap(root, options = {}) {
             return undefined;
         }
         map = await tryCodeindexMap(root, { cli, prompt: options.prompt, budget,
-            timeBudgetMs: (options.timeBudgetMs ?? Infinity) - (performance.now() - started), signal: options.signal, env: options.env,
-            spawnImpl: options.spawnImpl, killTreeImpl: options.killTreeImpl });
+            timeBudgetMs: (options.timeBudgetMs ?? Infinity) - (now() - started), signal: options.signal, env: options.env,
+            spawnImpl: options.spawnImpl, killTreeImpl: options.killTreeImpl,
+            now, setTimeout: options.setTimeout, clearTimeout: options.clearTimeout });
         options.signal?.throwIfAborted();
         if (typeof map === "string" && map.length <= budget && (!options.commandLineLength || options.commandLineLength(map + "\n\n") <= commandLimit)) {
             options.onSource?.(map ? "codeindex" : "none");
             return map || undefined;
         }
     }
-    const remaining = (options.timeBudgetMs ?? Infinity) - (performance.now() - started);
+    const remaining = (options.timeBudgetMs ?? Infinity) - (now() - started);
     map = remaining > 0 ? await buildRegexMap(root, { ...options, timeBudgetMs: Math.min(TIME_BUDGET_MS, remaining) }) : undefined;
     options.signal?.throwIfAborted();
     options.onSource?.(map ? "regex" : "none");

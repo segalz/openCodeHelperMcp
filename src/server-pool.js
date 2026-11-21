@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createServer } from "node:net";
 import { randomBytes } from "node:crypto";
+import { boundedSignal, untilAborted } from "./waits.js";
 
 const HOST = "127.0.0.1";
 const LISTEN_MS = 15_000;
@@ -138,8 +139,12 @@ export function createServerPool({ getFreePort = freeLoopbackPort, setTimeoutImp
         // Both servers can be executing models. Let an independent cold run keep its own deadline
         // and guard rather than killing another run or attributing its quota logs to this caller.
         if (!idle.length) return;
-        // An evicted server whose stop is unconfirmed must not fail this caller: it runs cold instead.
-        if ((await idle[0].stop())?.killConfirmed === false) return;
+        // An evicted server whose stop is unconfirmed or outlives this caller's budget must not block/fail this caller: it runs cold instead.
+        const evictBudget = remainingMs();
+        if (signal.aborted || evictBudget <= 0) return;
+        const evicted = await untilAborted(idle[0].stop(), boundedSignal(evictBudget, signal))
+          .catch(() => ({ killConfirmed: false }));
+        if (evicted?.killConfirmed === false) return;
         // Another caller may have claimed the freed slot while the tree was being reaped.
         return acquire(config, { editScope, signal, remainingMs, runProcess });
       }
