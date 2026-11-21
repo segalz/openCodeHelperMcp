@@ -207,15 +207,14 @@ async function specialEntryState(root, entry, signal, { baseline = false } = {})
                 return "other";
             if (stat.size > SPECIAL_PLACEHOLDER_HASH_CAP)
                 return `file-size:${stat.size}`;
-            if (stat.size > SPECIAL_PLACEHOLDER_LIMIT) {
-                const hashed = await hashFile(absolute, signal, SPECIAL_PLACEHOLDER_HASH_CAP);
-                if (hashed === null) {
-                    const current = await statOrMissing(absolute);
-                    return current?.isFile() ? `file-size:${current.size}` : "other";
-                }
-                return `file:${hashed}`;
+            // Always the capped, streamed hash (same SHA-256 hex as before): a placeholder that grows after the stat can
+            // never be read past the cap (final Codex check).
+            const hashed = await hashFile(absolute, signal, SPECIAL_PLACEHOLDER_HASH_CAP);
+            if (hashed === null) {
+                const current = await statOrMissing(absolute);
+                return current?.isFile() ? `file-size:${current.size}` : "other";
             }
-            return `file:${hash(await readFile(absolute, { signal }))}`;
+            return `file:${hashed}`;
         }
         return "other";
     }

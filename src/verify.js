@@ -39,7 +39,8 @@ export async function resolveVerificationCommand(command, args = [], cwd = proce
   // install's own CLI script only when the path exists; a missing one is refused below (plan S20 review).
   const npmName = /^(npm|npx)(?:\.cmd)?$/i.exec(hasDirectory ? path.basename(command) : command);
   const explicit = hasDirectory ? path.resolve(cwd, command) : undefined;
-  const npm = npmName && (!explicit || await isFile(explicit) || await isFile(explicit + ".cmd")) ? npmName : null;
+  const npm = npmName && (!explicit || await isFile(explicit) || (!path.extname(explicit) && await isFile(explicit + ".cmd")))
+    ? npmName : null;
   if (npm) {
     const script = npm[1].toLowerCase() + "-cli.js";
     const candidates = explicit ? [path.join(path.dirname(explicit), "node_modules", "npm", "bin", script)]
@@ -47,6 +48,11 @@ export async function resolveVerificationCommand(command, args = [], cwd = proce
         ...(process.env.APPDATA ? [path.join(process.env.APPDATA, "npm", "node_modules", "npm", "bin", script)] : [])];
     for (const candidate of candidates) {
       if (await isFile(candidate)) return { command: process.execPath, args: [candidate, ...args] };
+    }
+    // A project-local shim (`node_modules/.bin/npm.cmd`) points to its own npm: parse it like any other shim.
+    if (explicit) {
+      const shimPath = /\.cmd$/i.test(explicit) ? explicit : explicit + ".cmd";
+      if (await isFile(shimPath)) return resolveCmdShim(shimPath, args, 0);
     }
     throw new VerificationError("verification_refused", "Could not resolve the npm installation's CLI script.");
   }

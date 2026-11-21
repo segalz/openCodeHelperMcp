@@ -77,6 +77,36 @@ test("Gate 6: prefixed *_KEY secrets, Basic/Bearer after assignments and unquote
   }
 });
 
+test("final check: JSON secret values are always hidden; arrow functions are never cut off", () => {
+  for (const [text, secret] of [
+    ['{"key":"test-search-passphrase"}', "test-search-passphrase"],
+    ['{"password":"undefined"}', "undefined"],
+    [`{"key": "${digits}"}`, digits.slice(0, 20)],
+  ]) {
+    assert.ok(!redactSecrets(text).includes(secret), `${text} -> ${redactSecrets(text)}`);
+  }
+  for (const text of ["tokens.map(token => normalize(token))", "keys.forEach(key => print(key));", "secrets.filter(secret => secret.ok)"]) {
+    assert.equal(redactSecrets(text), text);
+  }
+  assert.ok(!redactSecrets('password => "hunter2hunter2"').includes("hunter2hunter2"));
+});
+
+test("final check: a project-local node_modules/.bin/npm.cmd shim still resolves", { skip: process.platform !== "win32" ? "Windows" : false }, async () => {
+  const project = await mkdtemp(path.join(base, "local-npm-"));
+  const bin = path.join(project, "node_modules", ".bin");
+  const { mkdir: mk, writeFile: wf } = await import("node:fs/promises");
+  await mk(bin, { recursive: true });
+  await mk(path.join(project, "node_modules", "npm", "bin"), { recursive: true });
+  await wf(path.join(project, "node_modules", "npm", "bin", "npm-cli.js"), "process.exit(0)");
+  const shim = ["@ECHO off", "GOTO start", ":find_dp0", "SET dp0=%~dp0", "EXIT /b", ":start", "SETLOCAL", "CALL :find_dp0", "",
+    String.raw`IF EXIST "%dp0%\node.exe" (`, String.raw`  SET "_prog=%dp0%\node.exe"`, ") ELSE (", "  SET \"_prog=node\"", ")", "",
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%` + "\\" + String.raw`..\npm\bin\npm-cli.js` + `" %*`, ""].join("\r\n");
+  await wf(path.join(bin, "npm.cmd"), shim);
+  const resolved = await resolveVerificationCommand(path.join(bin, "npm.cmd"), ["test"], project);
+  assert.equal(resolved.command, process.execPath);
+  assert.equal(path.resolve(resolved.args[0]), path.join(project, "node_modules", "npm", "bin", "npm-cli.js"));
+});
+
 test("S20 (5): an explicit path to a missing npm is refused, not replaced by the installed npm", async () => {
   const missing = path.join(base, "missing", "path", "npm");
   await assert.rejects(resolveVerificationCommand(missing, ["test"], base), VerificationError);

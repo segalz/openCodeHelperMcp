@@ -22,18 +22,22 @@ const SECRET_PATTERNS = [
   // Quoted value after a secret name (also `=>`, `:=`, triple quotes, a scheme, a string prefix such as rb"…"). A
   // quoted type literal (`token: "string"`) is not a secret (plan S20 review).
   [new RegExp(String.raw`((["']?)\b(${SECRET_NAME})\2\s*(?::=|=>|[:=])\s*(?:(?:bearer|basic)[ \t]+)?)([a-z]{1,2})?("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*')`, "gi"),
-    (match, prefix, _keyQuote, name, stringPrefix, value) => {
+    (match, prefix, keyQuote, name, stringPrefix, value) => {
       const quote = value.startsWith('"""') || value.startsWith("'''") ? value.slice(0, 3) : value[0];
       const inner = value.slice(quote.length, value.length - quote.length);
-      // `token: "string"` is a TypeScript literal type; `password: f"string"` is a Python string that may hold a secret.
-      if (!stringPrefix && TYPE_VALUE.test(inner)) return match;
-      if (!keyNameIsSecret(name, inner, true)) return match;
+      // A quoted key (JSON, `{"key": "…"}`) holds data, never a type or a JSX prop: always hidden (final Codex check).
+      if (!keyQuote) {
+        // `token: "string"` is a TypeScript literal type; `password: f"string"` is a Python string that may hold a secret.
+        if (!stringPrefix && TYPE_VALUE.test(inner)) return match;
+        if (!keyNameIsSecret(name, inner, true)) return match;
+      }
       return prefix + quote + "[REDACTED]" + quote;
     }],
   [/(authorization\s*[:=]\s*)(?:(?:bearer|basic|token)[ \t]+)?(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s"',;]+)/gi, "$1[REDACTED]"],
   [/\bbearer\s+[A-Za-z0-9._~+\/=-]{8,}/gi, "Bearer [REDACTED]"],
   // Unquoted value after a secret name; a scheme word (`token = Basic <v>`) is skipped so the value itself is hidden.
-  [new RegExp(String.raw`\b((${SECRET_NAME})\s*(:=|=>|[=:])\s*(?:(?:bearer|basic)[ \t]+)?)([^\s"',;&]+)`, "gi"),
+  // No `=>` here: unquoted, it is an arrow function (`tokens.map(token => normalize(token))`), not an assignment.
+  [new RegExp(String.raw`\b((${SECRET_NAME})\s*(:=|[=:])(?!>)\s*(?:(?:bearer|basic)[ \t]+)?)([^\s"',;&]+)`, "gi"),
     (match, prefix, name, sep, value) => (sep === ":" && TYPE_VALUE.test(value)) || value === "[REDACTED]" || !keyNameIsSecret(name, value, false)
       ? match : `${prefix}[REDACTED]`],
   [/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, "[REDACTED]"],
