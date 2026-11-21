@@ -731,6 +731,23 @@ test("cancelling analyze_code while catalog.list is pending stops waiting prompt
   assert.match(reply.content[0].text, /cancelled/i);
 });
 
+test("a cold catalog.list never holds analyze_code past budgetMs", async t => {
+  // Opus review of the OpenCode mirror: the catalog's own 60 s cap was not bounded by budgetMs.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const tools = new Map();
+  registerAnalysisTools({ registerTool: (name, _meta, handler) => tools.set(name, handler) }, {
+    resolveAllowedPath: async dir => dir,
+    catalog: { list: () => new Promise(() => {}) },
+    runner: () => assert.fail("no model may run without a catalog"),
+  });
+  const pending = tools.get("analyze_code")({ directory: process.cwd(), prompt: "inspect", codeMap: false, budgetMs: 30_000 }, {});
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  t.mock.timers.tick(30_001);
+  const reply = await pending;
+  assert.equal(reply.isError, true);
+  assert.match(reply.content[0].text, /did not answer within budgetMs \(30000 ms\)/);
+});
+
 test("verify exitGrace gets its full 500 ms inside the settle margin when the check exits at its deadline", async t => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
   let started;

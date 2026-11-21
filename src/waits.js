@@ -7,6 +7,9 @@
  * - Every internal wait is bounded by `min(its cap, the owning operation's remaining budget)`.
  * - A cancellation stops waiting promptly and shortens even a settlement wait already in progress.
  *   Edit baseline restoration has its own `RESTORE_BUDGET_MS` cap (below the 120 s shutdown cap).
+ *   So do the post-run and post-check identity checks in `edits.js` (`unchanged(boundedSignal(RESTORE_BUDGET_MS,
+ *   signal))`): they guard the snapshot, so a run that ended at its deadline may spend up to one snapshot Git
+ *   call (`SNAPSHOT_GIT_TIMEOUT_MS`) more before the budget error is reported.
  * - An unconfirmed kill never triggers an automatic restore: the recovery snapshot is retained and
  *   no repair runs.
  */

@@ -16,7 +16,7 @@ import { confirmTreeDead } from "./proctree.js";
 import { createWindowsJob } from "./jobobject.js";
 import { createServerPool, shutdownServers } from "./server-pool.js";
 import { withProgressHeartbeat } from "./progress.js";
-import { TREE_KILL_CONFIRM_MS, settlementBudget, untilAborted } from "./waits.js";
+import { TREE_KILL_CONFIRM_MS, boundedSignal, settlementBudget, untilAborted } from "./waits.js";
 
 // ---------------------------------------------------------------------------
 // Limits and defaults
@@ -1179,9 +1179,14 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
     try {
       validated = await awaitOrCancel(validate(directory));
       if (validated.error) return textResult(validated.error, true);
-      listed = await awaitOrCancel(catalog.list());
+      // A cold catalog listing can take up to its own 60 s cap; never wait for it past budgetMs. The
+      // listing keeps running in the background and fills the cache for the next call.
+      listed = await untilAborted(catalog.list(), boundedSignal(Math.max(0, deadline - nowImpl()), extra.signal));
     } catch (error) {
       if (extra.signal?.aborted) return cancelledReply();
+      if (error?.name === "TimeoutError") {
+        return textResult(`The free model list did not answer within budgetMs (${budget} ms). Try again; the list is being cached.`, true);
+      }
       throw error;
     }
     if (extra.signal?.aborted) return cancelledReply();
