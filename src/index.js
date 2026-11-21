@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createModelCatalog, createOpenCodeRunner, registerAnalysisTools, resolvePathWithinAllowedRoots, shutdownAnalysis } from "./core.js";
 import { registerEditTools, shutdownEdits } from "./edits.js";
 import { shutdownJobObjects } from "./jobobject.js";
+import { sweepOldSnapshots } from "./snapshot.js";
 
 const DEFAULT_ALLOWED_ROOT = "C:\\Develop";
 
@@ -22,6 +23,7 @@ const server = new McpServer({ name: "opencode-helper", version: "0.2.0" });
 registerAnalysisTools(server, { runner, catalog, resolveAllowedPath });
 registerEditTools(server, { runner, catalog, resolveAllowedPath });
 await server.connect(new StdioServerTransport());
+void sweepOldSnapshots().catch(() => {});
 
 // A client exit or restart must not leave a half-done edit in the checkout with the lock released by
 // process death: abort in-flight edits so they restore and release the shared lock, then exit.

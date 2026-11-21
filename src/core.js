@@ -414,7 +414,7 @@ export function buildAnalysisPrompt(prompt, maxWords, { directory, platform, map
 export function buildEditPrompt(prompt, { directory, platform, map } = {}) {
   return [buildEnvironmentLine(directory, platform),
     "You are the implementation agent. Edit only the requested checkout files. Never stage, commit, change branches, rewrite history or modify .git, ignored files, credential files, or verification requirements.",
-    WORKING_RULES.replace("Use read/glob/grep/list only. Bash, edits, delegated tasks and web tools are unavailable in analysis.", "Use read/glob/grep/list and edit/write/apply_patch. Bash, delegated tasks and web tools are unavailable; the bridge runs verification."),
+    WORKING_RULES.replace("Use read/glob/grep/list only. Bash, edits, delegated tasks and web tools are unavailable in analysis.", "Use read/glob/grep/list and edit/write/apply_patch. Bash, delegated tasks and web tools are unavailable. Do not run tests or the build, and do not create helper scripts or files to run them: when you finish, the bridge runs the caller's check and sends any failure back to you for a repair."),
     ...(map ? [map] : []), "Return a concise English Markdown summary of changed files, checks and unresolved questions. Do not claim checks were run by you.", "User objective:", prompt].join("\n");
 }
 

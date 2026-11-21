@@ -75,6 +75,16 @@ test("edits pass first check with real verification process", async t => {
   assert.equal(out.sessionID, "ses_fixture"); assert.equal(out.usage.inputTokens, 15); assert.deepEqual(await readdir(path.join(f.base, "snapshots")), []);
 });
 
+test("a first run left under a minute after the check's reserve is refused before the model starts", async t => {
+  // Live use 2026-11-21: a long verify timeout left the model too little of budgetMs, and the run could only time out.
+  const f = await repository(t);
+  const out = await runEdits({ ...input(f.root), budgetMs: 120_000, verify: { ...verify, timeoutSeconds: 90 } },
+    { ...f.options, runner: () => assert.fail("the model must not start") });
+  assert.equal(out.error, "budget_exceeded");
+  assert.match(out.message, /left for the model after reserving 100 s for the check/);
+  assert.equal(await readFile(path.join(f.root, "main.js"), "utf8"), "owner dirty bytes\n");
+});
+
 test("failed check repairs in the exact session and aggregates usage/guard", async t => {
   const f = await repository(t), calls = []; let checks = 0;
   const out = await runEdits(input(f.root), { ...f.options, verifyImpl: async () => ++checks === 1 ? failedCheck() : passedCheck(), runner: async call => {
@@ -361,16 +371,17 @@ test("S8: an edit run's limit is remembered by the shared catalog, and a passing
 });
 
 // Plan S10 (B10): the first run also keeps time for its final check.
-test("S10: with an 80 s budget and a 60 s check, the first run gets exactly the 10 s left after the reserve", async t => {
+// Was 80 s budget → 10 s run; since 2026-11-21 a first run under MIN_FIRST_RUN_MS (60 s) is refused up front.
+test("S10: with a 140 s budget and a 60 s check, the first run gets exactly the 70 s left after the reserve", async t => {
   const f = await repository(t), timeouts = [];
-  const out = await runEdits({ ...input(f.root), budgetMs: 80_000, verify: { ...verify, timeoutSeconds: 60 } }, { ...f.options,
+  const out = await runEdits({ ...input(f.root), budgetMs: 140_000, verify: { ...verify, timeoutSeconds: 60 } }, { ...f.options,
     nowImpl: () => 1_000,
     verifyImpl: async () => passedCheck(),
     runner: async call => { timeouts.push(call.timeoutMs); await writeFile(path.join(f.root, "main.js"), "fixed"); return response(); } });
   assert.equal(out.verification.passed, true);
   assert.equal(timeouts.length, 1);
-  // 80 s - (60 s check + 10 s margin) = 10 s with deterministic clock.
-  assert.equal(timeouts[0], 10_000, `first run got ${timeouts[0]} ms`);
+  // 140 s - (60 s check + 10 s margin) = 70 s with deterministic clock.
+  assert.equal(timeouts[0], 70_000, `first run got ${timeouts[0]} ms`);
 });
 
 test("S10: a budget too small for the check refuses before any run and leaves the files as they were", async t => {

@@ -318,7 +318,7 @@ export async function takeSnapshot(checkoutRoot, opts = {}) {
     const maxFiles = limit(opts.maxFiles, 20_000);
     const maxFile = limit(opts.maxFileBytes, 64 * 1024 * 1024);
     const maxTotal = limit(opts.maxTotalBytes, 512 * 1024 * 1024);
-    const base = path.resolve(opts.snapshotBase ?? path.join(os.tmpdir(), "cline-mcp-snapshots"));
+    const base = path.resolve(opts.snapshotBase ?? defaultSnapshotBase());
     // Resolve the closest existing ancestor too: a symlinked base must not lead back into the checkout.
     let ancestor = base;
     while (!await statOrMissing(ancestor))
@@ -657,4 +657,32 @@ export async function resolveCheckoutRoot(directory, signal) {
 }
 export async function ignoredCheckoutPaths(root, signal) {
   return [...new Set((await git(root, ["ls-files", "-z", "--ignored", "--cached", "--others", "--exclude-standard", "--directory"], signal)).toString("utf8").split("\0").filter(Boolean))];
+}
+
+export const SNAPSHOT_RETENTION_MS = 14 * 86_400_000;
+
+export function defaultSnapshotBase() {
+  return path.resolve(process.env.CLINE_MCP_SNAPSHOT_DIR?.trim() || path.join(os.tmpdir(), "cline-mcp-snapshots"));
+}
+
+const SNAPSHOT_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Remove kept snapshot folders (UUID names) older than maxAgeMs; never throws. */
+export async function sweepOldSnapshots(base, opts = {}) {
+  const now = opts.now ?? Date.now;
+  const maxAgeMs = opts.maxAgeMs ?? SNAPSHOT_RETENTION_MS;
+  const directory = base ?? defaultSnapshotBase();
+  let names;
+  try { names = await readdir(directory); } catch { return []; }
+  const removed = [];
+  for (const name of names) {
+    if (!SNAPSHOT_NAME.test(name)) continue;
+    const full = path.join(directory, name);
+    try {
+      const info = await lstat(full);
+      if (!info.isDirectory() || info.isSymbolicLink()) continue;
+      if (now() - info.mtimeMs > maxAgeMs) { await rm(full, { recursive: true, force: true }); removed.push(name); }
+    } catch { /* unreadable entry: skip */ }
+  }
+  return removed.sort();
 }

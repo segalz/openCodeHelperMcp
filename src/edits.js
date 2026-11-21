@@ -89,6 +89,8 @@ function hasEarlierQuestion(text) {
 export const VERIFY_RESERVE_MARGIN_MS = 10_000;
 /** A repair run shorter than this is not launched. */
 export const MIN_FIX_RUN_MS = 30_000;
+/** A first run shorter than this (after the check's reserve) is refused before the model starts. */
+export const MIN_FIRST_RUN_MS = 60_000;
 
 export function buildFixPrompt(objective, spec, attempt, root) {
   const mandatory = `Objective:\n${objective}\n\nVerification cwd: ${root}\nExact verification command and literal args:\n${JSON.stringify(spec)}\nFix only what the check reports. Fix the code; never weaken or bypass the check. Retain existing partial edits.\nPrevious check: exit=${attempt.exitCode}; signal=${attempt.signal}; timedOut=${attempt.timedOut}; killedForOutput=${attempt.killedForOutput}\n`;
@@ -217,6 +219,11 @@ export async function runEdits(rawInput, {
       const reserveMs = verification.required ? (input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS : 0;
       const runMs = deadline - nowImpl() - reserveMs;
       if (!run && runMs < 1_000) throw failure("budget_exceeded", "Not enough budget for a run and its final check.");
+      // The check's time is reserved up front; refuse a first run left too short to do real work rather than
+      // spend the model on a run that can only time out (live use 2026-11-21).
+      if (!run && reserveMs > 0 && runMs < MIN_FIRST_RUN_MS) {
+        throw failure("budget_exceeded", `Only ${Math.round(runMs / 1000)} s of budgetMs would be left for the model after reserving ${Math.round(reserveMs / 1000)} s for the check. Lower verify.timeoutSeconds or raise budgetMs.`);
+      }
       if (run && runMs < MIN_FIX_RUN_MS) throw failure("budget_exceeded", "Not enough budget left for another repair run and its check.");
       if (run) verification.fixRuns++;
       let response;
@@ -331,7 +338,7 @@ export async function shutdownEdits(waitMs = 120_000) {
 export function registerEditTools(server, { runner, catalog, resolveAllowedPath, isAbsolute = path.isAbsolute, nowImpl = Date.now, lifecycleOptions = {} }) {
   server.registerTool("apply_opencode_edits", {
     title: "Apply verified OpenCode edits", inputSchema: editsInputSchema,
-    description: "Edit one Git checkout using one explicit free model and build agent; shell/delegates/web denied. Required final check, up to two same-session repairs, shared Cline writer lock, one recovery snapshot, cumulative guard/deadline. Restores failed edits unless keepOnFailure=true; identity changes retain recovery evidence. Synchronous; no fallback. The check is verified before the run (a missing command is refused at once, with no model use) and runs in the requested directory (e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. If a stopped process may still be running, no repair runs, nothing is restored automatically, and the recovery snapshot is kept (evidence.snapshotDirectory). A restore is bounded and reports any file it could not reach. Internal waits follow the call's budget, so a busy machine slows the call instead of failing it. With an MCP progressToken the call sends notifications/progress every 15 s. For model-picker log_run pass the returned usage as tokens and write=true.",
+    description: "Edit one Git checkout using one explicit free model and build agent; shell/delegates/web denied. Required final check, up to two same-session repairs, shared Cline writer lock, one recovery snapshot, cumulative guard/deadline. Restores failed edits unless keepOnFailure=true; identity changes retain recovery evidence. Synchronous; no fallback. The check is verified before the run (a missing command is refused at once, with no model use) and runs in the requested directory (e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. If a stopped process may still be running, no repair runs, nothing is restored automatically, and the recovery snapshot is kept (evidence.snapshotDirectory). A restore is bounded and reports any file it could not reach. Internal waits follow the call's budget, so a busy machine slows the call instead of failing it. The check's timeout plus 10 s is reserved from budgetMs; if less than 60 s would be left for the model, the call is refused before the model starts. With an MCP progressToken the call sends notifications/progress every 15 s. For model-picker log_run pass the returned usage as tokens and write=true.",
   }, async (raw, extra = {}) => withProgressHeartbeat(extra, async () => {
     const deadline = nowImpl() + (raw?.budgetMs ?? DEFAULT_BUDGET_MS);
     // `controller` stops preparation on a client cancel or the deadline. Only a real client cancel
