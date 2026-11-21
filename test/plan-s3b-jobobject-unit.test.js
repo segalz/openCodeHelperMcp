@@ -10,11 +10,13 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { createWindowsJob } from "../src/jobobject.js";
 import { runVerification } from "../src/verify.js";
 
-const windows = { skip: process.platform !== "win32", timeout: 30_000 };
+// 60 s like ClineMcp: with TEMP blocked, background process-table reads (PowerShell) wait out their
+// PROCESS_TABLE_TIMEOUT_MS before the host process can exit, although the verification result is ready in ~1 s.
+const windows = { skip: process.platform !== "win32", timeout: 60_000 };
 const runNode = promisify(execFile);
 
 async function until(predicate) {
-  const deadline = Date.now() + 12_000;
+  const deadline = Date.now() + 30_000;
   while (!await predicate()) {
     assert.ok(Date.now() < deadline, "timed out waiting for the child");
     await sleep(15);

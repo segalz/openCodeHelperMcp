@@ -5,6 +5,7 @@ import path from "node:path";
 import { defaultKillTree } from "./process-utils.js";
 import { confirmTreeDead } from "./proctree.js";
 import { createWindowsJob } from "./jobobject.js";
+import { KILL_SETTLE_MS } from "./waits.js";
 import { ChildProcess } from "node:child_process";
 import { redactSecrets } from "./safety.js";
 export class VerificationError extends Error {
@@ -245,7 +246,7 @@ export async function runVerification(spec, cwd, signal, {
                 if (!realChild || rootAlive()) { try { child.kill("SIGKILL"); } catch { /* bounded grace fallback */ } }
                 finish(null, "SIGKILL");
                 destroyPipes();
-            }, 5000);
+            }, KILL_SETTLE_MS);
             // After exit the root PID may already belong to another process.
             try { if (pid && (!realChild || rootAlive())) killImpl(pid); } catch { /* bounded grace fallback */ }
             void job?.close();

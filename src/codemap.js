@@ -7,7 +7,9 @@ import { tryCodeindexMap } from "./codeindex.js";
 export const CODE_MAP_HEADER = "## Code map (bridge-generated, line numbers in current checkout contents)";
 const MAX_FILES = 3_000;
 const MAX_BYTES = 512 * 1024;
-const TIME_BUDGET_MS = 1_500;
+// Was 1.5 s: on a busy machine the regex scan ran out of time and the model got no map at all (plan
+// after-bridges, 2026-11-21; same value as ClineMcp). The caller's remaining budget still bounds it.
+const TIME_BUDGET_MS = 5_000;
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", "out", "vendor", ".git"]);
 const PER_FILE_IO_ERRORS = new Set(["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EBUSY", "ELOOP", "EISDIR"]);
 const BINARY_EXTENSION = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|7z|rar|exe|dll|so|dylib|woff2?|ttf|eot|mp[34]|wav|ogg|wasm|class|pyc|db|sqlite)$/i;

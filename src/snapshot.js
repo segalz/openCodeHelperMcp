@@ -6,6 +6,7 @@ import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, rmdir,
 import os from "node:os";
 import path from "node:path";
 import { defaultKillTree } from "./process-utils.js";
+import { KILL_SETTLE_MS, SNAPSHOT_GIT_TIMEOUT_MS } from "./waits.js";
 export class SnapshotError extends Error {
     kind;
     constructor(kind, message) {
@@ -67,9 +68,9 @@ async function git(root, args, signal, input, allowedCodes = [0]) {
                 child.stderr.destroy();
                 cleanup();
                 reject(failure);
-            }, 5000);
+            }, KILL_SETTLE_MS);
         };
-        const timer = setTimeout(() => stop(false), 10_000);
+        const timer = setTimeout(() => stop(false), SNAPSHOT_GIT_TIMEOUT_MS);
         const abort = () => stop(true);
         signal?.addEventListener("abort", abort, { once: true });
         if (signal?.aborted)
