@@ -224,13 +224,14 @@ test("explicit models are validated against the current free list", () => {
 
 test("auto order follows the preference list, then other free models, and skips failed probes", () => {
   const order = buildAutoOrder(FREE).map((m) => m.id);
-  assert.deepEqual(order.slice(0, 2), ["opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free"]);
+  assert.deepEqual(order.slice(0, 2), ["opencode/deepseek-v4.1-flash-free", "opencode/big-pickle"]);
   assert.equal(order.length, 4);
   assert.ok(!order.includes("opencode/mimo-v2.6-flash-free"), "unlisted preferred models are not used");
   const probes = { "opencode/deepseek-v4.1-flash-free": { status: "failed" }, "nvidia/z-ai/glm-5.3-flash": { status: "ok", latency_ms: 10 }, "opencode/big-pickle": { status: "timeout" } };
   const skipped = buildAutoOrder(FREE, { recentProbe: (id) => probes[id] }).map((m) => m.id);
-  assert.deepEqual(skipped, ["opencode/glm-5.3-flash-free", "nvidia/z-ai/glm-5.3-flash", "opencode/nemotron-3-ultra-free"]);
-  assert.deepEqual(PREFERRED_MODELS.slice(0, 3), ["opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free", "opencode/mimo-v2.6-flash-free"]);
+  assert.deepEqual(skipped, ["nvidia/z-ai/glm-5.3-flash", "opencode/glm-5.3-flash-free", "opencode/nemotron-3-ultra-free"]);
+  // opencode/glm-5.3-flash-free left the free list on 2026-11-21 and is no longer preferred.
+  assert.deepEqual([...PREFERRED_MODELS], ["opencode/deepseek-v4.1-flash-free", "opencode/mimo-v2.6-flash-free"]);
 });
 
 test("budget is shared across attempts without duplicate calls and never exceeded", async () => {

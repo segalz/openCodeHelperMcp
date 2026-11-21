@@ -166,12 +166,12 @@ test("S8: a runtime rate limit on model A is remembered, so the next auto call s
   };
   const { analyze } = tools({ clock, runner });
   const first = await analyze({ directory: "C:\\Develop\\x", prompt: "inspect" });
-  assert.match(first.content[0].text, /answer from opencode\/glm-5\.3-flash-free/);
+  assert.match(first.content[0].text, /answer from opencode\/big-pickle/);
   calls.length = 0;
   clock.now += 5_000;
   const second = await analyze({ directory: "C:\\Develop\\x", prompt: "inspect" });
-  assert.equal(calls[0], "opencode/glm-5.3-flash-free", "the rate-limited model is not tried first again");
-  assert.match(second.content[0].text, /Selection: auto \(opencode\/glm-5\.3-flash-free/);
+  assert.equal(calls[0], "opencode/big-pickle", "the rate-limited model is not tried first again");
+  assert.match(second.content[0].text, /Selection: auto \(opencode\/big-pickle/);
 });
 
 test("S8: a runtime quota cools the whole provider for the next auto call", async () => {

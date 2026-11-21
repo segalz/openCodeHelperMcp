@@ -77,7 +77,7 @@ The prompt includes the actual cwd and OS, working rules, and an optional code m
 | `codeMap` | `true` | Add a bounded map of current tracked source files when available. |
 | `guard` | Shared defaults | Loop/tool/input-token limits described below. |
 
-When you supply IDs from the current free catalog, the helper follows your order, tries each model at most once and stops at the first successful answer. Without IDs, automatic selection makes at most four attempts. It prefers `opencode/deepseek-v4.1-flash-free`, `opencode/glm-5.3-flash-free` and `opencode/mimo-v2.6-flash-free` when listed, then sorts other models by recent probe success, latency, provider and ID. It skips recent failed or timed-out probes unless every candidate failed or timed out. In that case, the full ordered list is eligible.
+When you supply IDs from the current free catalog, the helper follows your order, tries each model at most once and stops at the first successful answer. Without IDs, automatic selection makes at most four attempts. It prefers `opencode/deepseek-v4.1-flash-free` and `opencode/mimo-v2.6-flash-free` when listed, then sorts other models by recent probe success, latency, provider and ID. It skips recent failed or timed-out probes unless every candidate failed or timed out. In that case, the full ordered list is eligible.
 
 In both selection modes, models on cooldown move to the end, preserving relative order within each group. The bridge remembers limits for the life of the process. A quota limit cools the whole provider for one hour by default. Repeated rate limits cool the affected model for 1, 3, 10 and then 30 minutes. A provider retry delay sets the duration when available. Every cooldown lasts at least 5 seconds and at most 24 hours. Limits less than 2 seconds apart count as one strike, and a rate limit more than 30 minutes after the last one starts the ladder again. Analysis runs, edit runs and health probes all record limits; a successful analysis, a passing edit or an answered probe clears that model's strikes and its provider's quota cooldown.
 
@@ -89,7 +89,7 @@ Typical call to `analyze_code` (replace the directory and sample model with your
 {
   "directory": "C:\\Develop\\my-project",
   "prompt": "Trace input validation in src/parser.js. Cite the relevant functions and explain the failure path.",
-  "model": "opencode/glm-5.3-flash-free",
+  "model": "opencode/deepseek-v4.1-flash-free",
   "budgetMs": 180000,
   "maxWords": 200,
   "codeMap": true,
@@ -124,7 +124,7 @@ Typical call to `apply_opencode_edits`:
 {
   "directory": "C:\\Develop\\my-project",
   "prompt": "Fix the input validation bug in src/parser.js while preserving behavior for valid input.",
-  "model": "opencode/glm-5.3-flash-free",
+  "model": "opencode/deepseek-v4.1-flash-free",
   "verify": { "command": "npm", "args": ["test"], "timeoutSeconds": 60 },
   "maxFixRuns": 2,
   "keepOnFailure": false,

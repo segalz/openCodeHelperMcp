@@ -51,7 +51,6 @@ export const MAX_BUDGET_MS = 600_000;
 // Auto-order preference only; every entry is used only if it is currently listed as free.
 export const PREFERRED_MODELS = Object.freeze([
   "opencode/deepseek-v4.1-flash-free",
-  "opencode/glm-5.3-flash-free",
   "opencode/mimo-v2.6-flash-free",
 ]);
 
@@ -1046,7 +1045,7 @@ export async function resolvePathWithinAllowedRoots(directory, roots, { realpath
 export const ANALYZE_DESCRIPTION = [
   "Read-only code analysis through OpenCode (plan agent, no edits) using FREE models only.",
   "Recommended flow: first call list_free_models (probe=true when unsure which models are healthy right now), then pick the model yourself and pass it as `model`, optionally with an ordered fallback list in `models`.",
-  "When both optional fields are omitted, the helper auto-orders the currently listed free models (preferring DeepSeek V4.1 Flash, GLM 5.3 Flash, MiMo V2.6 Flash when listed). It skips recent probe failures unless every model failed.",
+  "When both optional fields are omitted, the helper auto-orders the currently listed free models (preferring DeepSeek V4.1 Flash and MiMo V2.6 Flash when listed). It skips recent probe failures unless every model failed.",
   "Automatic and caller-supplied chains try models on cooldown last. This process remembers quota per provider (default 1 hour) and rate limits per model (1/3/10/30 minutes on successive strikes). A provider retry delay overrides the default.",
   "Explicit read/search permissions, cumulative guard budgets and optional bounded code map; a loop trip moves to the next model, while a budget trip stops without fallback.",
   "Only ids from the current free list are accepted. Each model is called at most once; budgetMs is shared across attempts. The result header lists the model used and every attempt with its status and real (redacted) error.",
