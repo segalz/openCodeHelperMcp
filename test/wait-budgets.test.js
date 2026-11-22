@@ -1,3 +1,4 @@
+import "./heavy-test-dir.js";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -49,11 +50,12 @@ function drainedJob() {
 }
 
 function fakeGitSpawn(t, root, filesList = "a.txt\0") {
+  const getRoot = typeof root === "function" ? root : () => root;
   mockSpawn(t, (_file, args) => {
     const proc = child();
     const cmd = args[2], arg = args[3];
     let out = "";
-    if (cmd === "rev-parse") out = arg === "--show-toplevel" ? root : arg === "--git-path" ? ".git/info/exclude" : "a".repeat(40);
+    if (cmd === "rev-parse") out = arg === "--show-toplevel" ? getRoot() : arg === "--git-path" ? ".git/info/exclude" : "a".repeat(40);
     else if (cmd === "ls-files" && arg === "--stage") out = "";
     else if (cmd === "ls-files" && args.includes("--ignored")) out = "";
     else if (cmd === "ls-files") out = filesList;
@@ -634,9 +636,10 @@ test("a restore that hits RESTORE_BUDGET_MS mid-loop finishes the current file, 
 test("an unconfirmed kill never triggers an automatic restore in sync edits (run, verify, or cancel)", async t => {
   const base = await mkdtemp(path.join(os.tmpdir(), "unconfirmed-no-restore-"));
   t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
-  const root = path.join(base, "repo"), snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
+  let root = path.join(base, "repo");
+  const snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
   await mkdir(root);
-  fakeGitSpawn(t, root, "a.txt\0");
+  fakeGitSpawn(t, () => root, "a.txt\0");
 
   // 1. Cancelled edit with unconfirmed kill: must NOT restore.
   await writeFile(path.join(root, "a.txt"), "baseline");
@@ -658,8 +661,10 @@ test("an unconfirmed kill never triggers an automatic restore in sync edits (run
   assert.deepEqual(cancelledOut.evidence.processesStillAlive, [9090]);
   assert.equal(cancelledOut.evidence.killUnverified, true);
   assert.ok(typeof cancelledOut.evidence.snapshotDirectory === "string" && existsSync(cancelledOut.evidence.snapshotDirectory));
+  await assert.rejects(acquire(root, { lockDirectory: locks }), CheckoutBusyError);
 
   // 2. Real runner timeout with unconfirmed kill: must NOT restore.
+  root = await mkdtemp(path.join(base, "sync-"));
   await writeFile(path.join(root, "a.txt"), "baseline");
   const runner = createOpenCodeRunner({
     env: {}, platform: "win32",
@@ -679,7 +684,7 @@ test("an unconfirmed kill never triggers an automatic restore in sync edits (run
     { directory: root, prompt: "Edit", model: "opencode/test-free", codeMap: false, verify: { none: true, reason: "Sync unconfirmed fixture" } },
     {
       resolveRoot: async () => root, lockDirectory: locks, snapshotOptions: { snapshotBase: snapshots },
-      ignoredPathsImpl: async () => [], deadline: Date.now() + 5_000,
+      ignoredPathsImpl: async () => [], deadline: Date.now() + 120_000,
       runner: call => runner({ ...call, timeoutMs: 40 }),
     },
   );
@@ -687,8 +692,16 @@ test("an unconfirmed kill never triggers an automatic restore in sync edits (run
   assert.deepEqual(syncOut.evidence.processesStillAlive, [4242]);
   assert.ok(typeof syncOut.evidence.snapshotDirectory === "string" && existsSync(syncOut.evidence.snapshotDirectory));
   assert.equal(await readFile(path.join(root, "a.txt"), "utf8"), "edited-sync", "sync edits must not restore while kill is unconfirmed");
+  const lockHolder = JSON.parse(await readFile(checkoutLockPath(root, locks), "utf8"));
+  assert.deepEqual(lockHolder.survivors, [4242]);
+  assert.equal(lockHolder.pid, process.pid);
+  assert.equal(lockHolder.kill_unverified, true);
+  assert.equal(existsSync(path.join(process.env.BRIDGE_HEAVY_DIR, "slot-1.json")), false, "heavy slot must be freed after killUnverified");
+  assert.equal(existsSync(path.join(process.env.BRIDGE_HEAVY_DIR, "slot-2.json")), false, "heavy slot must be freed after killUnverified");
+  await assert.rejects(acquire(root, { lockDirectory: locks }), CheckoutBusyError);
 
   // 3. Failed verification with unconfirmed kill: must NOT restore, no repair runs.
+  root = await mkdtemp(path.join(base, "verify-"));
   await writeFile(path.join(root, "a.txt"), "baseline");
   let verifyRunCount = 0;
   const verifyOut = await runEdits(
@@ -830,7 +843,8 @@ test("timeout during keepOnFailure preserves the snapshot and does not mark edit
 test("a child alive outside a drained Job Object is NOT confirmed in verify or runner, and triggers no auto-restore", async t => {
   const base = await mkdtemp(path.join(os.tmpdir(), "job-escape-"));
   t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
-  const root = path.join(base, "repo"), snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
+  let root = path.join(base, "repo");
+  const snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
   await mkdir(root);
   await writeFile(path.join(root, "a.txt"), "baseline");
 
@@ -898,8 +912,9 @@ test("a child alive outside a drained Job Object is NOT confirmed in verify or r
   }
 
   // 3. Sync runEdits with drained job + live descendant in runner (timeout and exit-with-held-pipes): NOT confirmed, NO auto-restore.
-  fakeGitSpawn(t, root, "a.txt\0");
+  fakeGitSpawn(t, () => root, "a.txt\0");
   for (const mode of ["timeout", "pipesHeldOpen"]) {
+    root = await mkdtemp(path.join(base, `${mode}-`));
     await writeFile(path.join(root, "a.txt"), "baseline");
     const alivePid = mode === "timeout" ? 9003 : 9004;
     let tableCalls = 0;

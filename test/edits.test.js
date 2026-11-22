@@ -1,3 +1,4 @@
+import "./heavy-test-dir.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, mkdir, writeFile, readFile, rm, access, readdir } from "node:fs/promises";

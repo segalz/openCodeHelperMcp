@@ -1,7 +1,8 @@
 import { z } from "zod";
 import path from "node:path";
 import { realpath } from "node:fs/promises";
-import { acquire } from "./checkoutlock.js";
+import { acquire, survivorsAreDead } from "./checkoutlock.js";
+import { acquireHeavySlot } from "./heavyslots.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, resolveCheckoutRoot, ignoredCheckoutPaths } from "./snapshot.js";
 import { resolveVerificationCommand, runVerification, VerificationError } from "./verify.js";
 import { createGuard, guardSchema } from "./guard.js";
@@ -10,7 +11,7 @@ import { redactSecrets } from "./safety.js";
 import { analysisInputSchema, DEFAULT_BUDGET_MS, resolveRequestedModels, variantFor } from "./core.js";
 import { withProgressHeartbeat } from "./progress.js";
 import { createEditServerScope } from "./server-pool.js";
-import { RESTORE_BUDGET_MS, boundedSignal, untilAborted } from "./waits.js";
+import { PROCESS_QUERY_TIMEOUT_MS, RESTORE_BUDGET_MS, boundedSignal, untilAborted } from "./waits.js";
 
 const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
   + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
@@ -91,6 +92,8 @@ export const VERIFY_RESERVE_MARGIN_MS = 10_000;
 export const MIN_FIX_RUN_MS = 30_000;
 /** A first run shorter than this (after the check's reserve) is refused before the model starts. */
 export const MIN_FIRST_RUN_MS = 60_000;
+/** How often the owning process re-checks recorded survivors of a survivors-only retained lease. */
+export const SURVIVOR_RECHECK_INTERVAL_MS = 30_000;
 
 export function buildFixPrompt(objective, spec, attempt, root) {
   const mandatory = `Objective:\n${objective}\n\nVerification cwd: ${root}\nExact verification command and literal args:\n${JSON.stringify(spec)}\nFix only what the check reports. Fix the code; never weaken or bypass the check. Retain existing partial edits.\nPrevious check: exit=${attempt.exitCode}; signal=${attempt.signal}; timedOut=${attempt.timedOut}; killedForOutput=${attempt.killedForOutput}\n`;
@@ -122,6 +125,7 @@ export async function runEdits(rawInput, {
   discardSnapshotImpl = discardSnapshot, identityImpl = headAndIndexIdentity, createdFilesImpl = createdFiles,
   ignoredPathsImpl = ignoredCheckoutPaths, lockDirectory, snapshotOptions,
   signal, deadline: outerDeadline, nowImpl = Date.now, variant,
+  onQueue, processStartMs: processStartMsImpl, survivorCheckIntervalMs,
 } = {}) {
   const input = inputSchema.parse(rawInput);
   const started = nowImpl(), deadline = outerDeadline ?? started + (input.budgetMs ?? DEFAULT_BUDGET_MS);
@@ -136,7 +140,102 @@ export async function runEdits(rawInput, {
   let unconfirmedKill = false;
   // root: the checkout (lock, identity, snapshot). workDir: the requested folder, maybe a monorepo package, where
   // OpenCode and the final check run.
-  let root, workDir, release, snapshot, identity, completed = false, sessionID;
+  let root, workDir, slot, release, snapshot, identity, completed = false, sessionID;
+  let disposed = false;
+  let survivorsCleared = false;
+  let survivorGeneration = 0;
+  let survivorObservedAt;
+  let survivorTimer;
+  let survivorCheckInFlight = false;
+  const recordCleanupNote = (note) => {
+    const clean = redactSecrets(note);
+    result.warnings ??= [];
+    if (!result.warnings.includes(clean)) result.warnings.push(clean);
+    const notes = result.evidence.cleanupNotes;
+    if (!notes) result.evidence.cleanupNotes = [clean];
+    else if (!notes.includes(clean)) notes.push(clean);
+  };
+  const recordLeaseError = (action, error) => {
+    const note = redactSecrets(`${action}: ${error}`);
+    const existing = result.evidence.leaseErrors;
+    if (!existing) result.evidence.leaseErrors = [note];
+    else if (!existing.includes(note)) existing.push(note);
+    result.warnings ??= [];
+    if (!result.warnings.includes(note)) result.warnings.push(note);
+  };
+  const stopSurvivorCheck = () => {
+    if (survivorTimer) {
+      clearInterval(survivorTimer);
+      survivorTimer = undefined;
+    }
+  };
+  const releaseLease = (lease, label, force) => {
+    if (!lease) return;
+    try {
+      const ok = force ? lease.forceRelease() : lease();
+      if (!ok) recordLeaseError(`Failed to release ${label}`, lease.lastError ?? "unknown error");
+    } catch (err) {
+      recordLeaseError(`Failed to release ${label}`, err instanceof Error ? err.message : String(err));
+    }
+  };
+  const releaseSlotNow = (force) => {
+    const current = slot;
+    slot = undefined;
+    releaseLease(current, "heavy slot", force);
+  };
+  const releaseNow = (force) => {
+    const currentLock = release;
+    release = undefined;
+    releaseLease(currentLock, "checkout lock", force);
+    releaseSlotNow(force);
+  };
+  const releaseSlotForUnverifiedKill = () => {
+    if (!slot) return;
+    releaseSlotNow(true);
+    recordCleanupNote("Released the heavy-run slot after an unverified kill while keeping the checkout lock retained.");
+  };
+  const recheckSurvivors = async (parent) => {
+    if (!unconfirmedKill) return true;
+    if (result.evidence.killUnverified) return false;
+    const generation = survivorGeneration;
+    const survivors = [...(result.evidence.processesStillAlive ?? [])];
+    if (survivors.length === 0) return false;
+    try {
+      const querySignal = boundedSignal(PROCESS_QUERY_TIMEOUT_MS, parent);
+      const allDead = await survivorsAreDead(survivors, survivorObservedAt, processStartMsImpl, querySignal);
+      return allDead && generation === survivorGeneration && !result.evidence.killUnverified;
+    } catch {
+      return false;
+    }
+  };
+  const startSurvivorCheck = () => {
+    if (survivorTimer || result.evidence.killUnverified || survivorsCleared) return;
+    const survivors = result.evidence.processesStillAlive ?? [];
+    if (survivors.length === 0 || (!slot && (!disposed || !release))) return;
+    const intervalMs = Math.max(1, survivorCheckIntervalMs ?? SURVIVOR_RECHECK_INTERVAL_MS);
+    survivorTimer = setInterval(() => {
+      if (survivorCheckInFlight) return;
+      if (result.evidence.killUnverified || (!slot && (!disposed || !release))) {
+        stopSurvivorCheck();
+        return;
+      }
+      const generation = survivorGeneration;
+      survivorCheckInFlight = true;
+      void recheckSurvivors().then((allDead) => {
+        if (!survivorTimer || result.evidence.killUnverified || generation !== survivorGeneration) return;
+        if (allDead) {
+          survivorsCleared = true;
+          stopSurvivorCheck();
+          // Never free the checkout lock before the edit reaches its release/disposal point.
+          if (disposed) releaseNow(true);
+          else releaseSlotNow(true);
+        }
+      }).finally(() => {
+        survivorCheckInFlight = false;
+      });
+    }, intervalMs);
+    survivorTimer.unref?.();
+  };
   // A stopped run, verify, or server whose processes were not confirmed dead: retain the recovery snapshot
   // and never trigger an automatic restore while a surviving process may still write.
   const warnIfStillRunning = (outcome) => {
@@ -149,7 +248,33 @@ export async function runEdits(rawInput, {
     if (!result.warnings.includes(warning)) result.warnings.push(warning);
     const alive = Array.isArray(outcome.stillAlive) ? outcome.stillAlive : [];
     result.evidence.processesStillAlive = [...new Set([...(result.evidence.processesStillAlive ?? []), ...alive])];
+    survivorGeneration++;
+    survivorsCleared = false;
     if (outcome.killUnverified) result.evidence.killUnverified = true;
+    survivorObservedAt = new Date().toISOString();
+    // Retain is best-effort: never throw out of cleanup or turn a passed check into an error.
+    const survivors = result.evidence.processesStillAlive;
+    const retainOptions = { killUnverified: Boolean(result.evidence.killUnverified) };
+    if (release) {
+      try {
+        if (!release.retain(survivors, retainOptions)) {
+          recordLeaseError("Failed to retain checkout lock", release.lastError ?? "unknown error");
+        }
+      } catch (err) {
+        recordLeaseError("Failed to retain checkout lock", err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (slot && !result.evidence.killUnverified) {
+      try {
+        if (!slot.retain(survivors, retainOptions)) {
+          recordLeaseError("Failed to retain heavy slot", slot.lastError ?? "unknown error");
+        }
+      } catch (err) {
+        recordLeaseError("Failed to retain heavy slot", err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (result.evidence.killUnverified) stopSurvivorCheck();
+    else if (survivors.length > 0) startSurvivorCheck();
   };
   const check = () => {
     if (signal?.aborted) throw failure("cancelled", "Edit lifecycle cancelled.");
@@ -190,7 +315,7 @@ export async function runEdits(rawInput, {
     check(); root = await resolveRoot(input.directory, controller.signal); check();
     workDir = await subfolderOf(root, input.directory);
     if (workDir === undefined) throw failure("edits_refused", "The directory is not inside its Git checkout.");
-    // A check that cannot even start makes the run pointless: refuse before the lock, the snapshot and any launch.
+    // A check that cannot even start makes the run pointless: refuse before the slot, the lock, the snapshot and any launch.
     if (verification.required && resolveVerifyImpl) {
       try { await untilAborted(resolveVerifyImpl(input.verify.command, input.verify.args ?? [], workDir), controller.signal); }
       catch (error) {
@@ -199,6 +324,17 @@ export async function runEdits(rawInput, {
       }
       check();
     }
+    const reserveMs = verification.required ? (input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS : 0;
+    const available = () => deadline - nowImpl() - reserveMs;
+    const waitMs = () => available() - MIN_FIRST_RUN_MS;
+    if (waitMs() < 0) {
+      if (available() < 1_000 && reserveMs > 0) {
+        throw failure("budget_exceeded", "Not enough budget for a run and its final check.");
+      }
+      throw failure("budget_exceeded",
+        `Only ${Math.max(0, Math.floor(available() / 1000))} s of budgetMs would be left for the model after reserving ${Math.round(reserveMs / 1000)} s for the check. Lower verify.timeoutSeconds or raise budgetMs.`);
+    }
+    slot = await acquireHeavySlot(root, waitMs, controller.signal, onQueue);
     release = await acquire(root, { lockDirectory, signal: controller.signal });
     identity = await identityImpl(root, controller.signal); check();
     snapshot = await takeSnapshotImpl(root, { ...snapshotOptions, signal: controller.signal });
@@ -216,13 +352,12 @@ export async function runEdits(rawInput, {
         throw failure("budget_exceeded", "Cumulative edit guard budget exhausted before launch.");
       }
       // Keep time for the final check (and restore) so a run that finishes late is still verified.
-      const reserveMs = verification.required ? (input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS : 0;
-      const runMs = deadline - nowImpl() - reserveMs;
+      const runMs = available();
       if (!run && runMs < 1_000) throw failure("budget_exceeded", "Not enough budget for a run and its final check.");
       // The check's time is reserved up front; refuse a first run left too short to do real work rather than
       // spend the model on a run that can only time out (live use 2026-11-21).
-      if (!run && reserveMs > 0 && runMs < MIN_FIRST_RUN_MS) {
-        throw failure("budget_exceeded", `Only ${Math.round(runMs / 1000)} s of budgetMs would be left for the model after reserving ${Math.round(reserveMs / 1000)} s for the check. Lower verify.timeoutSeconds or raise budgetMs.`);
+      if (!run && runMs < MIN_FIRST_RUN_MS) {
+        throw failure("budget_exceeded", `Only ${Math.max(0, Math.floor(runMs / 1000))} s of budgetMs would be left for the model after reserving ${Math.round(reserveMs / 1000)} s for the check. Lower verify.timeoutSeconds or raise budgetMs.`);
       }
       if (run && runMs < MIN_FIX_RUN_MS) throw failure("budget_exceeded", "Not enough budget left for another repair run and its check.");
       if (run) verification.fixRuns++;
@@ -315,7 +450,26 @@ export async function runEdits(rawInput, {
     }
   } finally {
     clearTimeout(timer); signal?.removeEventListener("abort", abort);
-    release?.(); result.guard ??= guardState.snapshot(); result.elapsedMs = nowImpl() - started;
+    disposed = true;
+    if (!unconfirmedKill) {
+      stopSurvivorCheck();
+      releaseNow(false);
+    } else if (result.evidence.killUnverified) {
+      stopSurvivorCheck();
+      releaseSlotForUnverifiedKill();
+      releaseLease(release, "checkout lock", false);
+    } else if (!release && !slot) {
+      stopSurvivorCheck();
+    } else if (survivorsCleared || await recheckSurvivors()) {
+      survivorsCleared = true;
+      stopSurvivorCheck();
+      releaseNow(true);
+    } else {
+      // Mark the checkout lock released-while-retained; the unref'd interval and stale reaper heal once survivors exit.
+      releaseLease(release, "checkout lock", false);
+      startSurvivorCheck();
+    }
+    result.guard ??= guardState.snapshot(); result.elapsedMs = nowImpl() - started;
   }
   return result;
 }
@@ -338,8 +492,8 @@ export async function shutdownEdits(waitMs = 120_000) {
 export function registerEditTools(server, { runner, catalog, resolveAllowedPath, isAbsolute = path.isAbsolute, nowImpl = Date.now, lifecycleOptions = {} }) {
   server.registerTool("apply_opencode_edits", {
     title: "Apply verified OpenCode edits", inputSchema: editsInputSchema,
-    description: "Edit one Git checkout using one explicit free model and build agent; shell/delegates/web denied. Required final check, up to two same-session repairs, shared Cline writer lock, one recovery snapshot, cumulative guard/deadline. Restores failed edits unless keepOnFailure=true; identity changes retain recovery evidence. Synchronous; no fallback. The check is verified before the run (a missing command is refused at once, with no model use) and runs in the requested directory (e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. If a stopped process may still be running, no repair runs, nothing is restored automatically, and the recovery snapshot is kept (evidence.snapshotDirectory). A restore is bounded and reports any file it could not reach. Internal waits follow the call's budget, so a busy machine slows the call instead of failing it. The check's timeout plus 10 s is reserved from budgetMs; if less than 60 s would be left for the model, the call is refused before the model starts. With an MCP progressToken the call sends notifications/progress every 15 s. For model-picker log_run pass the returned usage as tokens and write=true.",
-  }, async (raw, extra = {}) => withProgressHeartbeat(extra, async () => {
+    description: "Edit one Git checkout using one explicit free model and build agent; shell/delegates/web denied. Required final check, up to two same-session repairs, shared Cline writer lock, one recovery snapshot, cumulative guard/deadline. Restores failed edits unless keepOnFailure=true; identity changes retain recovery evidence. Synchronous; no fallback. The check is verified before the run (a missing command is refused at once, with no model use) and runs in the requested directory (e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. If a stopped process may still be running, no repair runs, nothing is restored automatically, and the recovery snapshot is kept (evidence.snapshotDirectory). A restore is bounded and reports any file it could not reach. Edits share machine-wide FIFO slots. If waiting leaves too little time for a run and check, the call returns machine_busy. The check's timeout plus 10 s is reserved from budgetMs; if less than 60 s would be left for the model, the call is refused before the model starts. With an MCP progressToken the call sends notifications/progress every 15 s. For model-picker log_run pass the returned usage as tokens and write=true.",
+  }, async (raw, extra = {}) => withProgressHeartbeat(extra, async (onQueue) => {
     const deadline = nowImpl() + (raw?.budgetMs ?? DEFAULT_BUDGET_MS);
     // `controller` stops preparation on a client cancel or the deadline. Only a real client cancel
     // reaches runEdits as `signal`; runEdits owns the deadline, so an exhausted budget is reported as
@@ -369,7 +523,11 @@ export function registerEditTools(server, { runner, catalog, resolveAllowedPath,
         return root;
       };
       const model = selected.models[0];
-      const running = runEdits({ ...input, directory }, { ...lifecycleOptions, runner, resolveRoot, nowImpl, deadline, signal: user.signal, variant: variantFor(model) });
+      const onHeavyQueue = (queue) => {
+        onQueue(queue);
+        lifecycleOptions.onQueue?.(queue);
+      };
+      const running = runEdits({ ...input, directory }, { ...lifecycleOptions, runner, resolveRoot, nowImpl, deadline, signal: user.signal, variant: variantFor(model), onQueue: onHeavyQueue });
       const call = { abort: userAbort, done: running };
       activeEditCalls.add(call);
       try {

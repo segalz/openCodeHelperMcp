@@ -1,3 +1,4 @@
+import "./heavy-test-dir.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -229,8 +230,9 @@ test("S16 edit and same-session repair share a private server that exits before 
   for (const identityChanges of [false, true]) {
     let head = "same";
     const recoveryCalls = [];
+    const uncertainLockDir = await mkdtemp(path.join(lockDirectory, `uncertain-${identityChanges}-`));
     const uncertain = await runEdits({ ...input, keepOnFailure: true }, {
-      ...lifecycle, identityImpl: async () => ({ head, indexHash: "same" }),
+      ...lifecycle, lockDirectory: uncertainLockDir, identityImpl: async () => ({ head, indexHash: "same" }),
       runner: async ({ editScope }) => {
         if (identityChanges) head = "changed";
         editScope.server = { stop: async () => ({ killConfirmed: false, stillAlive: [], killUnverified: true }) };

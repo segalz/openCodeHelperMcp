@@ -3,17 +3,20 @@ export async function withProgressHeartbeat(extra, work, { intervalMs = 15_000 }
   const progressToken = extra?._meta?.progressToken;
   // Any string (the empty string too) or number is a valid MCP progress token.
   const hasToken = typeof progressToken === "string" || typeof progressToken === "number";
-  if (!hasToken || typeof extra?.sendNotification !== "function") return work();
+  if (!hasToken || typeof extra?.sendNotification !== "function") return work(() => {});
 
   const stepMs = Number.isFinite(intervalMs) && intervalMs > 0 ? intervalMs : 15_000;
   const started = performance.now();
+  let queue;
   let progress = 0;
   let done = false;
   const timer = setInterval(() => {
     if (done) return;
     progress += 1;
     const elapsedSec = Math.round((performance.now() - started) / 1000);
-    const message = `still running, ${elapsedSec} s elapsed`;
+    const message = queue
+      ? `queued for a heavy-run slot: position ${queue.position} of ${queue.total}`
+      : `still running, ${elapsedSec} s elapsed`;
     try {
       Promise.resolve(extra.sendNotification({
         method: "notifications/progress",
@@ -25,7 +28,7 @@ export async function withProgressHeartbeat(extra, work, { intervalMs = 15_000 }
   }, stepMs);
   timer.unref?.();
   try {
-    return await work();
+    return await work((position) => { queue = position; });
   } finally {
     done = true;
     clearInterval(timer);

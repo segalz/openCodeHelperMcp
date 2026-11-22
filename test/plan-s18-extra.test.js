@@ -1,3 +1,4 @@
+import "./heavy-test-dir.js";
 import assert from "node:assert/strict";
 import { ChildProcess, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";

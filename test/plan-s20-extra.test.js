@@ -1,3 +1,4 @@
+import "./heavy-test-dir.js";
 import assert from "node:assert/strict";
 import childProcess, { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -41,6 +42,7 @@ test("S20 (2): a child error during a verification stop retains the snapshot and
   let timeout, runs = 0, discarded = false;
   const out = await runEdits(editInput, {
     ...editOptions,
+    lockDirectory: path.join(base, "locks-s20-2"),
     takeSnapshotImpl: async () => ({ directory: "recovery" }),
     restoreSnapshotImpl: async () => ({ failed: [] }),
     discardSnapshotImpl: async () => { discarded = true; },

@@ -1,4 +1,5 @@
 // Regression tests for the 2026-11-17 production failures (real multi-file review and checked edit).
+import "./heavy-test-dir.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";

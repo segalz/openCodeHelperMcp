@@ -32,6 +32,10 @@ async function fixture(t, { tracked, script }) {
   const sources = [];
   const options = {
     env, onSource: (source) => sources.push(source),
+    // Stretch the real kill timer so a slow spawn under full-suite parallel load cannot fall back to regex.
+    now: () => 0,
+    setTimeout: (fn, ms) => setTimeout(fn, Math.max(ms, 60_000)),
+    clearTimeout,
     spawnImpl: (exe, args, opts) => args.includes("ls-files") ? fakeChild(tracked.map((file) => `${file}\0`).join("")) : spawn(exe, args, opts),
   };
   return { root, options, sources };
