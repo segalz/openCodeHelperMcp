@@ -29,6 +29,7 @@ export const PROBE_TIMEOUT_MS = 30_000;
 export const PROBE_CONCURRENCY = 4;
 export const LIST_TIMEOUT_MS = 60_000;
 export const MODEL_CACHE_TTL_MS = 600_000;
+export const DEGRADED_LIST_TTL_MS = 30_000;
 export const RATE_LIMIT_LADDER_MS = Object.freeze([60_000, 180_000, 600_000, 1_800_000]);
 export const QUOTA_COOLDOWN_MS = 3_600_000;
 export const RATE_LIMIT_STRIKE_WINDOW_MS = 1_800_000;
@@ -769,7 +770,7 @@ export function createModelCatalog({
   runner, spawnImpl = defaultSpawn, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, killProcessTreeImpl,
   env = process.env, platform = process.platform, execPath = process.execPath, nowImpl = Date.now,
   ttlMs = MODEL_CACHE_TTL_MS, probeTimeoutMs = PROBE_TIMEOUT_MS, probeConcurrency = PROBE_CONCURRENCY, probeDirectory = PACKAGE_ROOT,
-  listTimeoutMs = LIST_TIMEOUT_MS,
+  listTimeoutMs = LIST_TIMEOUT_MS, listRetryDelayMs = 1000,
 } = {}) {
   const terminate = killProcessTreeImpl ?? ((child) => defaultKillProcessTree(child, { platform, spawnImpl }));
   let listCache = null; // { at, models, source, excluded }
@@ -821,6 +822,7 @@ export function createModelCatalog({
     });
   };
 
+  const sleep = (ms) => ms <= 0 ? Promise.resolve() : new Promise((resolve) => setTimeoutImpl(resolve, ms));
   const loadList = async () => {
     if (analysisShutDown) return { error: "OpenCode run cancelled." };
     const controller = new AbortController();
@@ -834,6 +836,16 @@ export function createModelCatalog({
       if (verbose.exitCode === 0 && !verbose.timedOut && !verbose.overflowed) all = parseVerboseModels(verbose.stdout);
       let failure = all.length === 0 ? describeProcessFailure(verbose, { label: "opencode models --verbose" }) : null;
       if (all.length === 0) {
+        await sleep(listRetryDelayMs);
+        if (analysisShutDown || controller.signal.aborted) return { error: "OpenCode run cancelled." };
+        const retried = await runModelsCommand(["--verbose"], controller.signal);
+        if (analysisShutDown || controller.signal.aborted) return { error: "OpenCode run cancelled." };
+        if (retried.exitCode === 0 && !retried.timedOut && !retried.overflowed) {
+          const retriedModels = parseVerboseModels(retried.stdout);
+          if (retriedModels.length) { all = retriedModels; failure = null; }
+        }
+      }
+      if (all.length === 0) {
         const plain = await runModelsCommand([], controller.signal);
         if (analysisShutDown || controller.signal.aborted) return { error: "OpenCode run cancelled." };
         if (plain.exitCode === 0 && !plain.timedOut) all = parsePlainModels(plain.stdout);
@@ -842,27 +854,36 @@ export function createModelCatalog({
           const plainFailure = describeProcessFailure(plain, { label: "opencode models" });
           return { error: [failure?.error, plainFailure.error].filter(Boolean).join("\n") || "opencode models returned no models." };
         }
-        failure = null;
       }
       // Owner-declared free tiers (providers with no billing method) count as free despite catalog prices.
       const freeProviders = new Set(String(env.OPENCODE_HELPER_FREE_PROVIDERS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
       for (const model of all) if (!model.free && freeProviders.has(model.provider)) { model.free = true; model.freeBasis = "provider"; }
       const usable = all.filter(isUsableFreeModel);
-      return { at: nowImpl(), source, models: usable, excluded: { paid: all.filter((m) => !m.free).length, freeWithoutToolsOrDeprecated: all.filter((m) => m.free && !isUsableFreeModel(m)).length }, total: all.length };
+      return { at: nowImpl(), source, models: usable, excluded: { paid: all.filter((m) => !m.free).length, freeWithoutToolsOrDeprecated: all.filter((m) => m.free && !isUsableFreeModel(m)).length }, total: all.length, ...(source === "opencode models (name rule)" ? { degraded: true, degradedReason: failure?.error } : {}) };
     } finally {
       activeRunnerCalls.delete(entry);
       resolveDone();
     }
   };
 
-  const list = async ({ refresh = false } = {}) => {
-    if (!refresh && listCache && nowImpl() - listCache.at < ttlMs) return listCache;
-    if (inflightList) return inflightList;
-    inflightList = loadList().then((result) => {
-      if (!result.error) listCache = result;
-      return result;
-    }).finally(() => { inflightList = null; });
-    return inflightList;
+  const list = async ({ refresh = false, require = [] } = {}) => {
+    let result;
+    if (!refresh && listCache && nowImpl() - listCache.at < (listCache.degraded ? DEGRADED_LIST_TTL_MS : ttlMs)) {
+      result = listCache;
+    } else {
+      if (inflightList) return inflightList;
+      inflightList = loadList().then((result) => {
+        if (!result.error) listCache = result;
+        return result;
+      }).finally(() => { inflightList = null; });
+      result = await inflightList;
+    }
+    if (result.degraded && require.length && require.some((id) => !result.models.some((m) => m.id === id))) {
+      const fresh = await loadList();
+      if (!fresh.error) listCache = fresh;
+      result = fresh;
+    }
+    return result;
   };
 
   const recentProbe = (id) => {
@@ -1181,7 +1202,8 @@ export function registerAnalysisTools(server, { runner, catalog, resolveAllowedP
       if (validated.error) return textResult(validated.error, true);
       // A cold catalog listing can take up to its own 60 s cap; never wait for it past budgetMs. The
       // listing keeps running in the background and fills the cache for the next call.
-      listed = await untilAborted(catalog.list(), boundedSignal(Math.max(0, deadline - nowImpl()), extra.signal));
+      const require = [...(model ? [model] : []), ...(models ?? [])];
+      listed = await untilAborted(catalog.list({ require }), boundedSignal(Math.max(0, deadline - nowImpl()), extra.signal));
     } catch (error) {
       if (extra.signal?.aborted) return cancelledReply();
       if (error?.name === "TimeoutError") {

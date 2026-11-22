@@ -522,7 +522,7 @@ export function registerEditTools(server, { runner, catalog, resolveAllowedPath,
       if (!isAbsolute(input.directory)) throw new Error("directory must be absolute.");
       const directory = await active(() => resolveAllowedPath(input.directory));
       if (!directory) throw new Error("The directory is outside the helper's allowed roots.");
-      const listed = await active(() => catalog.list()); if (listed.error) throw new Error(listed.error);
+      const listed = await active(() => catalog.list({ require: [input.model] })); if (listed.error) throw new Error(listed.error);
       const selected = resolveRequestedModels({ model: input.model }, listed.models); if (selected.error) throw new Error(selected.error);
       const resolveRoot = async (dir, signal) => {
         const root = await resolveCheckoutRoot(dir, signal);
