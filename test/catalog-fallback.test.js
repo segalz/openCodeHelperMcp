@@ -8,10 +8,13 @@ import { createModelCatalog } from "../src/core.js";
 // and an edit with a valid nvidia model was refused.
 
 function fakeChild() {
+  const stdout = new EventEmitter(); stdout.setEncoding = () => {};
+  const stderr = new EventEmitter(); stderr.setEncoding = () => {};
   const child = new EventEmitter();
-  child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
-  child.stdin = { end() {}, write() {}, destroy() {} };
-  child.pid = 4321; child.kill = () => true;
+  child.pid = 4321;
+  child.stdin = { on() {}, write() {}, end() {} };
+  child.stdout = stdout; child.stderr = stderr;
+  child.kill = () => child.emit("exit", null);
   return child;
 }
 function scriptedSpawn(script, calls = []) {
