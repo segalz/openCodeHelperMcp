@@ -4,7 +4,7 @@ import test from "node:test";
 import childProcess, { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
-import fs, { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
@@ -193,6 +193,41 @@ test("cross-bridge: Cline slot and recorded survivor block OpenCode; stale slot/
     if (q) { assert.deepEqual(q, { position: 1, total: 1 }); controller.abort(); }
   }), { name: "AbortError" });
   assert.deepEqual(readdirSync(path.join(dir(), "queue")), []);
+
+  // Live Cline-format ticket while all slots are held: OpenCode queues behind it at position 2 with stamp >= Cline ms + 1,
+  // and is admitted once the Cline ticket is removed and the slot frees.
+  const clineTicketMs = Date.now() + 5_000;
+  const clineTicketToken = "11111111-2222-4333-8444-555555555555";
+  const clineTicketName = `${clineTicketMs}-${process.pid}-${clineTicketToken}.json`;
+  const clineTicketPath = path.join(dir(), "queue", clineTicketName);
+  writeFileSync(clineTicketPath, JSON.stringify({
+    pid: process.pid,
+    time,
+    token: clineTicketToken,
+    bridge: "cline",
+    kind: "edit",
+    checkout: "a".repeat(64),
+    started_at: time,
+  }));
+  let queuedBehindCline;
+  const queuedPending = acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal, q => {
+    if (q) queuedBehindCline = q;
+  });
+  await until(() => queuedBehindCline !== undefined);
+  assert.deepEqual(queuedBehindCline, { position: 2, total: 2 });
+  const queueEntries = readdirSync(path.join(dir(), "queue")).filter(n => n.endsWith(".json"));
+  const opencodeTicketName = queueEntries.find(n => n !== clineTicketName);
+  assert.ok(opencodeTicketName, `expected OpenCode ticket alongside Cline ticket: ${JSON.stringify(queueEntries)}`);
+  assert.ok(parseInt(opencodeTicketName, 10) >= clineTicketMs + 1,
+    `OpenCode ticket stamp ${parseInt(opencodeTicketName, 10)} must be >= ${clineTicketMs + 1}`);
+  unlinkSync(clineTicketPath);
+  unlinkSync(file);
+  const admittedAfterCline = await queuedPending;
+  assert.equal(data("slot-1.json").bridge, "opencode");
+  assert.equal(data("slot-1.json").pid, process.pid);
+  assert.deepEqual(readdirSync(path.join(dir(), "queue")), []);
+  admittedAfterCline();
+  writeFileSync(file, JSON.stringify(clineSlot));
 
   // Queue a worker and kill it so a stale ticket sits in queue/.
   w.child.send("go");
@@ -432,6 +467,38 @@ test("unconfirmed kill: killUnverified frees the slot with a note while keeping 
     assert.equal(lockHolder.pid, process.pid);
     assert.equal(lockHolder.kill_unverified, true);
     await delay(50);
+    await assert.rejects(acquire(f.root, { lockDirectory: f.locks }), CheckoutBusyError);
+  }
+});
+
+test("unconfirmed kill: killConfirmed=false with missing or empty survivors and no killUnverified is treated as killUnverified", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  for (const outcome of [
+    { status: "failed", error: "timed out", killConfirmed: false },
+    { status: "failed", error: "timed out", killConfirmed: false, stillAlive: [] },
+  ]) {
+    const f = await editFixture(t);
+    const out = await runEdits(f.input(), {
+      ...f.options,
+      survivorCheckIntervalMs: 15,
+      runner: async () => outcome,
+    });
+    assert.equal(out.status, "failed");
+    assert.deepEqual(out.evidence.processesStillAlive, []);
+    assert.equal(out.evidence.killUnverified, true);
+    assert.ok(out.evidence.cleanupNotes?.some(n => /released.*slot.*checkout lock/i.test(n)), JSON.stringify(out.evidence));
+    assert.ok(out.warnings?.some(w => /released.*slot.*checkout lock/i.test(w)), JSON.stringify(out.warnings));
+
+    // Heavy slot is freed immediately (never held for the bridge's lifetime).
+    assert.equal(existsSync(path.join(dir(), "slot-1.json")), false);
+    const slot = await acquireHeavySlot(f.root, () => TEST_WAIT_MS, signal);
+    slot();
+
+    // Checkout lock stays retained with kill_unverified: true.
+    const lockHolder = JSON.parse(await readFile(checkoutLockPath(f.root, f.locks), "utf8"));
+    assert.equal(lockHolder.pid, process.pid);
+    assert.deepEqual(lockHolder.survivors, []);
+    assert.equal(lockHolder.kill_unverified, true);
     await assert.rejects(acquire(f.root, { lockDirectory: f.locks }), CheckoutBusyError);
   }
 });

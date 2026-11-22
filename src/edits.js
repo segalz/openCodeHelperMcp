@@ -239,18 +239,21 @@ export async function runEdits(rawInput, {
   // A stopped run, verify, or server whose processes were not confirmed dead: retain the recovery snapshot
   // and never trigger an automatic restore while a surviving process may still write.
   const warnIfStillRunning = (outcome) => {
-    if (outcome?.killConfirmed !== false) return;
+    const alive = Array.isArray(outcome?.stillAlive)
+      ? outcome.stillAlive
+      : Array.isArray(outcome?.processesStillAlive) ? outcome.processesStillAlive : [];
+    const unverified = Boolean(outcome?.killUnverified) || (outcome?.killConfirmed === false && alive.length === 0);
+    if (!alive.length && !unverified) return;
     unconfirmedKill = true;
     const warning = completed
       ? "A process from the stopped edit server may still be running; files may change."
       : "A process from the stopped run may still be running; automatic restoration was skipped and the recovery snapshot was retained.";
     result.warnings ??= [];
     if (!result.warnings.includes(warning)) result.warnings.push(warning);
-    const alive = Array.isArray(outcome.stillAlive) ? outcome.stillAlive : [];
     result.evidence.processesStillAlive = [...new Set([...(result.evidence.processesStillAlive ?? []), ...alive])];
     survivorGeneration++;
     survivorsCleared = false;
-    if (outcome.killUnverified) result.evidence.killUnverified = true;
+    if (unverified) result.evidence.killUnverified = true;
     survivorObservedAt = new Date().toISOString();
     // Retain is best-effort: never throw out of cleanup or turn a passed check into an error.
     const survivors = result.evidence.processesStillAlive;
@@ -366,9 +369,13 @@ export async function runEdits(rawInput, {
         guardState, sessionID, ignoredPaths, editScope, signal: controller.signal,
         timeoutMs: runMs }); }
       catch (error) {
+        const stillAlive = Array.isArray(error?.stillAlive)
+          ? error.stillAlive
+          : Array.isArray(error?.processesStillAlive) ? error.processesStillAlive : undefined;
+        const unconfirmed = error?.killConfirmed === false || Boolean(stillAlive?.length) || Boolean(error?.killUnverified);
         response = {
           error: redactSecrets(String(error)), usage: error?.usage, guard: error?.guard,
-          ...(error?.killConfirmed === false ? { killConfirmed: false, stillAlive: error.stillAlive, ...(error.killUnverified ? { killUnverified: true } : {}) } : {}),
+          ...(unconfirmed ? { killConfirmed: false, stillAlive, ...(error?.killUnverified ? { killUnverified: true } : {}) } : {}),
         };
       }
       result.codeMapSource = response?.codeMapSource ?? "none";
@@ -454,7 +461,7 @@ export async function runEdits(rawInput, {
     if (!unconfirmedKill) {
       stopSurvivorCheck();
       releaseNow(false);
-    } else if (result.evidence.killUnverified) {
+    } else if (result.evidence.killUnverified || !(result.evidence.processesStillAlive?.length)) {
       stopSurvivorCheck();
       releaseSlotForUnverifiedKill();
       releaseLease(release, "checkout lock", false);
