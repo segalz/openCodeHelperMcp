@@ -6,7 +6,7 @@ Updated by the supervisor (Grok Bot) after every step.
 | Step | Type | Risk | Status | Executor / model | Attempts | 1st try | Escalation | CI reverts | Minutes | Notes |
 |------|------|------|--------|------------------|----------|---------|------------|------------|---------|-------|
 | S0.1 | OWNER | low | done | — | — | — | — | — | — | push approved and pushed 2026-11-24 |
-| S0.2 | Claude | low | done | — | — | — | — | — | — | check-locked.sh, linux-check.sh, CI workflow, .gitattributes (2026-11-24) |
+| S0.2 | Claude | low | in-progress | — | — | — | — | — | — | scripts + .gitattributes pushed 2026-11-24; CI workflow NOT pushed (push token lacks `workflow` scope): supervisor adds it verbatim from S0.2, or Claude after the owner grants the scope |
 | S0.3 | SUP | low | pending | — | — | — | — | — | — | VM: Node 22, opencode, cline + free-model access (reuse ClineMcp S0.3) |
 | S0.4 | SUP | med | pending | — | — | — | — | — | — | baseline.md |
 | S0.5 | SUP | med | pending | — | — | — | — | — | — | discovery.md (serve banner, models --verbose, SIDs) |
