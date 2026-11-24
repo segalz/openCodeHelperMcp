@@ -1,17 +1,10 @@
-import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createModelCatalog, createOpenCodeRunner, registerAnalysisTools, resolvePathWithinAllowedRoots, shutdownAnalysis } from "./core.js";
 import { registerEditTools, shutdownEdits } from "./edits.js";
 import { shutdownJobObjects } from "./jobobject.js";
 import { sweepOldSnapshots } from "./snapshot.js";
-
-const DEFAULT_ALLOWED_ROOT = "C:\\Develop";
-
-function configuredRoots() {
-  return (process.env.OPENCODE_HELPER_ALLOWED_ROOTS ?? DEFAULT_ALLOWED_ROOT)
-    .split(";").map((root) => root.trim()).filter(Boolean).map((root) => path.resolve(root));
-}
+import { configuredRoots } from "./roots.js";
 
 async function resolveAllowedPath(directory) {
   return resolvePathWithinAllowedRoots(directory, configuredRoots());
