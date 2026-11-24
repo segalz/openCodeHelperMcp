@@ -11,8 +11,8 @@ Updated by the supervisor (Grok Bot) after every step.
 | S0.4 | SUP | med | done | — | — | — | — | — | 20 | VM + CI arm green; ubuntu codeindex.test.js:142 flaky (failed once, re-run green). First-run windows failures were runner env (c). **GATE PASS** |
 | S0.5 | SUP | med | done | — | — | — | — | — | 10 | native ELF `opencode.exe` 1.19.6; serve banner and `models --verbose` match the parsers; no own-SID children. GATE PASS |
 | S1.1 | SUP | low | done | — | — | — | — | — | 2 | no class (a) tests in the baseline → no change |
-| S2.1 | TEST | low | pending | — | — | — | — | — | — | linux-roots.test.js |
-| S2.2 | CODE | low | pending | | | | | | | src/roots.js |
+| S2.1 | TEST | low | done | — | — | — | — | — | 2 | `d50b2e8`; RED as expected (ERR_MODULE_NOT_FOUND src/roots.js) |
+| S2.2 | CODE | low | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 2 | `916a9eb`: src/roots.js exact content. Linux check 5/5. CI 45505996330: all 3 jobs green (windows 359/0 fail) |
 | S2.3 | TEST | low | pending | — | — | — | — | — | — | linux-index-roots.test.js |
 | S2.4 | CODE | low | pending | | | | | | | index.js uses roots.js |
 | S3.1 | TEST | low | pending | — | — | — | — | — | — | linux-childenv.test.js |
