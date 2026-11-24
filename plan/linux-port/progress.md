@@ -7,7 +7,7 @@ Updated by the supervisor (Grok Bot) after every step.
 |------|------|------|--------|------------------|----------|---------|------------|------------|---------|-------|
 | S0.1 | OWNER | low | done | — | — | — | — | — | — | push approved and pushed 2026-11-24 |
 | S0.2 | Claude | low | in-progress | — | — | — | — | — | — | scripts + .gitattributes pushed 2026-11-24; CI workflow NOT pushed: owner token and supervisor token both lack the `workflow` scope (supervisor checked 2026-11-24). Needs the owner/Claude with `workflow` scope |
-| S0.3 | SUP | low | done | — | — | — | — | — | 8 | Reused ClineMcp S0.3 VM; `npm ci` OK. OpenCode: `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b`, `nvidia/poolside/laguna-xs-2.1`, `opencode/deepseek-v4.1-flash-free`; Cline: `nvidia` / `nvidia/nemotron-3.5-super-vl-120b-a12b`. NVIDIA key from the VM secret store (owner). See discovery.md |
+| S0.3 | SUP | low | done | — | — | — | — | — | 10 | Reused ClineMcp S0.3 VM; `npm ci` OK. Cline primary `cline-free/nemotron-3.5-super-vl` (Cline account login, owner-approved), fallback `nvidia` / `nvidia/nemotron-3.5-super-vl-120b-a12b`. OpenCode primary `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b`, fallback `opencode/deepseek-v4.1-flash-free`. See discovery.md |
 | S0.4 | SUP | med | in-progress | — | — | — | — | — | 5 | Linux VM: 354 tests, 327 pass, 0 fail, 27 skipped. CI not run (no workflow) → windows GATE not evaluated. See baseline.md |
 | S0.5 | SUP | med | done | — | — | — | — | — | 10 | native ELF `opencode.exe` 1.19.6; serve banner and `models --verbose` match the parsers; no own-SID children. GATE PASS |
 | S1.1 | SUP | low | pending | — | — | — | — | — | — | skip class (a) tests |

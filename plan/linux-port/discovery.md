@@ -6,14 +6,16 @@ Supervisor VM: Linux x86_64 (Debian 13), 2026-11-24. Names and ids only; no keys
 
 Reused from ClineMcp S0.3 (same VM): Node `v22.23.5` (nvm), git, build-essential, `cline` 3.0.75, `opencode-ai` 1.19.6. This repo: `npm ci` OK.
 
-| Executor | Model id | Status |
-|----------|----------|--------|
-| OpenCode | `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b` | works (`opencode run` → `PONG`) |
-| OpenCode | `nvidia/poolside/laguna-xs-2.1` | works (`opencode run` → `PONG`) |
-| OpenCode | `opencode/deepseek-v4.1-flash-free` | works, no secret (`opencode run` → `PONG`) |
-| Cline | `-P nvidia -m nvidia/nemotron-3.5-super-vl-120b-a12b` | works (plan's headless command line → `finishReason: completed`) |
+| Executor | Role | Model id | Status |
+|----------|------|----------|--------|
+| OpenCode | **primary** | `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b` | works (`opencode run` → `PONG`) |
+| OpenCode | alternate | `nvidia/poolside/laguna-xs-2.1` | works |
+| OpenCode | fallback | `opencode/deepseek-v4.1-flash-free` | works, no secret |
+| Cline | **primary** | `-P cline -m cline-free/nemotron-3.5-super-vl` | works (headless → `completed`) |
+| Cline | alternate | `-P cline -m nvidia/nemotron-3.5-lightning-free` | works |
+| Cline | fallback | `-P nvidia -m nvidia/nemotron-3.5-super-vl-120b-a12b` | works |
 
-NVIDIA access: `NVIDIA_API_KEY` is in the supervisor VM's secret store (owner, 2026-11-24) and read from the environment only; never stored in this repo. Details in ClineMcp `plan/linux-port/discovery.md`.
+Access: Cline account device login (owner-approved, 2026-11-24) and `NVIDIA_API_KEY` from the supervisor VM's secret store. Both live only on the VM, never in this repo. Details in ClineMcp `plan/linux-port/discovery.md`.
 
 ## S0.5 — Discovery of the Linux OpenCode install
 
