@@ -45,3 +45,10 @@ Workflow `1f1bad7` (Windows tests run with `TEMP`/`TMP` = the long runner temp f
 | ubuntu-24.04 | attempt 1 failed, 1 test: `test/codeindex.test.js:142` "remaining attempt time bounds the adapter and prevents late fallback" (timing). The supervisor re-ran the failed job once (attempt 2): **success** → recorded as **flaky** (timing-sensitive on a shared runner), not class (b). Watch it in S6.1 (green twice). |
 
 All W1-W5 above were runner environment (class (c)), fixed by CI revision 2. **GATE (windows-latest green): PASS.** Stage 0 closed 2026-11-24.
+
+## Known-flaky list (plan rule 7, "Flaky first")
+
+| # | Where | Test | Signature | Status |
+|---|-------|------|-----------|--------|
+| F1 | ubuntu-24.04 | `test/codeindex.test.js:142` remaining attempt time bounds the adapter and prevents late fallback | timing; failed once in run 45488832658, green on rerun | watch |
+
