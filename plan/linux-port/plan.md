@@ -53,6 +53,8 @@ Version 2, 2026-11-24. Written by Claude Opus 5.5 after reading the source. Grok
    3. put the CI log tail into the next attempt.
 
    Never force-push.
+
+   **Flaky first** (added 2026-11-25). Before any revert, compare the CI failures with the known-flaky list in `baseline.md` (for example `codeindex.test.js:142` "remaining attempt time bounds the adapter..."). If every new failure is a known-flaky test, run `gh run rerun <run id> --failed` once. Only a failure that repeats on the rerun, or one that is not on the list, leads to a revert. A revert caused by a flake does not count as a failed attempt for the executor.
 8. **Retries.** At most 3 attempts per CODE step, then escalate (section 6). Never weaken, skip or edit a test to get green.
 9. **Executors** use no git, no installs and no network, and never touch `main`.
 10. **Secrets** stay only in the supervisor VM's environment: never in the repo, CI, logs or reports.
