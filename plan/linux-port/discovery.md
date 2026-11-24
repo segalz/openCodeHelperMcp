@@ -8,8 +8,12 @@ Reused from ClineMcp S0.3 (same VM): Node `v22.23.5` (nvm), git, build-essential
 
 | Executor | Model id | Status |
 |----------|----------|--------|
+| OpenCode | `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b` | works (`opencode run` → `PONG`) |
+| OpenCode | `nvidia/poolside/laguna-xs-2.1` | works (`opencode run` → `PONG`) |
 | OpenCode | `opencode/deepseek-v4.1-flash-free` | works, no secret (`opencode run` → `PONG`) |
-| Cline | — | BLOCKED: `cline-free/*` needs a Cline account login; `nvidia` needs `NVIDIA_API_KEY`. Details in ClineMcp `plan/linux-port/discovery.md` |
+| Cline | `-P nvidia -m nvidia/nemotron-3.5-super-vl-120b-a12b` | works (plan's headless command line → `finishReason: completed`) |
+
+NVIDIA access: `NVIDIA_API_KEY` is in the supervisor VM's secret store (owner, 2026-11-24) and read from the environment only; never stored in this repo. Details in ClineMcp `plan/linux-port/discovery.md`.
 
 ## S0.5 — Discovery of the Linux OpenCode install
 
