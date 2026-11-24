@@ -32,4 +32,16 @@ The runner's `%TEMP%` is the 8.3 short path `C:\Users\RUNNER~1\...`, while the c
 | W4 | `test/edits.test.js` | S8: an edit run's limit is remembered by the shared catalog, and a passing edit clears limits | expected `[['limit','opencode/test-free',...]]`, actual `[]` | unconfirmed |
 | W5 | `test/plan-s20-extra.test.js` | S20 (6): oversized placeholders use size-only recovery and a running hash honours cancellation | `...\runneradmin\...\placeholder`, expected `...\RUNNER~1\...` | E2 → (c) |
 
-**GATE (CI `windows-latest` green apart from explained class (c)): FAIL, not cleared.** Stage 0 stops here and the owner decides.
+**First-run GATE: failed (superseded by CI revision 2 below).** Stage 0 stops here and the owner decides.
+
+## CI revision 2 (S0.2, Claude) — gate re-check
+
+Workflow `1f1bad7` (Windows tests run with `TEMP`/`TMP` = the long runner temp folder). Run: https://github.com/segalz/openCodeHelperMcp/actions/runs/45488832658
+
+| Job | Result |
+|-----|--------|
+| windows-latest | **success** |
+| ubuntu-24.04-arm | success |
+| ubuntu-24.04 | attempt 1 failed, 1 test: `test/codeindex.test.js:142` "remaining attempt time bounds the adapter and prevents late fallback" (timing). The supervisor re-ran the failed job once (attempt 2): **success** → recorded as **flaky** (timing-sensitive on a shared runner), not class (b). Watch it in S6.1 (green twice). |
+
+All W1-W5 above were runner environment (class (c)), fixed by CI revision 2. **GATE (windows-latest green): PASS.** Stage 0 closed 2026-11-24.

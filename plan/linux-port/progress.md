@@ -6,11 +6,11 @@ Updated by the supervisor (Grok Bot) after every step.
 | Step | Type | Risk | Status | Executor / model | Attempts | 1st try | Escalation | CI reverts | Minutes | Notes |
 |------|------|------|--------|------------------|----------|---------|------------|------------|---------|-------|
 | S0.1 | OWNER | low | done | — | — | — | — | — | — | push approved and pushed 2026-11-24 |
-| S0.2 | Claude | low | done | — | — | — | — | — | — | scripts + .gitattributes 2026-11-24; workflow `a340fbe` (exact match to S0.2). First run 45483816284: ubuntu ok, arm ok, windows fail |
+| S0.2 | Claude | low | done | — | — | — | — | — | — | workflow `a340fbe` + CI revision 2 `1f1bad7` (long TEMP on Windows). Run 45488832658: windows success |
 | S0.3 | SUP | low | done | — | — | — | — | — | 10 | Reused ClineMcp S0.3 VM; `npm ci` OK. Cline primary `cline-free/nemotron-3.5-super-vl` (Cline account login, owner-approved), fallback `nvidia` / `nvidia/nemotron-3.5-super-vl-120b-a12b`. OpenCode primary `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b`, fallback `opencode/deepseek-v4.1-flash-free`. See discovery.md |
-| S0.4 | SUP | med | escalated | — | — | — | — | — | 15 | VM + CI ubuntu/arm green. **GATE FAIL:** windows-latest 5 fail (8.3 `RUNNER~1` TEMP path; others unconfirmed). Stopped, waiting for the owner. See baseline.md |
+| S0.4 | SUP | med | done | — | — | — | — | — | 20 | VM + CI arm green; ubuntu codeindex.test.js:142 flaky (failed once, re-run green). First-run windows failures were runner env (c). **GATE PASS** |
 | S0.5 | SUP | med | done | — | — | — | — | — | 10 | native ELF `opencode.exe` 1.19.6; serve banner and `models --verbose` match the parsers; no own-SID children. GATE PASS |
-| S1.1 | SUP | low | pending | — | — | — | — | — | — | skip class (a) tests |
+| S1.1 | SUP | low | done | — | — | — | — | — | 2 | no class (a) tests in the baseline → no change |
 | S2.1 | TEST | low | pending | — | — | — | — | — | — | linux-roots.test.js |
 | S2.2 | CODE | low | pending | | | | | | | src/roots.js |
 | S2.3 | TEST | low | pending | — | — | — | — | — | — | linux-index-roots.test.js |
