@@ -15,8 +15,8 @@ Updated by the supervisor (Grok Bot) after every step.
 | S2.2 | CODE | low | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 2 | `916a9eb`: src/roots.js exact content. Linux check 5/5. CI 45505996330: all 3 jobs green (windows 359/0 fail) |
 | S2.3 | TEST | low | done | — | — | — | — | — | 2 | `abc848c`; RED as expected (index.js has no roots.js import) |
 | S2.4 | CODE | low | done | OpenCode / nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b | 1 | y | none | 0 | 2 | `507dc49`: diff per spec. Linux check 29/29; VM full 333 pass / 0 fail. CI 45508052054: all green (windows 360/0 fail) |
-| S3.1 | TEST | low | pending | — | — | — | — | — | — | linux-childenv.test.js |
-| S3.2 | CODE | low | pending | | | | | | | childEnv: no relative PATH (security) |
+| S3.1 | TEST | low | done | — | — | — | — | — | 2 | `f24cddc`; RED as expected (core.childEnv is not a function) |
+| S3.2 | CODE | low | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 2 | `071f5cd`: export + APPDATA-guarded npm entry, per spec. Linux check 31/31. CI 45508653975: all green (windows 362/0 fail) |
 | S4.1 | TEST | low | pending | — | — | — | — | — | — | linux-verify-bin.test.js |
 | S4.2 | CODE | low | pending | | | | | | | node_modules/.bin on POSIX |
 | S5.x | TEST/CODE | ? | pending | | | | | | | from baseline class (b) / discovery |
