@@ -13,8 +13,8 @@ Updated by the supervisor (Grok Bot) after every step.
 | S1.1 | SUP | low | done | — | — | — | — | — | 2 | no class (a) tests in the baseline → no change |
 | S2.1 | TEST | low | done | — | — | — | — | — | 2 | `d50b2e8`; RED as expected (ERR_MODULE_NOT_FOUND src/roots.js) |
 | S2.2 | CODE | low | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 2 | `916a9eb`: src/roots.js exact content. Linux check 5/5. CI 45505996330: all 3 jobs green (windows 359/0 fail) |
-| S2.3 | TEST | low | pending | — | — | — | — | — | — | linux-index-roots.test.js |
-| S2.4 | CODE | low | pending | | | | | | | index.js uses roots.js |
+| S2.3 | TEST | low | done | — | — | — | — | — | 2 | `abc848c`; RED as expected (index.js has no roots.js import) |
+| S2.4 | CODE | low | done | OpenCode / nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b | 1 | y | none | 0 | 2 | `507dc49`: diff per spec. Linux check 29/29; VM full 333 pass / 0 fail. CI 45508052054: all green (windows 360/0 fail) |
 | S3.1 | TEST | low | pending | — | — | — | — | — | — | linux-childenv.test.js |
 | S3.2 | CODE | low | pending | | | | | | | childEnv: no relative PATH (security) |
 | S4.1 | TEST | low | pending | — | — | — | — | — | — | linux-verify-bin.test.js |
