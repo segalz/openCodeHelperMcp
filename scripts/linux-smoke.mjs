@@ -27,7 +27,7 @@ async function settle(before, label) {
   throw new Error(`${label}: opencode process count did not return to ${before} (now ${countOpencode()})`);
 }
 function text(result) { return (result.content ?? []).map(c => c.text ?? "").join("\n"); }
-function check(cond, msg) { if (!cond) throw new Error(msg); console.log("ok -", msg); }
+function check(cond, msg, result) { if (!cond) throw new Error(`${msg}${result ? `\n${text(result).slice(0, 2000)}` : ""}`); console.log("ok -", msg); }
 
 const smokeRoot = await mkdtemp(path.join(os.tmpdir(), "oc-smoke-"));
 const outside = await mkdtemp(path.join(os.tmpdir(), "oc-outside-"));
@@ -61,19 +61,19 @@ try {
   before = countOpencode();
   const analyzed = await call("analyze_code", { directory: repo, prompt: "What does add.js export? Answer in one sentence.", maxWords: 60, model });
   await settle(before, "analyze_code");
-  check(!analyzed.isError && text(analyzed).length > 0, "analyze_code answered inside the smoke root");
+  check(!analyzed.isError && text(analyzed).length > 0, "analyze_code answered inside the smoke root", analyzed);
 
   before = countOpencode();
   const edited = await call("apply_opencode_edits", { directory: repo, prompt: "add the word hello to README.md", model,
     verify: { command: "node", args: ["-e", "process.exit(require('fs').readFileSync('README.md','utf8').includes('hello')?0:1)"] } });
   await settle(before, "apply_opencode_edits");
   const readme = await readFile(path.join(repo, "README.md"), "utf8");
-  check(!edited.isError && readme.includes("hello"), "apply_opencode_edits added hello and the check passed");
+  check(!edited.isError && readme.includes("hello"), "apply_opencode_edits added hello and the check passed", edited);
 
   before = countOpencode();
   const refused = await call("analyze_code", { directory: outside, prompt: "List the files.", maxWords: 60, model });
   await settle(before, "analyze_code outside");
-  check(refused.isError || /outside|allowed root/i.test(text(refused)), "analyze_code outside the smoke root was refused");
+  check(refused.isError || /outside|allowed root/i.test(text(refused)), "analyze_code outside the smoke root was refused", refused);
   console.log("SMOKE PASS");
 } catch (error) {
   failed = true;
