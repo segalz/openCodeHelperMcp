@@ -167,12 +167,12 @@ export function resolveOpenCodeExecutable({ env = process.env, platform = proces
   return "opencode";
 }
 
-function childEnv(env, execPath) {
+export function childEnv(env, execPath) {
   return {
     ...env,
     NO_COLOR: "1",
     GIT_OPTIONAL_LOCKS: "0",
-    PATH: [path.join(env.APPDATA ?? "", "npm"), path.dirname(execPath), env.PATH ?? ""].filter(Boolean).join(path.delimiter),
+    PATH: [...(env.APPDATA ? [path.join(env.APPDATA, "npm")] : []), path.dirname(execPath), env.PATH ?? ""].filter(Boolean).join(path.delimiter),
   };
 }
 
