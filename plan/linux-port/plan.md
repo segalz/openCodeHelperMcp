@@ -113,7 +113,8 @@ Out of scope by design:
   bash scripts/check-locked.sh
   if [ "$#" -gt 0 ]; then node --test "$@"; else node --test; fi
   ```
-- `.github/workflows/linux-port.yml`: the same as ClineMcp S0.2. Matrix `windows-latest`, `ubuntu-24.04`, `ubuntu-24.04-arm`; Node 22; `git config` user; `npm ci`; `npm test`.
+- `.github/workflows/linux-port.yml`: the same as ClineMcp S0.2, without the two "Install Cline CLI" steps. It has the matrix `windows-latest`, `ubuntu-24.04` and `ubuntu-24.04-arm`; Node 22; the `git config` user; `npm ci`; and `npm test`. On Windows the test step runs with `TEMP` and `TMP` set to `${{ runner.temp }}`.
+  CI revision 2 (2026-11-24): the first run failed on `windows-latest` before any code change, because the runner's 8.3 short `%TEMP%` (`C:\Users\RUNNER~1`) did not match the long path the code resolves. Known latent Windows issue, out of scope here: path identity can differ between an 8.3 short path and the long path.
 
 Done when it is committed and pushed (after S0.1) and the first CI run has finished.
 
