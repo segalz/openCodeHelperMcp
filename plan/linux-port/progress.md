@@ -6,10 +6,10 @@ Updated by the supervisor (Grok Bot) after every step.
 | Step | Type | Risk | Status | Executor / model | Attempts | 1st try | Escalation | CI reverts | Minutes | Notes |
 |------|------|------|--------|------------------|----------|---------|------------|------------|---------|-------|
 | S0.1 | OWNER | low | done | — | — | — | — | — | — | push approved and pushed 2026-11-24 |
-| S0.2 | Claude | low | in-progress | — | — | — | — | — | — | scripts + .gitattributes pushed 2026-11-24; CI workflow NOT pushed (push token lacks `workflow` scope): supervisor adds it verbatim from S0.2, or Claude after the owner grants the scope |
-| S0.3 | SUP | low | pending | — | — | — | — | — | — | VM: Node 22, opencode, cline + free-model access (reuse ClineMcp S0.3) |
-| S0.4 | SUP | med | pending | — | — | — | — | — | — | baseline.md |
-| S0.5 | SUP | med | pending | — | — | — | — | — | — | discovery.md (serve banner, models --verbose, SIDs) |
+| S0.2 | Claude | low | in-progress | — | — | — | — | — | — | scripts + .gitattributes pushed 2026-11-24; CI workflow NOT pushed: owner token and supervisor token both lack the `workflow` scope (supervisor checked 2026-11-24). Needs the owner/Claude with `workflow` scope |
+| S0.3 | SUP | low | in-progress | — | — | — | — | — | 5 | Reused ClineMcp S0.3 VM; `npm ci` OK. OpenCode free model works (`opencode/deepseek-v4.1-flash-free`); Cline BLOCKED on owner (Cline login or NVIDIA_API_KEY). See discovery.md |
+| S0.4 | SUP | med | in-progress | — | — | — | — | — | 5 | Linux VM: 354 tests, 327 pass, 0 fail, 27 skipped. CI not run (no workflow) → windows GATE not evaluated. See baseline.md |
+| S0.5 | SUP | med | done | — | — | — | — | — | 10 | native ELF `opencode.exe` 1.19.6; serve banner and `models --verbose` match the parsers; no own-SID children. GATE PASS |
 | S1.1 | SUP | low | pending | — | — | — | — | — | — | skip class (a) tests |
 | S2.1 | TEST | low | pending | — | — | — | — | — | — | linux-roots.test.js |
 | S2.2 | CODE | low | pending | | | | | | | src/roots.js |
