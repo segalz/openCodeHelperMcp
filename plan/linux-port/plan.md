@@ -334,6 +334,50 @@ Linux check: `bash scripts/linux-check.sh test/linux-verify-bin.test.js test/pla
 
 **S5.x · TEST/CODE pairs**, written by the supervisor from the class (b) items in S0.4 and the S0.5 gate. Use one failing test and one function per step. Items about process killing or timing are high risk: send them to Claude unless they are one-liners.
 
+**S5.1 · TEST · Bare `npm`/`npx` keep the installed npm, as on Windows.** Added 2026-11-25 from Claude's S6.2 second review. Risk low. New file `test/linux-verify-npm.test.js`:
+```js
+import assert from "node:assert/strict";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { resolveVerificationCommand } from "../src/verify.js";
+
+test("posix: bare npm/npx skip the project-local node_modules/.bin, as on Windows", { skip: process.platform === "win32" && "POSIX behaviour" }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "verify-npm-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = path.join(root, "node_modules", ".bin");
+  const pathDir = path.join(root, "pathdir");
+  await mkdir(path.join(root, ".git"));
+  await mkdir(bin, { recursive: true });
+  await mkdir(pathDir);
+  for (const dir of [bin, pathDir]) {
+    for (const name of ["npm", "npx", "mytool"]) {
+      await writeFile(path.join(dir, name), "#!/bin/sh\nexit 0\n"); await chmod(path.join(dir, name), 0o755);
+    }
+  }
+  const savedPath = process.env.PATH;
+  process.env.PATH = pathDir;
+  try {
+    assert.deepEqual(await resolveVerificationCommand("npm", ["test"], root), { command: "npm", args: ["test"] });
+    assert.deepEqual(await resolveVerificationCommand("npx", ["tsc"], root), { command: "npx", args: ["tsc"] });
+    assert.deepEqual(await resolveVerificationCommand("mytool", [], root), { command: path.join(bin, "mytool"), args: [] });
+  } finally { process.env.PATH = savedPath; }
+});
+```
+RED on Linux: today `npm` resolves to `<root>/node_modules/.bin/npm`. Skipped on Windows.
+
+**S5.2 · CODE.** Risk low. Files allowed: `src/verify.js`, the POSIX branch only.
+Current line (~34): `    if (bare) {`
+Required change: replace that one line with these two lines:
+```js
+    // As on Windows, a bare npm/npx is the installed npm, never a project-local copy.
+    if (bare && command !== "npm" && command !== "npx") {
+```
+Nothing else changes.
+Linux check: `bash scripts/linux-check.sh test/linux-verify-npm.test.js test/linux-verify-bin.test.js test/plan-s4-verify-shims.test.js`.
+After S5.2, repeat S6.1 (the suite twice on the VM, and CI green on all three jobs). The S7 smoke needs no rerun: its verify uses `node`, not npm.
+
 ### Stage 6 — Full green
 
 **S6.1 · SUP.** The whole suite is green twice on the VM, and CI is green on all three jobs.

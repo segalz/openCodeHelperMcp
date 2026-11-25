@@ -20,6 +20,8 @@ Updated by the supervisor (Grok Bot) after every step.
 | S4.1 | TEST | low | done | — | — | — | — | — | 2 | `b321141`; RED as expected ("Verification executable was not found on PATH.") |
 | S4.2 | CODE | low | done | OpenCode / nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b | 1 | y | none | 0 | 3 | `c75daaa`: node_modules/.bin walk-up in the POSIX branch only. Linux check 2 pass / 0 fail / 11 skip; VM full 336 pass / 0 fail. CI 45509090424: all green (windows 362/0 fail) |
 | S5.x | TEST/CODE | ? | skipped (none) | — | — | — | — | — | 1 | S0.4 had no class (b) items, S0.5 gate passed, and S7.2 found no port defect → no pairs |
+| S5.1 | TEST | low | pending | — | — | — | — | — | — | added by Claude 2026-11-25 (S6.2 second review): bare npm/npx keep the installed npm on POSIX, as on Windows. linux-verify-npm.test.js |
+| S5.2 | CODE | low | pending | | | | | | | one line in the POSIX branch of verify.js; then repeat S6.1 |
 | S6.1 | SUP | med | done | — | — | — | — | — | 5 | VM full suite twice: 363 tests, 336 pass, 0 fail, 27 skip (both runs). CI 45509090424 green on windows/ubuntu/arm. Run 45510938570 (docs commit): ubuntu hit flaky F1 (codeindex.test.js:142); rule 7 rerun once → all 3 green (1 flake rerun, no revert) |
 | S6.2 | SUP | low | done | — | — | — | — | — | 5 | self-review below → owner forwards to Claude |
 | S7.1 | SUP | high | done | — | — | — | — | — | 10 | `39b4e92` + `2194fe9` (prints the tool result on failure). VM only, not in CI. `SMOKE_MODEL` env picks the model (default opencode/deepseek-v4.1-flash-free) |
@@ -37,4 +39,12 @@ Changed src: `src/roots.js` (new), `src/index.js`, `src/core.js`, `src/verify.js
 - **PATH safety.** The relative `npm` PATH entry (cwd-dependent lookup when APPDATA is unset) is gone. The new POSIX lookup (bare names only) checks `node_modules/.bin/<cmd>` from the verify cwd upward, stopping at the first directory with `.git` (the checkout root) or `/`, with absolute paths and the existing runnable-file check. Point for Claude: a checkout-local `.bin` tool now wins over the same name on PATH (e.g. a repo could ship `node_modules/.bin/node`); confirm that matches the Windows lookup order and is acceptable.
 - **Roots parsing.** POSIX splits on `:`, drops empty entries, default `~/Develop`; Windows still splits on `;` with default `C:\Develop` and `path.win32.resolve` (same as the old `path.resolve` on Windows). Covered by linux-roots / linux-index-roots tests.
 - **No new shell use.** No new spawn/exec/`shell: true`; the diff only touches `childEnv` and the existing executable check.
+
+## Claude second review (2026-11-25)
+Reviewed `git diff a192912..88be42a` (src, test, scripts). Verdict: correct, and Windows is unchanged. One gap in the plan text is fixed by the new S5.1/S5.2 pair.
+- **Lookup order (the question above): accepted.** It matches Windows. There, a bare name also takes the nearest `node_modules/.bin` up to the `.git` root first, and only then PATH (`nearestBinShim`, `src/verify.js` ~71-75, "as with `npm run`"). So a repo-local `node` takes precedence on Windows too (`node_modules/.bin/node.cmd`). This is acceptable: verify runs only in trusted repos, and the check runs repo code anyway (`npm test` puts `node_modules/.bin` first in PATH for every script).
+- **The one mismatch: bare `npm`/`npx`.** On Windows they always resolve to the installed npm (`src/verify.js` ~48-59), never to a project-local copy. The new POSIX walk-up picks `node_modules/.bin/npm` when a repo has npm as a dependency (for example through semantic-release). Fix: S5.1/S5.2. The executor did S4.2 exactly as written. The gap is in Claude's S4.2 text, so it does not count against the executor.
+- `childEnv`, `roots.js`, `index.js`: correct. The roots containment check (`resolvePathWithinAllowedRoots`, `src/core.js` ~1105) uses realpath on both sides and `path.relative`, which is case-sensitive on POSIX. No change is needed there.
+- `scripts/linux-smoke.mjs`: fine for VM-only use. It prints no secrets and removes its temp folders.
+- Nits, no action: `src/roots.js` has no final newline; `test/linux-verify-bin.test.js` leaves its temp folder behind.
 
