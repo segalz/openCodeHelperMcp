@@ -31,7 +31,8 @@ export async function resolveVerificationCommand(command, args = [], cwd = proce
   const bare = !hasDirectory && !ext;
   if (process.platform !== "win32") {
     // POSIX spawns resolve through PATH; check that the program is a runnable file so a missing/directory/non-executable one is refused up front.
-    if (bare) {
+    // As on Windows, a bare npm/npx is the installed npm, never a project-local copy.
+    if (bare && command !== "npm" && command !== "npx") {
       for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
         const local = path.join(dir, "node_modules", ".bin", command);
         if (await isRunnablePosix(local)) return { command: local, args };
