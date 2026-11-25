@@ -50,5 +50,5 @@ All W1-W5 above were runner environment (class (c)), fixed by CI revision 2. **G
 
 | # | Where | Test | Signature | Status |
 |---|-------|------|-----------|--------|
-| F1 | ubuntu-24.04 | `test/codeindex.test.js:142` remaining attempt time bounds the adapter and prevents late fallback | timing; failed in run 45488832658 and again in run 45510938570 (docs-only commit 1f3e124), green on rerun both times | watch (2 sightings, timing-only, never on VM/arm/windows) |
+| F1 | ubuntu-24.04 | `test/codeindex.test.js:142` remaining attempt time bounds the adapter and prevents late fallback | timing; failed in run 45488832658 and again in run 45510938570 (docs-only commit 1f3e124), green on rerun both times; 3rd sighting on the VM (2026-11-25, S6.1 repeat run 2), green on the next 2 runs | watch (3 sightings, timing-only; never on arm/windows) |
 
