@@ -31,8 +31,8 @@ Updated by the supervisor (Grok Bot) after every step.
 | S9 | OWNER | — | pending | — | — | — | — | — | — | merge decision |
 
 ## Experiment summary (fill at the end)
-- CODE steps: 4 (S2.2 Cline, S2.4 OpenCode, S3.2 Cline, S4.2 OpenCode) · alone 1st try: 4 · alone within 3: 4 · after supervisor rewrite: 0 · needed Claude: 0 (Claude only for the workflow S0.2 and plan rule 7)
-- Failure patterns: none in CODE steps. Environment only: OpenCode free-tier quota during the S7.2 smoke; CI flake codeindex.test.js:142 seen once in S0.4 (no reruns needed after).
+- CODE steps: 5 (S2.2 Cline, S2.4 OpenCode, S3.2 Cline, S4.2 OpenCode, S5.2 Cline) · alone 1st try: 5 · alone within 3: 5 · after supervisor rewrite: 0 · needed Claude: 0 (Claude only for the workflow S0.2 and plan rule 7)
+- Failure patterns: none in CODE steps. Environment only: OpenCode free-tier quota during the S7.2 smoke; CI/VM flake F1 codeindex.test.js:142 (3 sightings, 1 rule-7 rerun). Planner gap: npm/npx lookup in Claude's S4.2 text, fixed by S5.1/S5.2 (S4.2 stays a first-try pass).
 
 ## S6.2 self-review of `git diff main...linux-support` (for Claude's second review)
 Changed src: `src/roots.js` (new), `src/index.js`, `src/core.js`, `src/verify.js`. Plus tests (4 new linux-*.test.js), `scripts/` (check-locked, linux-check, linux-smoke), the workflow.
